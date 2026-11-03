@@ -59,6 +59,8 @@ if __name__ == "__main__":
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=99x75:d=2", str(gif)], check=True)
         jpg, mov = make_live(gif, 0, 1.5, 0.2, out, "g")
         assert mov.stat().st_size and jpg.stat().st_size
+        jpg, mov = make_live(src, 0, 2.0, 0.5, out, "o", overlay_list=[ov.text("hi", size=0.2)])
+        assert mov.stat().st_size and jpg.stat().st_size
         jpg, mov = make_live(src, 0.5, 2.5, 1.9, out, "r", {"direction": "reverse", "look": "mono"})
         assert jpg.stat().st_size and 1.9 < effects.thumbs.video_duration(str(mov)) < 2.1
     print("livemake ok")
