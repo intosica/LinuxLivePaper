@@ -1,5 +1,6 @@
-"""LinuxLivePaper GTK4/libadwaita app: gallery grid + viewer + quick live-image creator."""
+"""LinuxLivePaper GTK4/libadwaita app: gallery grid + viewer; the editor lives in editor.py."""
 import os
+import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -8,11 +9,12 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
-from . import library, livemake, thumbs  # noqa: E402
+from . import library, thumbs  # noqa: E402
+from .editor import EditorPage  # noqa: E402
 
 APP_ID = "io.github.linuxlivepaper"
 TILE = 220
-FILTERS = [("All", None), ("Live", "live"), ("Videos", "video"), ("Photos", "photo"), ("GIFs", "gif")]
+FILTERS = [("All", None), ("Live", "live"), ("Videos", "video"), ("GIFs", "gif")]
 CSS = """
 .tile { border-radius: 14px; background: alpha(@view_fg_color, 0.06); }
 .tile:hover { box-shadow: 0 0 0 3px @accent_bg_color; }
@@ -37,6 +39,15 @@ def badge(text, icon=None):
     return box
 
 
+def media_filters():
+    f = Gtk.FileFilter(name="Videos and GIFs")
+    f.add_mime_type("video/*")
+    f.add_mime_type("image/gif")
+    store = Gio.ListStore(item_type=Gtk.FileFilter)
+    store.append(f)
+    return store
+
+
 def play_stream(path, picture, muted=True, loop=True):
     """Start playing path and swap it into picture once the first frame is decoded (no black flash)."""
     m = Gtk.MediaFile.new_for_filename(path)
@@ -52,6 +63,21 @@ def play_stream(path, picture, muted=True, loop=True):
     return m
 
 
+def playable(item, callback):
+    """callback(path) on the main thread with something GTK can play: GIFs go through an MP4 proxy."""
+    if item.kind != "gif":
+        callback(item.motion)
+        return
+
+    def work():
+        try:
+            path = thumbs.mp4_proxy(item.motion)
+        except Exception:
+            path = None
+        GLib.idle_add(lambda: path and callback(path))
+    pool.submit(work)
+
+
 class ItemObj(GObject.Object):
     def __init__(self, item):
         super().__init__()
@@ -63,7 +89,7 @@ class ItemObj(GObject.Object):
 
 class Tile(Gtk.Overlay):
     """Fixed-size tile; the picture is an overlay child so its natural size doesn't stretch the row.
-    Hovering a live/video/GIF tile plays it muted."""
+    Hovering plays the item muted."""
 
     def __init__(self):
         super().__init__(css_classes=["tile"], overflow=Gtk.Overflow.HIDDEN, margin_start=4, margin_end=4,
@@ -74,6 +100,7 @@ class Tile(Gtk.Overlay):
         self.badge = None
         self.obj = None
         self.stream = None
+        self.hovering = False
         self._hover_id = 0
         motion = Gtk.EventControllerMotion()
         motion.connect("enter", lambda *_: self._schedule_play())
@@ -102,13 +129,12 @@ class Tile(Gtk.Overlay):
             self.badge = badge("LIVE", "media-playlist-repeat-symbolic")
         elif o.item.kind == "gif":
             self.badge = badge("GIF")
-        elif o.item.kind == "video" and o.duration:
+        elif o.duration:
             self.badge = badge(fmt_time(o.duration), "media-playback-start-symbolic")
         if self.badge:
             self.add_overlay(self.badge)
 
-    @staticmethod
-    def _load_obj(obj):
+    def _load(self, obj):
         path = thumbs.make_thumb(obj.item)
         tex = None
         if path:
@@ -117,10 +143,6 @@ class Tile(Gtk.Overlay):
             except GLib.Error:
                 pass
         dur = thumbs.video_duration(obj.item.path) if obj.item.kind == "video" else None
-        return tex, dur
-
-    def _load(self, obj):
-        tex, dur = self._load_obj(obj)
 
         def done():
             obj.texture, obj.duration, obj.loading = tex, dur, False
@@ -130,16 +152,20 @@ class Tile(Gtk.Overlay):
         GLib.idle_add(done)
 
     def _schedule_play(self):
-        if self.obj and self.obj.item.motion and not self._hover_id:
+        self.hovering = True
+        if self.obj and not self._hover_id:
             self._hover_id = GLib.timeout_add(250, self._play)
 
     def _play(self):
         self._hover_id = 0
-        if self.obj:
-            self.stream = play_stream(self.obj.item.motion, self.pic)
+        obj = self.obj
+        if obj:
+            playable(obj.item, lambda p: self.hovering and self.obj is obj and self.stream is None
+                     and setattr(self, "stream", play_stream(p, self.pic)))
         return False
 
     def stop(self):
+        self.hovering = False
         if self._hover_id:
             GLib.source_remove(self._hover_id)
             self._hover_id = 0
@@ -150,7 +176,7 @@ class Tile(Gtk.Overlay):
 
 
 class LiveView(Gtk.Overlay):
-    """Shows the still; press and hold (or click LIVE) to play the motion with sound, like iOS."""
+    """Shows the still; press and hold (or Space) to play the motion with sound, like iOS."""
 
     def __init__(self, item):
         super().__init__()
@@ -180,13 +206,15 @@ class LiveView(Gtk.Overlay):
 
 
 class Viewer(Adw.NavigationPage):
-    def __init__(self, objs, index):
+    def __init__(self, win, objs, index):
         super().__init__(title="")
-        self.objs, self.index, self.stream, self.view = objs, index, None, None
+        self.win, self.objs, self.index, self.stream, self.view = win, objs, index, None, None
         self.header = Adw.HeaderBar()
+        self.make_btn = Gtk.Button(label="Make Live Image", css_classes=["suggested-action"])
+        self.make_btn.connect("clicked", lambda *_: win.open_editor(self.objs[self.index].item.motion))
+        self.header.pack_end(self.make_btn)
         self.frame = Gtk.Overlay(css_classes=["viewer"], hexpand=True, vexpand=True)
-        self.content = Gtk.Box()
-        self.frame.set_child(self.content)
+        self.frame.set_child(Gtk.Box())
         for icon, step, align in (("go-previous-symbolic", -1, Gtk.Align.START),
                                   ("go-next-symbolic", 1, Gtk.Align.END)):
             b = Gtk.Button(icon_name=icon, halign=align, valign=Gtk.Align.CENTER, margin_start=12,
@@ -205,14 +233,13 @@ class Viewer(Adw.NavigationPage):
     def _key(self, _c, keyval, *_):
         if keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
             self.go(-1 if keyval == Gdk.KEY_Left else 1)
-            return True
-        if keyval == Gdk.KEY_Escape:
+        elif keyval == Gdk.KEY_Escape:
             self.get_ancestor(Adw.NavigationView).pop()
-            return True
-        if keyval == Gdk.KEY_space and isinstance(self.view, LiveView):
+        elif keyval == Gdk.KEY_space and isinstance(self.view, LiveView):
             self.view.play()
-            return True
-        return False
+        else:
+            return False
+        return True
 
     def go(self, step):
         self.index = (self.index + step) % len(self.objs)
@@ -224,25 +251,28 @@ class Viewer(Adw.NavigationPage):
             self.stream = None
         if isinstance(self.view, LiveView):
             self.view.stop()
-        elif isinstance(self.view, Gtk.Video):
-            self.view.get_media_stream() and self.view.get_media_stream().set_playing(False)
+        elif isinstance(self.view, Gtk.Video) and self.view.get_media_stream():
+            self.view.get_media_stream().set_playing(False)
 
     def show(self):
         self._stop()
         item = self.objs[self.index].item
         self.set_title(item.name)
+        self.make_btn.set_visible(item.kind != "live")
         if item.kind == "live":
             view = LiveView(item)
         elif item.kind == "video":
             view = Gtk.Video.new_for_filename(item.path)
             view.set_autoplay(True)
             view.set_loop(True)
-        elif item.kind == "gif":
-            view = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN)
-            self.stream = play_stream(item.path, view)
-        else:
-            view = Gtk.Picture.new_for_filename(item.path)
+        else:  # gif: loop the MP4 proxy
+            view = Gtk.Picture.new_for_filename(item.path)  # first frame until the proxy is ready
             view.set_content_fit(Gtk.ContentFit.CONTAIN)
+
+            def ready(path, v=view):
+                if self.view is v:
+                    self.stream = play_stream(path, v)
+            playable(item, ready)
         view.set_hexpand(True)
         view.set_vexpand(True)
         self.frame.set_child(view)
@@ -250,60 +280,9 @@ class Viewer(Adw.NavigationPage):
         self.grab_focus()
 
 
-class CreateDialog(Adw.Dialog):
-    """Quick creator: trim a video into a live image. The full editor comes later (docs/ROADMAP.md)."""
-
-    def __init__(self, src, on_done):
-        super().__init__(title="New Live Image", content_width=520)
-        self.src, self.on_done = src, on_done
-        dur = thumbs.video_duration(src) or 3.0
-        video = Gtk.Video.new_for_filename(src)
-        video.set_autoplay(True)
-        video.set_loop(True)
-        video.set_size_request(-1, 260)
-        self.start = Adw.SpinRow.new_with_range(0, max(0.0, dur - 0.1), 0.1)
-        self.start.set_title("Start (s)")
-        self.length = Adw.SpinRow.new_with_range(0.5, max(0.5, dur), 0.1)
-        self.length.set_title("Length (s)")
-        self.length.set_value(min(3.0, dur))
-        self.key = Adw.SpinRow.new_with_range(0, max(0.0, dur), 0.1)
-        self.key.set_title("Cover frame (s from start)")
-        for r in (self.start, self.length, self.key):
-            r.set_digits(1)
-        group = Adw.PreferencesGroup(title=os.path.basename(src), description=f"Duration {fmt_time(dur)}")
-        for r in (self.start, self.length, self.key):
-            group.add(r)
-        self.button = Gtk.Button(label="Create", css_classes=["suggested-action", "pill"],
-                                 halign=Gtk.Align.CENTER, margin_top=6)
-        self.button.connect("clicked", self._create)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_start=18, margin_end=18,
-                      margin_top=6, margin_bottom=18)
-        for w in (video, group, self.button):
-            box.append(w)
-        tv = Adw.ToolbarView(content=box)
-        tv.add_top_bar(Adw.HeaderBar())
-        self.set_child(tv)
-        self.video = video
-
-    def _create(self, _b):
-        self.button.set_sensitive(False)
-        self.button.set_label("Creating…")
-        s, length, k = self.start.get_value(), self.length.get_value(), self.key.get_value()
-
-        def work():
-            try:
-                res = livemake.make_live(self.src, s, s + length, min(k, length - 0.05))
-                err = None
-            except Exception as e:  # surfaced as a toast
-                res, err = None, str(e)
-            GLib.idle_add(lambda: (self.on_done(res, err), self.close()))
-        self.video.get_media_stream() and self.video.get_media_stream().set_playing(False)
-        threading.Thread(target=work, daemon=True).start()
-
-
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
-        super().__init__(application=app, title="LinuxLivePaper", default_width=1280, default_height=820)
+        super().__init__(application=app, title="LinuxLivePaper", default_width=1280, default_height=860)
         self.store = Gio.ListStore(item_type=ItemObj)
         self.kind = None
         self.filter = Gtk.CustomFilter.new(lambda o: self.kind is None or o.item.kind == self.kind)
@@ -317,7 +296,7 @@ class Window(Adw.ApplicationWindow):
                                  min_columns=2, single_click_activate=True, margin_start=8, margin_end=8)
         self.grid.connect("activate", self._open)
 
-        self.status = Adw.StatusPage(icon_name="image-x-generic-symbolic", title="Loading your collection…")
+        self.status = Adw.StatusPage(icon_name="video-x-generic-symbolic", title="Loading your collection…")
         self.stack = Gtk.Stack()
         self.stack.add_named(self.status, "status")
         self.stack.add_named(Gtk.ScrolledWindow(child=self.grid, vexpand=True), "grid")
@@ -332,12 +311,23 @@ class Window(Adw.ApplicationWindow):
             switch.append(b)
         first.set_active(True)
         header.set_title_widget(switch)
-        create = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="New live image from a video")
-        create.connect("clicked", self._pick_video)
+        create = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Create a live image from a video or GIF")
+        create.connect("clicked", self._pick_source)
+        imp = Gtk.Button(icon_name="document-open-symbolic", tooltip_text="Import videos and GIFs into the library")
+        imp.connect("clicked", self._import)
         header.pack_start(create)
-        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Rescan")
-        refresh.connect("clicked", lambda *_: self.rescan())
-        header.pack_end(refresh)
+        header.pack_start(imp)
+        menu = Gio.Menu()
+        menu.append("Library Folder…", "win.prefs")
+        menu.append("Open Library Folder", "win.open-folder")
+        menu.append("Rescan", "win.rescan")
+        header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
+        for name, fn in (("prefs", self._prefs), ("rescan", self.rescan),
+                         ("open-folder", lambda: Gtk.FileLauncher.new(
+                             Gio.File.new_for_path(str(library.library_dir()))).launch(self, None, None))):
+            act = Gio.SimpleAction(name=name)
+            act.connect("activate", lambda *_a, f=fn: f())
+            self.add_action(act)
 
         tv = Adw.ToolbarView(content=self.stack)
         tv.add_top_bar(header)
@@ -346,6 +336,9 @@ class Window(Adw.ApplicationWindow):
         self.nav.add(Adw.NavigationPage(child=self.toasts, title="Gallery", tag="gallery"))
         self.set_content(self.nav)
         self.rescan()
+
+    def toast(self, text):
+        self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
 
     def _set_kind(self, kind):
         self.kind = kind
@@ -357,7 +350,8 @@ class Window(Adw.ApplicationWindow):
             self.stack.set_visible_child_name("grid")
             return
         self.status.set_title("Nothing here yet")
-        self.status.set_description("Add photos, videos or GIFs to Pictures/Videos, or press + to create a live image.")
+        self.status.set_description(f"Your library is {library.library_dir()}.\n"
+                                    "Press + to create a live image, or import videos and GIFs.")
         self.stack.set_visible_child_name("status")
 
     def rescan(self):
@@ -372,27 +366,74 @@ class Window(Adw.ApplicationWindow):
 
     def _open(self, _grid, pos):
         objs = [self.model.get_item(i) for i in range(self.model.get_n_items())]
-        self.nav.push(Viewer(objs, pos))
+        self.nav.push(Viewer(self, objs, pos))
 
-    def _pick_video(self, *_):
-        f = Gtk.FileFilter(name="Videos")
-        f.add_mime_type("video/*")
-        filters = Gio.ListStore(item_type=Gtk.FileFilter)
-        filters.append(f)
-        dlg = Gtk.FileDialog(title="Choose a video", filters=filters)
+    # --- creating & importing -------------------------------------------------------------------
+    def open_editor(self, path):
+        self.nav.push(EditorPage(path, self._saved))
 
+    def _saved(self, page, res, err):
+        if err:
+            page.save_btn.set_sensitive(True)
+            page.save_btn.set_label("Save Live Image")
+            self.toast(f"Saving failed: {err}")
+            return
+        self.nav.pop_to_tag("gallery")
+        self.toast(f"Saved {res[0].stem}")
+        self.rescan()
+
+    def _pick_source(self, *_):
         def picked(d, res):
             try:
-                file = d.open_finish(res)
+                self.open_editor(d.open_finish(res).get_path())
+            except GLib.Error:
+                pass
+        Gtk.FileDialog(title="Choose a video or GIF", filters=media_filters()).open(self, None, picked)
+
+    def _import(self, *_):
+        def picked(d, res):
+            try:
+                files = [f.get_path() for f in d.open_multiple_finish(res)]
             except GLib.Error:
                 return
-            CreateDialog(file.get_path(), self._created).present(self)
-        dlg.open(self, None, picked)
+            dest = library.library_dir()
 
-    def _created(self, res, err):
-        self.toasts.add_toast(Adw.Toast(title=f"Failed: {err}" if err else f"Saved {res[0].stem} to {res[0].parent}"))
-        if not err:
+            def work():
+                for f in files:
+                    shutil.copy2(f, dest)
+                GLib.idle_add(lambda: (self.toast(f"Imported {len(files)} file(s)"), self.rescan()))
+            threading.Thread(target=work, daemon=True).start()
+        Gtk.FileDialog(title="Import videos and GIFs", filters=media_filters()).open_multiple(self, None, picked)
+
+    def _prefs(self):
+        dlg = Adw.PreferencesDialog(title="Preferences")
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(title="Library", description="The gallery shows this folder, and new live "
+                                     "images are saved here. Existing files are not moved.")
+        row = Adw.ActionRow(title="LinuxLivePaper folder", subtitle=str(library.library_dir()))
+        change = Gtk.Button(label="Change…", valign=Gtk.Align.CENTER)
+        reset = Gtk.Button(icon_name="edit-undo-symbolic", valign=Gtk.Align.CENTER,
+                           tooltip_text=f"Reset to {library.DEFAULT_LIBRARY}", css_classes=["flat"])
+
+        def apply(path):
+            library.set_library_dir(path)
+            row.set_subtitle(str(library.library_dir()))
             self.rescan()
+
+        def chosen(d, res):
+            try:
+                apply(d.select_folder_finish(res).get_path())
+            except GLib.Error:
+                pass
+        change.connect("clicked", lambda *_: Gtk.FileDialog(title="Choose the LinuxLivePaper folder")
+                       .select_folder(self, None, chosen))
+        reset.connect("clicked", lambda *_: apply(library.DEFAULT_LIBRARY))
+        row.add_suffix(reset)
+        row.add_suffix(change)
+        group.add(row)
+        page.add(group)
+        dlg.add(page)
+        dlg.present(self)
 
 
 class App(Adw.Application):

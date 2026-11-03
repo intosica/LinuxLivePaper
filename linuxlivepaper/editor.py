@@ -1,0 +1,514 @@
+"""Live-image editor: preview + zoomable filmstrip timeline with trim handles and a cover-frame marker.
+
+Preview strategy (GTK's GStreamer seek isn't frame-exact): while paused we show an exact ffmpeg frame;
+while playing we loop a small ffmpeg-rendered proxy of exactly the selection, with sound."""
+import math
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+from gi.repository import Adw, Gdk, GLib, GObject, Gtk, Pango, PangoCairo  # noqa: E402
+
+from . import livemake, thumbs  # noqa: E402
+
+YELLOW = (0.96, 0.76, 0.07)
+PAD = 16                     # horizontal padding so edge handles stay grabbable
+OV_Y, OV_H = 2, 30           # overview filmstrip (whole video) with the zoomed view window
+RU_Y, RU_H = 40, 18          # ruler
+ST_Y, ST_H = 60, 64          # filmstrip
+CV_Y, CV_H = ST_Y + ST_H + 4, 18  # cover knob row
+HEIGHT = CV_Y + CV_H + 2
+HW = 12                      # trim handle width
+MIN_SEL = 0.3
+DEFAULT_SEL = 3.0
+
+
+def fmt(t, fine=True):
+    m, s = divmod(max(0.0, t), 60)
+    return f"{int(m)}:{s:05.2f}" if fine else f"{int(m)}:{int(s):02d}"
+
+
+class Timeline(Gtk.DrawingArea):
+    """Emits changed(what) with what in start|end|move|cover|scrub. Times are absolute seconds."""
+    __gsignals__ = {"changed": (GObject.SignalFlags.RUN_FIRST, None, (str,))}
+
+    def __init__(self, src, duration, aspect):
+        super().__init__(content_height=HEIGHT, hexpand=True, focusable=False)
+        self.src, self.D, self.aspect = src, max(duration, 0.1), aspect
+        self.s, self.e = 0.0, min(DEFAULT_SEL, self.D)
+        self.k = self.p = 0.0
+        self.k = (self.s + self.e) / 2
+        span = self.D if self.D <= 60 else 30.0
+        self.v0, self.v1 = 0.0, span
+        self.frames, self.wanted = {}, set()
+        self.pool = ThreadPoolExecutor(max_workers=3)
+        self.mode, self.mx = None, 0.0
+        self.set_draw_func(self._draw)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", self._begin)
+        drag.connect("drag-update", self._update)
+        drag.connect("drag-end", lambda *_: setattr(self, "mode", None))
+        self.add_controller(drag)
+        scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES)
+        scroll.connect("scroll", self._scroll)
+        self.add_controller(scroll)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._motion)
+        self.add_controller(motion)
+
+    # --- geometry -------------------------------------------------------------------------------
+    def _w(self):
+        return max(1, self.get_width() - 2 * PAD)
+
+    def x(self, t):
+        return PAD + (t - self.v0) / (self.v1 - self.v0) * self._w()
+
+    def t(self, x):
+        return self.v0 + (x - PAD) / self._w() * (self.v1 - self.v0)
+
+    def ox(self, t):
+        return PAD + t / self.D * self._w()
+
+    def set_view(self, v0, span):
+        span = min(self.D, max(min(self.D, 1.0), span))
+        v0 = min(max(0.0, v0), self.D - span)
+        self.v0, self.v1 = v0, v0 + span
+        self.queue_draw()
+
+    def zoom(self, factor, around=None):
+        around = (self.v0 + self.v1) / 2 if around is None else around
+        span = (self.v1 - self.v0) * factor
+        frac = (around - self.v0) / (self.v1 - self.v0)
+        self.set_view(around - frac * span, span)
+
+    def zoom_to_selection(self):
+        span = (self.e - self.s) * 3
+        self.set_view(self.s - (span - (self.e - self.s)) / 2, span)
+
+    def set_selection(self, s, e, what="move"):
+        self.s, self.e = s, e
+        self.k = min(max(self.k, s), e)
+        self.queue_draw()
+        self.emit("changed", what)
+
+    # --- input ----------------------------------------------------------------------------------
+    def _hit(self, x, y):
+        if y < RU_Y:
+            return "overview"
+        if y >= CV_Y and abs(x - self.x(self.k)) < 28:
+            return "cover"
+        xs, xe = self.x(self.s), self.x(self.e)
+        if ST_Y <= y < CV_Y or RU_Y <= y < ST_Y:
+            ds, de = abs(x - (xs - HW / 2)), abs(x - (xe + HW / 2))
+            if min(ds, de) <= HW:
+                return "start" if ds < de else "end"
+        if ST_Y <= y < ST_Y + ST_H and xs < x < xe:
+            return "move"
+        return "scrub"
+
+    def _motion(self, _c, x, y):
+        self.mx = x
+        cursor = {"start": "ew-resize", "end": "ew-resize", "move": "grab", "cover": "grab",
+                  "overview": "pointer"}.get(self._hit(x, y), "text")
+        self.set_cursor_from_name(cursor)
+
+    def _begin(self, _g, x, y):
+        self.mode = self._hit(x, y)
+        self.x0, self.grab = x, self.t(x)
+        self.sel0, self.k0 = (self.s, self.e), self.k
+        self._apply(x)
+
+    def _update(self, _g, dx, _dy):
+        if self.mode:
+            self._apply(self.x0 + dx)
+
+    def _apply(self, x):
+        t = min(max(self.t(x), 0.0), self.D)
+        m = self.mode
+        if m == "overview":
+            ot = (x - PAD) / self._w() * self.D
+            span = self.v1 - self.v0
+            self.set_view(ot - span / 2, span)
+            return
+        if m == "start":
+            self.s = min(t, self.e - MIN_SEL)
+        elif m == "end":
+            self.e = max(t, self.s + MIN_SEL)
+        elif m == "move":
+            length = self.sel0[1] - self.sel0[0]
+            self.s = min(max(self.sel0[0] + (t - self.grab), 0.0), self.D - length)
+            self.e = self.s + length
+            self.k = self.k0 + (self.s - self.sel0[0])
+        elif m == "cover":
+            self.k = t
+        else:
+            self.p = t
+        self.k = min(max(self.k, self.s), self.e)
+        self.queue_draw()
+        self.emit("changed", m)
+
+    def _scroll(self, ctrl, dx, dy):
+        state = ctrl.get_current_event_state()
+        span = self.v1 - self.v0
+        if dx or state & Gdk.ModifierType.SHIFT_MASK:
+            self.set_view(self.v0 + (dx or dy) * span * 0.08, span)
+        else:
+            self.zoom(1.2 ** dy, self.t(self.mx))
+        return True
+
+    # --- filmstrip frames -----------------------------------------------------------------------
+    def _frame(self, t):
+        pb = self.frames.get(t)
+        if pb is None and t not in self.wanted:
+            self.wanted.add(t)
+            self.pool.submit(self._load, t)
+        return pb
+
+    def _load(self, t):
+        if t not in self.wanted:  # scrolled away before we got to it
+            return
+        pb = thumbs.grab_frame(self.src, t, ST_H * 2)
+
+        def done():
+            self.wanted.discard(t)
+            if pb:
+                self.frames[t] = pb
+                if len(self.frames) > 600:
+                    self.frames.pop(next(iter(self.frames)))
+                self.queue_draw()
+        GLib.idle_add(done)
+
+    def _nearest(self, t):
+        if not self.frames:
+            return None
+        return self.frames[min(self.frames, key=lambda k: abs(k - t))]
+
+    # --- drawing --------------------------------------------------------------------------------
+    @staticmethod
+    def _rrect(cr, x, y, w, h, r):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.close_path()
+
+    def _text(self, cr, x, y, text, size=8, rgba=(1, 1, 1, 0.7), bold=False, center=False):
+        layout = PangoCairo.create_layout(cr)
+        layout.set_font_description(Pango.FontDescription(f"Sans {'Bold ' if bold else ''}{size}"))
+        layout.set_text(text, -1)
+        w = layout.get_pixel_size()[0]
+        cr.set_source_rgba(*rgba)
+        cr.move_to(x - (w / 2 if center else 0), y)
+        PangoCairo.show_layout(cr, layout)
+
+    def _strip(self, cr, y, h, v0, v1, xf):
+        """Filmstrip of [v0, v1] into rows y..y+h, xf maps time → x. Frames sit on a power-of-2 time grid,
+        so they're reused across zoom levels; missing ones fall back to the nearest cached frame."""
+        pps = self._w() / (v1 - v0)
+        fstep = 2 ** math.ceil(math.log2(max(h * self.aspect / pps, 1 / 64)))
+        k = int(v0 // fstep)
+        while k * fstep < min(v1, self.D):
+            t = k * fstep
+            pb = self._frame(round(t, 4)) or self._nearest(t)
+            if pb:
+                x, cw = xf(t), fstep * pps
+                sc = max(cw / pb.get_width(), h / pb.get_height())
+                cr.save()
+                cr.rectangle(x, y, cw + 0.5, h)
+                cr.clip()
+                cr.translate(x + (cw - pb.get_width() * sc) / 2, y + (h - pb.get_height() * sc) / 2)
+                cr.scale(sc, sc)
+                Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+                cr.paint()
+                cr.restore()
+            k += 1
+
+    def _draw(self, _a, cr, W, _H):
+        w = self._w()
+        span = self.v1 - self.v0
+        # overview: whole video, dimmed except the zoomed view window; selection as a yellow bar
+        cr.save()
+        self._rrect(cr, PAD, OV_Y, w, OV_H, 6)
+        cr.clip()
+        cr.set_source_rgba(1, 1, 1, 0.06)
+        cr.paint()
+        self._strip(cr, OV_Y, OV_H, 0.0, self.D, self.ox)
+        ov0, ov1 = self.ox(self.v0), max(self.ox(self.v1), self.ox(self.v0) + 6)
+        cr.set_source_rgba(0, 0, 0, 0.55)
+        cr.rectangle(0, OV_Y, ov0, OV_H)
+        cr.rectangle(ov1, OV_Y, W, OV_H)
+        cr.fill()
+        cr.set_source_rgb(*YELLOW)
+        cr.rectangle(self.ox(self.s), OV_Y + OV_H - 5, max(3, self.ox(self.e) - self.ox(self.s)), 5)
+        cr.fill()
+        cr.restore()
+        self._rrect(cr, ov0, OV_Y, ov1 - ov0, OV_H, 4)
+        cr.set_source_rgba(1, 1, 1, 0.9)
+        cr.set_line_width(2)
+        cr.stroke()
+        # ruler
+        pps = w / span
+        step = next((s for s in (0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600) if s * pps >= 80), 1200)
+        t = math.ceil(self.v0 / step) * step
+        while t <= self.v1:
+            x = self.x(t)
+            cr.set_source_rgba(1, 1, 1, 0.3)
+            cr.rectangle(x, RU_Y + 12, 1, 6)
+            cr.fill()
+            self._text(cr, x + 3, RU_Y, fmt(t, step < 1))
+            t += step
+        # filmstrip
+        cr.save()
+        self._rrect(cr, PAD, ST_Y, w, ST_H, 8)
+        cr.clip()
+        cr.set_source_rgba(1, 1, 1, 0.06)
+        cr.paint()
+        self._strip(cr, ST_Y, ST_H, self.v0, self.v1, self.x)
+        # dim outside selection; past the end of the video
+        xs, xe = self.x(self.s), self.x(self.e)
+        cr.set_source_rgba(0, 0, 0, 0.62)
+        cr.rectangle(0, ST_Y, max(0, xs), ST_H)
+        cr.rectangle(xe, ST_Y, max(0, W - xe), ST_H)
+        cr.fill()
+        cr.restore()
+        # selection frame + handles
+        cr.set_source_rgb(*YELLOW)
+        cr.rectangle(xs, ST_Y, xe - xs, 3)
+        cr.rectangle(xs, ST_Y + ST_H - 3, xe - xs, 3)
+        cr.fill()
+        for hx in (xs - HW, xe):
+            self._rrect(cr, hx, ST_Y, HW, ST_H, 4)
+            cr.set_source_rgb(*YELLOW)
+            cr.fill()
+            cr.set_source_rgba(0, 0, 0, 0.6)
+            cr.rectangle(hx + HW / 2 - 1, ST_Y + ST_H / 2 - 10, 2, 20)
+            cr.fill()
+        # cover marker
+        xk = self.x(self.k)
+        cr.set_source_rgba(1, 1, 1, 0.9)
+        cr.rectangle(xk - 1, ST_Y + 3, 2, ST_H - 6)
+        cr.fill()
+        self._rrect(cr, xk - 24, CV_Y, 48, CV_H, CV_H / 2)
+        cr.fill()
+        self._text(cr, xk, CV_Y + 2, "COVER", 7, (0, 0, 0, 0.85), True, True)
+        # playhead
+        xp = self.x(self.p)
+        if PAD - 1 <= xp <= W - PAD + 1:
+            cr.set_source_rgb(0.9, 0.2, 0.2)
+            cr.rectangle(xp - 1, RU_Y + 6, 2, ST_Y + ST_H - RU_Y - 6)
+            cr.fill()
+            cr.move_to(xp - 5, RU_Y + 4)
+            cr.line_to(xp + 5, RU_Y + 4)
+            cr.line_to(xp, RU_Y + 10)
+            cr.fill()
+        # selection length pill above the selection
+        label = f"{self.e - self.s:.1f}s"
+        self._rrect(cr, (xs + xe) / 2 - 22, ST_Y - 18, 44, 16, 8)
+        cr.set_source_rgb(*YELLOW)
+        cr.fill()
+        self._text(cr, (xs + xe) / 2, ST_Y - 17, label, 8, (0, 0, 0, 0.9), True, True)
+
+
+class EditorPage(Adw.NavigationPage):
+    """Pick a stretch of a video/GIF and save it as a live image."""
+
+    def __init__(self, src, on_saved):
+        super().__init__(title="Create Live Image")
+        self.src, self.on_saved = src, on_saved
+        dur, vw, vh = thumbs.probe(src)
+        self.D = dur or 1.0
+        self.preview_pool = ThreadPoolExecutor(max_workers=1)
+        self.req = 0
+        self.stream, self.tick, self.proxies = None, 0, set()
+
+        self.tl = Timeline(src, self.D, vw / vh if vh else 16 / 9)
+        self.tl.connect("changed", self._changed)
+
+        self.pic = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, vexpand=True, hexpand=True)
+        frame = Gtk.Overlay(css_classes=["viewer", "card"], overflow=Gtk.Overflow.HIDDEN, child=self.pic)
+        self.spinner = Gtk.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, width_request=32,
+                                   height_request=32)
+        frame.add_overlay(self.spinner)
+
+        self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", tooltip_text="Play selection (Space)",
+                                   css_classes=["circular", "suggested-action"])
+        self.play_btn.connect("clicked", lambda *_: self.toggle_play())
+        self.time_lbl = Gtk.Label(css_classes=["numeric", "dim-label"], width_chars=16, xalign=0)
+        presets = Gtk.Box(css_classes=["linked"])
+        for secs in (1.5, 3, 5):
+            b = Gtk.Button(label=f"{secs:g}s", tooltip_text=f"Make the selection {secs:g} seconds long")
+            b.connect("clicked", lambda _b, n=secs: self._set_length(n))
+            presets.append(b)
+        here = Gtk.Button(label="Start at playhead", tooltip_text="Move the selection so it starts at the red playhead")
+        here.connect("clicked", lambda *_: self._start_at_playhead())
+        cover = Gtk.Button(label="Cover = playhead", tooltip_text="Use the frame under the red playhead as the still")
+        cover.connect("clicked", lambda *_: self._cover_at_playhead())
+        zoom = Gtk.Box(css_classes=["linked"])
+        for icon, tip, fn in (("zoom-out-symbolic", "Zoom out", lambda: self.tl.zoom(1.6)),
+                              ("zoom-fit-best-symbolic", "Zoom to selection", self.tl.zoom_to_selection),
+                              ("zoom-in-symbolic", "Zoom in", lambda: self.tl.zoom(1 / 1.6))):
+            b = Gtk.Button(icon_name=icon, tooltip_text=tip)
+            b.connect("clicked", lambda _b, f=fn: f())
+            zoom.append(b)
+        controls = Gtk.Box(spacing=8)
+        for wdg in (self.play_btn, self.time_lbl, Gtk.Box(hexpand=True), here, cover, presets, zoom):
+            controls.append(wdg)
+
+        hint = Gtk.Label(wrap=True, css_classes=["dim-label", "caption"], label=(
+            "Drag the yellow handles to trim · drag inside the selection to move it · drag COVER to pick the still · "
+            "click to move the playhead · scroll to zoom, Shift+scroll to pan · drag the top bar to jump around"))
+
+        self.save_btn = Gtk.Button(label="Save Live Image", css_classes=["suggested-action"])
+        self.save_btn.connect("clicked", self._save)
+        header = Adw.HeaderBar()
+        header.pack_end(self.save_btn)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_start=18, margin_end=18,
+                      margin_top=12, margin_bottom=18)
+        for wdg in (frame, controls, self.tl, hint):
+            box.append(wdg)
+        tv = Adw.ToolbarView(content=box)
+        tv.add_top_bar(header)
+        self.set_child(tv)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._key)
+        self.add_controller(keys)
+        self.connect("hidden", lambda *_: self._cleanup())
+        self._show_frame(self.tl.k)
+        self._update_label()
+
+    # --- preview --------------------------------------------------------------------------------
+    def _show_frame(self, t):
+        self.req += 1
+        req = self.req
+        self.preview_pool.submit(self._grab, t, req)
+
+    def _grab(self, t, req):
+        if req != self.req:  # a newer request superseded this one
+            return
+        pb = thumbs.grab_frame(self.src, t, 720)
+
+        def done():
+            if req == self.req and pb and self.stream is None:
+                self.pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb))
+        GLib.idle_add(done)
+
+    def toggle_play(self):
+        if self.stream or self.spinner.get_spinning():
+            self.stop()
+            return
+        s, e = self.tl.s, self.tl.e
+        self.spinner.start()
+        self.play_btn.set_icon_name("media-playback-pause-symbolic")
+        req = self.req = self.req + 1
+
+        def work():
+            try:
+                path = thumbs.mp4_proxy(self.src, s, e, 540)
+            except Exception:
+                path = None
+            GLib.idle_add(start, path)
+
+        def start(path):
+            self.spinner.stop()
+            if req != self.req or not path:
+                return self.stop()
+            self.proxies.add(path)
+            self.stream = Gtk.MediaFile.new_for_filename(path)
+            self.stream.set_loop(True)
+            hid = self.stream.connect("invalidate-contents", lambda st: (st.disconnect(hid), self.pic.set_paintable(st)))
+            self.stream.play()
+            self.tick = GLib.timeout_add(40, self._on_tick, s)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_tick(self, s):
+        if not self.stream:
+            self.tick = 0
+            return False
+        self.tl.p = s + self.stream.get_timestamp() / 1e6
+        self.tl.queue_draw()
+        self._update_label()
+        return True
+
+    def stop(self):
+        self.req += 1
+        self.spinner.stop()
+        self.play_btn.set_icon_name("media-playback-start-symbolic")
+        if self.tick:
+            GLib.source_remove(self.tick)
+            self.tick = 0
+        if self.stream:
+            self.stream.set_playing(False)
+            self.stream = None
+            self._show_frame(self.tl.p)
+
+    def _cleanup(self):
+        self.stop()
+        for p in self.proxies:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    # --- edits ----------------------------------------------------------------------------------
+    def _changed(self, _tl, what):
+        self.stop()
+        self._show_frame({"start": self.tl.s, "end": self.tl.e, "move": self.tl.s, "cover": self.tl.k}.get(what, self.tl.p))
+        self._update_label()
+
+    def _update_label(self):
+        self.time_lbl.set_label(f"{fmt(self.tl.p)} / {fmt(self.D, False)}")
+
+    def _set_length(self, n):
+        s = min(self.tl.s, max(0.0, self.D - n))
+        self.tl.set_selection(s, min(self.D, s + n), "move")
+        self.tl.zoom_to_selection()
+
+    def _start_at_playhead(self):
+        length = self.tl.e - self.tl.s
+        s = min(self.tl.p, max(0.0, self.D - length))
+        self.tl.k += s - self.tl.s
+        self.tl.set_selection(s, s + length, "move")
+
+    def _cover_at_playhead(self):
+        if not (self.tl.s <= self.tl.p <= self.tl.e):
+            self._start_at_playhead()
+        self.tl.k = self.tl.p
+        self.tl.queue_draw()
+        self._show_frame(self.tl.k)
+
+    def _key(self, _c, keyval, _code, state):
+        fps_step = 1.0 if state & Gdk.ModifierType.SHIFT_MASK else 1 / 24
+        if keyval == Gdk.KEY_space:
+            self.toggle_play()
+        elif keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
+            self.stop()
+            self.tl.p = min(max(0.0, self.tl.p + (fps_step if keyval == Gdk.KEY_Right else -fps_step)), self.D)
+            if not self.tl.v0 <= self.tl.p <= self.tl.v1:
+                self.tl.set_view(self.tl.p - (self.tl.v1 - self.tl.v0) / 2, self.tl.v1 - self.tl.v0)
+            self.tl.queue_draw()
+            self._show_frame(self.tl.p)
+            self._update_label()
+        else:
+            return False
+        return True
+
+    # --- save -----------------------------------------------------------------------------------
+    def _save(self, _b):
+        self.stop()
+        self.save_btn.set_sensitive(False)
+        self.save_btn.set_label("Saving…")
+        s, e, k = self.tl.s, self.tl.e, self.tl.k
+
+        def work():
+            try:
+                res, err = livemake.make_live(self.src, s, e, min(k - s, e - s - 0.04)), None
+            except Exception as ex:  # surfaced as a toast
+                res, err = None, str(ex)
+            GLib.idle_add(self.on_saved, self, res, err)
+        threading.Thread(target=work, daemon=True).start()

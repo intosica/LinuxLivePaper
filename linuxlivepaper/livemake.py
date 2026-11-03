@@ -5,19 +5,21 @@ import time
 import uuid
 from pathlib import Path
 
-from .library import LIBRARY_DIR
+from .library import library_dir
 
 
-def make_live(src, start=0.0, end=None, key_time=None, out_dir=LIBRARY_DIR, name=None):
-    """Trim src to [start, end] → <name>.mov, and grab the frame at key_time (relative to start) → <name>.jpg."""
-    out_dir = Path(out_dir)
+def make_live(src, start=0.0, end=None, key_time=None, out_dir=None, name=None):
+    """Trim src (video or GIF) to [start, end] → <name>.mov, and grab the frame at key_time
+    (relative to start) → <name>.jpg. Defaults to the library folder."""
+    out_dir = Path(out_dir or library_dir())
     out_dir.mkdir(parents=True, exist_ok=True)
     name = name or time.strftime("LLP_%Y%m%d_%H%M%S")
     mov, jpg = out_dir / f"{name}.mov", out_dir / f"{name}.jpg"
     cid = str(uuid.uuid4()).upper()
     trim = ["-ss", f"{start:.3f}"] + (["-to", f"{end:.3f}"] if end is not None else [])
     subprocess.run(["ffmpeg", "-v", "error", "-y", *trim, "-i", str(src),
-                    "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+                    "-map", "0:v:0", "-map", "0:a:0?", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p",
+                    "-c:v", "libx264", "-crf", "18",
                     "-c:a", "aac", "-movflags", "use_metadata_tags",
                     "-metadata", f"com.apple.quicktime.content.identifier={cid}",
                     "-metadata", "com.apple.quicktime.software=LinuxLivePaper", str(mov)], check=True)
@@ -36,8 +38,12 @@ if __name__ == "__main__":
         out = Path(d, "out")
         jpg, mov = make_live(src, 1.0, 3.0, 0.5, out, "t")
         assert jpg.stat().st_size and mov.stat().st_size
-        assert [i.kind for i in scan([out])] == ["live"]
+        assert [i.kind for i in scan(out)] == ["live"]
         tags = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags", str(mov)],
                               capture_output=True, text=True).stdout
         assert "content.identifier" in tags, tags
+        gif = Path(d, "g.gif")
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=99x75:d=2", str(gif)], check=True)
+        jpg, mov = make_live(gif, 0, 1.5, 0.2, out, "g")
+        assert mov.stat().st_size and jpg.stat().st_size
     print("livemake ok")

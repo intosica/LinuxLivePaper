@@ -5,11 +5,13 @@ Read this first. Update it before you stop (state, files touched, next steps, lo
 ## Goal
 **LinuxLivePaper** (`/home/montel/Documents/LinuxLivePaper`) is a **Linux-exclusive entertainment app** for
 *live images* (stills that play when pressed, iPhone-Live-Photo style), inspired by the iOS app *intoLive*.
-1. **Gallery** of the user's own collection (photos, videos, GIFs, live images) in an attractive grid. This is the core experience.
+1. **Gallery** of the LinuxLivePaper library folder (live images, videos, GIFs; **no standalone photos**) in an attractive grid.
 2. **Creator** with intoLive-style video effects/editing that outputs live images.
 
 The user's decisions:
 - iOS/iPhone compatibility doesn't matter for now ("we can worry about the format working outside of the Linux version later").
+- The library is ONE user-settable folder, default `~/Videos/LinuxLivePaper`; creations are saved there.
+- The creator must be timeline-based (no typing seconds).
 - Windows comes later. It's not a desktop-wallpaper engine (that would be a separate Rust project).
 
 ## Read in this order
@@ -19,11 +21,27 @@ The user's decisions:
 4. `docs/INTOLIVE-ANALYSIS.md`: intoLive feature map, to use as the parity checklist for the creator
 
 ## Current state
-- ✅ Gallery MVP (`linuxlivepaper/app.py`, `library.py`, `thumbs.py`): grid, filters, LIVE/GIF/duration badges,
-  hover-to-play, viewer (press-and-hold live with sound, video, GIF, ←/→/Esc/Space).
-- ✅ Quick creator (`livemake.py` + `CreateDialog`, the **+** button): video → trim + cover frame → `~/Pictures/LinuxLivePaper/LLP_*.jpg/.mov`.
-- A demo item `~/Pictures/LinuxLivePaper/LLP_test.{jpg,mov}` was made from a screencast. It's safe to delete.
-- Self-checks: `/usr/bin/python3 -m linuxlivepaper.library`, `/usr/bin/python3 -m linuxlivepaper.livemake`.
+- ✅ Gallery (`linuxlivepaper/app.py`, `library.py`, `thumbs.py`): grid of the library folder, filters All/Live/Videos/GIFs,
+  badges, hover-to-play, viewer (press-and-hold live with sound, video with controls, GIF, ←/→/Esc/Space),
+  import button (copies into the library), ☰ menu: Library Folder… (Adw.PreferencesDialog), Open Library Folder, Rescan.
+  Library path persisted in `~/.config/linuxlivepaper/config.json` (`{"library": "..."}`).
+- ✅ Timeline editor (`editor.py`: `Timeline` DrawingArea + `EditorPage`), opened by **+** or the viewer's *Make Live Image*:
+  overview strip, zoomable filmstrip, trim handles, movable selection, COVER marker, playhead, presets 1.5/3/5 s.
+  Output via `livemake.make_live` → `<library>/LLP_*.jpg/.mov`. Video and GIF sources both work.
+- Demo items `~/Videos/LinuxLivePaper/LLP_test.*` and `LLP_20261102_224701.*` are made from screencasts. Safe to delete.
+- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake}`.
+
+### Hard-won facts (don't relearn these)
+- GTK's GStreamer `Gtk.MediaFile.seek()` while **paused** reports success but doesn't render the frame (black).
+  So the editor shows exact **ffmpeg frame grabs** (`thumbs.grab_frame`, ~0.25 s on a 1080p episode) while paused,
+  and plays a cached **ffmpeg proxy of exactly the selection** (`thumbs.mp4_proxy(src, s, e, 540)`) for looping playback.
+- **GStreamer can't play GIFs** in `Gtk.MediaFile` (no video, no error), and **GdkPixbuf fails on many real GIFs**
+  ("Not all frames of the GIF image were loaded"). GIFs go through ffmpeg: thumbnails via `grab_frame`, playback
+  via an MP4 proxy in `~/.cache/linuxlivepaper/proxies/`.
+- Audio: playback with sound works (verified via `pactl list sink-inputs`). The user's 23 screencasts in ~/Videos/Screencasts
+  have **no audio track**, so anything made from them is silent. Grid hover is muted on purpose; the viewer and editor play sound.
+- Test video with audio: `/media/montel/Extreme SSD/Yu-Gi-Oh Arc-V Episode 18 English SubbedDubbed Aniwatch.mp4` (21:55, 1080p).
+  Test GIFs: `/home/montel/Documents/GifDeck/GIFs/`.
 
 ## How to test the UI headlessly (without capturing the user's real screen!)
 ```bash
@@ -33,9 +51,13 @@ import gi, sys; gi.require_version('Gdk','3.0')
 from gi.repository import Gdk
 w=Gdk.get_default_root_window(); Gdk.pixbuf_get_from_window(w,0,0,w.get_width(),w.get_height()).savev(sys.argv[1],'png',[],[])
 EOF
-xvfb-run -a -s "-screen 0 1400x900x24" bash -c '/usr/bin/python3 -m linuxlivepaper & P=$!; sleep 10;
+# point the app at a throwaway library so tests don't touch the user's folder
+mkdir -p /tmp/llpcfg/linuxlivepaper /tmp/llplib && echo '{"library": "/tmp/llplib"}' > /tmp/llpcfg/linuxlivepaper/config.json
+XDG_CONFIG_HOME=/tmp/llpcfg xvfb-run -a -s "-screen 0 1400x900x24" bash -c '/usr/bin/python3 -m linuxlivepaper & P=$!; sleep 10;
   xdotool mousemove 130 200; sleep 2; /usr/bin/python3 /tmp/shot.py /tmp/shot.png; kill $P'
 ```
+To open the editor directly, run a small script that calls `App().run()` and, from a `GLib.timeout_add`, calls
+`app.props.active_window.open_editor(path)`.
 Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` display; it shows their private browsing.
 
 ## Environment gotchas
@@ -43,7 +65,6 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - GNOME 46 on X11. Installed: ffmpeg 6.1.1, GStreamer 1.24 (libav, avdec_gif, h265 decode), exiftool, Xvfb, xdotool.
   NVENC is available (`h264_nvenc`, `hevc_nvenc`).
 - No new dependencies unless unavoidable (stdlib + PyGObject + ffmpeg CLI).
-- The user's collection is ~350 files, mostly PNG screenshots plus 23 MP4 screencasts.
 - Ghidra MCP (pyghidra-mcp) is its own empty project, not the user's CodeBrowser. Not needed now. Only revisit it for
   iPhone-compat details (`LiveVideoWriter`, `LiveKeyPhotoWriter`).
 
@@ -52,11 +73,14 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - Every non-trivial module gets one runnable self-check (`if __name__ == "__main__":` asserts).
 
 ## Next steps (suggested order)
-1. Gallery polish: folder management + config, date sections, fullscreen/zoom, context menu (trash, open folder), favorites.
-2. Creator Phase 2: `project.py` + `render.py` (ffmpeg filter graph), then the editor page and effects (ROADMAP Phases 3–4).
+1. Creator: grow `editor.py` into the full editor: `project.py` + `render.py` (ffmpeg filter graph), then speed/crop/
+   filters/effects/text panels beside the timeline (ROADMAP Phases 2–4). Preview = proxy render of the selection.
+2. Gallery polish: date sections, Gio.FileMonitor live reload, context menu (trash, open folder), fullscreen.
 3. Package it: a `.desktop` file + icon.
 
 ## Log
 - 2026-11-02: Phase 0. Static IPA analysis.
 - 2026-11-02: Scope v2: iPhone Live Photo creator (superseded).
 - 2026-11-02: Scope v3 (current): a Linux-exclusive gallery + creator; iOS compat deferred. Built the gallery MVP + quick creator; docs rewritten.
+- 2026-11-02: Fixed GIF import/viewing (ffmpeg thumbs + MP4 proxies). Removed photos. Single library folder (default ~/Videos/LinuxLivePaper, settable).
+  Replaced the seconds-typing CreateDialog with the timeline editor (`editor.py`). Audio checked: it works; the screencasts are silent.
