@@ -13,6 +13,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GLib, GObject, Gtk, Pango, PangoCairo  # noqa: E402
 
 from . import livemake, thumbs  # noqa: E402
+from .playback import media_file  # noqa: E402
 
 YELLOW = (0.96, 0.76, 0.07)
 PAD = 16                     # horizontal padding so edge handles stay grabbable
@@ -419,8 +420,7 @@ class EditorPage(Adw.NavigationPage):
             if req != self.req or not path:
                 return self.stop()
             self.proxies.add(path)
-            self.stream = Gtk.MediaFile.new_for_filename(path)
-            self.stream.set_loop(True)
+            self.stream = media_file(path, muted=False, loop=True)
             hid = self.stream.connect("invalidate-contents", lambda st: (st.disconnect(hid), self.pic.set_paintable(st)))
             self.stream.play()
             self.tick = GLib.timeout_add(40, self._on_tick, s)

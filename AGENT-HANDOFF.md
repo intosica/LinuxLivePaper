@@ -29,7 +29,10 @@ The user's decisions:
   overview strip, zoomable filmstrip, trim handles, movable selection, COVER marker, playhead, presets 1.5/3/5 s.
   Output via `livemake.make_live` → `<library>/LLP_*.jpg/.mov`. Video and GIF sources both work.
 - Demo items `~/Videos/LinuxLivePaper/LLP_test.*` and `LLP_20261102_224701.*` are made from screencasts. Safe to delete.
-- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake}`.
+- ✅ Press-and-hold transition (`playback.py: LiveCanvas`): the still pushes in and smears into a radial motion blur +
+  gaussian blur, the video cross-fades in through it and sharpens (0.55 s); release reverses it (0.40 s). Knobs at the
+  top of `playback.py` (`T_IN`, `T_OUT`, `BLUR_PX`, `ZOOM_BLUR`, `HOLD_ZOOM`). Space works as hold too.
+- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake,playback}`.
 
 ### Hard-won facts (don't relearn these)
 - GTK's GStreamer `Gtk.MediaFile.seek()` while **paused** reports success but doesn't render the frame (black).
@@ -38,6 +41,10 @@ The user's decisions:
 - **GStreamer can't play GIFs** in `Gtk.MediaFile` (no video, no error), and **GdkPixbuf fails on many real GIFs**
   ("Not all frames of the GIF image were loaded"). GIFs go through ffmpeg: thumbnails via `grab_frame`, playback
   via an MP4 proxy in `~/.cache/linuxlivepaper/proxies/`.
+- **PipeWire mute bug**: PipeWire remembers the last mute state per app. After a muted hover preview, a new
+  `Gtk.MediaFile` comes up muted at the sink while GTK reports `muted=False` (so it never re-sends it). Always create
+  streams with `playback.media_file()`, which re-asserts the mute state on `notify::prepared`. Check with
+  `pactl -f json list sink-inputs` filtered by `application.process.id`.
 - Audio: playback with sound works (verified via `pactl list sink-inputs`). The user's 23 screencasts in ~/Videos/Screencasts
   have **no audio track**, so anything made from them is silent. Grid hover is muted on purpose; the viewer and editor play sound.
 - Test video with audio: `/media/montel/Extreme SSD/Yu-Gi-Oh Arc-V Episode 18 English SubbedDubbed Aniwatch.mp4` (21:55, 1080p).
@@ -56,7 +63,8 @@ mkdir -p /tmp/llpcfg/linuxlivepaper /tmp/llplib && echo '{"library": "/tmp/llpli
 XDG_CONFIG_HOME=/tmp/llpcfg xvfb-run -a -s "-screen 0 1400x900x24" bash -c '/usr/bin/python3 -m linuxlivepaper & P=$!; sleep 10;
   xdotool mousemove 130 200; sleep 2; /usr/bin/python3 /tmp/shot.py /tmp/shot.png; kill $P'
 ```
-To open the editor directly, run a small script that calls `App().run()` and, from a `GLib.timeout_add`, calls
+The app is a unique GApplication: if the user has it open, a test launch just raises THEIR window. Test scripts
+must add `Gio.ApplicationFlags.NON_UNIQUE`. To open the editor directly, run a small script that calls `App().run()` and, from a `GLib.timeout_add`, calls
 `app.props.active_window.open_editor(path)`.
 Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` display; it shows their private browsing.
 
@@ -73,9 +81,11 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - Every non-trivial module gets one runnable self-check (`if __name__ == "__main__":` asserts).
 
 ## Next steps (suggested order)
-1. Creator: grow `editor.py` into the full editor: `project.py` + `render.py` (ffmpeg filter graph), then speed/crop/
+1. More effects. The press transition is done; next are editor effects baked into the MOV (see ROADMAP Phase 4).
+   Maybe make the press transition style selectable (blur / zoom / none) and stored per item.
+2. Creator: grow `editor.py` into the full editor: `project.py` + `render.py` (ffmpeg filter graph), then speed/crop/
    filters/effects/text panels beside the timeline (ROADMAP Phases 2–4). Preview = proxy render of the selection.
-2. Gallery polish: date sections, Gio.FileMonitor live reload, context menu (trash, open folder), fullscreen.
+3. Gallery polish: date sections, Gio.FileMonitor live reload, context menu (trash, open folder), fullscreen.
 3. Package it: a `.desktop` file + icon.
 
 ## Log
@@ -84,3 +94,4 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - 2026-11-02: Scope v3 (current): a Linux-exclusive gallery + creator; iOS compat deferred. Built the gallery MVP + quick creator; docs rewritten.
 - 2026-11-02: Fixed GIF import/viewing (ffmpeg thumbs + MP4 proxies). Removed photos. Single library folder (default ~/Videos/LinuxLivePaper, settable).
   Replaced the seconds-typing CreateDialog with the timeline editor (`editor.py`). Audio checked: it works; the screencasts are silent.
+- 2026-11-02: Fixed live audio being muted after hover previews (PipeWire mute restore). Added the immersive press transition (`playback.py`).

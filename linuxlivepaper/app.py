@@ -11,6 +11,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from . import library, thumbs  # noqa: E402
 from .editor import EditorPage  # noqa: E402
+from .playback import LiveCanvas, media_file, play_stream  # noqa: E402
 
 APP_ID = "io.github.linuxlivepaper"
 TILE = 220
@@ -46,21 +47,6 @@ def media_filters():
     store = Gio.ListStore(item_type=Gtk.FileFilter)
     store.append(f)
     return store
-
-
-def play_stream(path, picture, muted=True, loop=True):
-    """Start playing path and swap it into picture once the first frame is decoded (no black flash)."""
-    m = Gtk.MediaFile.new_for_filename(path)
-    m.set_muted(muted)
-    m.set_loop(loop)
-
-    def first_frame(stream):
-        stream.disconnect(hid)
-        if stream.get_playing():
-            picture.set_paintable(stream)
-    hid = m.connect("invalidate-contents", first_frame)
-    m.play()
-    return m
 
 
 def playable(item, callback):
@@ -176,33 +162,34 @@ class Tile(Gtk.Overlay):
 
 
 class LiveView(Gtk.Overlay):
-    """Shows the still; press and hold (or Space) to play the motion with sound, like iOS."""
+    """Shows the still; press and hold (or hold Space) to play the motion with sound, like iOS,
+    with the immersive blur transition from playback.LiveCanvas."""
 
     def __init__(self, item):
         super().__init__()
         self.item = item
-        self.still = Gdk.Texture.new_from_filename(item.path)
-        self.pic = Gtk.Picture(paintable=self.still, content_fit=Gtk.ContentFit.CONTAIN)
-        self.set_child(self.pic)
+        self.canvas = LiveCanvas(Gdk.Texture.new_from_filename(item.path), item.motion,
+                                 on_idle=lambda: self.hint.set_visible(True))
+        self.set_child(self.canvas)
         self.add_overlay(badge("LIVE", "media-playlist-repeat-symbolic"))
-        self.add_overlay(Gtk.Label(label="Press and hold to play", css_classes=["hint"],
-                                   halign=Gtk.Align.CENTER, valign=Gtk.Align.END))
-        self.stream = None
+        self.hint = Gtk.Label(label="Press and hold to play", css_classes=["hint"],
+                              halign=Gtk.Align.CENTER, valign=Gtk.Align.END)
+        self.add_overlay(self.hint)
         press = Gtk.GestureClick()
         press.connect("pressed", lambda *_: self.play())
-        press.connect("released", lambda *_: self.stop())
+        press.connect("released", lambda *_: self.release())
+        press.connect("cancel", lambda *_: self.release())
         self.add_controller(press)
 
     def play(self):
-        self.stop()
-        self.stream = play_stream(self.item.motion, self.pic, muted=False, loop=False)
-        self.stream.connect("notify::ended", lambda s, _: s.get_ended() and self.stop())
+        self.hint.set_visible(False)
+        self.canvas.press()
+
+    def release(self):
+        self.canvas.release()
 
     def stop(self):
-        if self.stream:
-            self.stream.set_playing(False)
-            self.stream = None
-        self.pic.set_paintable(self.still)
+        self.canvas.stop()
 
 
 class Viewer(Adw.NavigationPage):
@@ -226,6 +213,7 @@ class Viewer(Adw.NavigationPage):
         self.set_child(tv)
         keys = Gtk.EventControllerKey()
         keys.connect("key-pressed", self._key)
+        keys.connect("key-released", self._key_up)
         self.add_controller(keys)
         self.connect("hidden", lambda *_: self._stop())
         self.show()
@@ -236,10 +224,15 @@ class Viewer(Adw.NavigationPage):
         elif keyval == Gdk.KEY_Escape:
             self.get_ancestor(Adw.NavigationView).pop()
         elif keyval == Gdk.KEY_space and isinstance(self.view, LiveView):
-            self.view.play()
+            if not self.view.canvas.is_live():  # ignore key auto-repeat
+                self.view.play()
         else:
             return False
         return True
+
+    def _key_up(self, _c, keyval, *_):
+        if keyval == Gdk.KEY_space and isinstance(self.view, LiveView):
+            self.view.release()
 
     def go(self, step):
         self.index = (self.index + step) % len(self.objs)
@@ -262,9 +255,8 @@ class Viewer(Adw.NavigationPage):
         if item.kind == "live":
             view = LiveView(item)
         elif item.kind == "video":
-            view = Gtk.Video.new_for_filename(item.path)
-            view.set_autoplay(True)
-            view.set_loop(True)
+            view = Gtk.Video(media_stream=media_file(item.path, muted=False, loop=True))
+            view.get_media_stream().play()
         else:  # gif: loop the MP4 proxy
             view = Gtk.Picture.new_for_filename(item.path)  # first frame until the proxy is ready
             view.set_content_fit(Gtk.ContentFit.CONTAIN)
