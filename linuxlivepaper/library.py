@@ -33,6 +33,30 @@ def set_library_dir(path):
     CONFIG.write_text(json.dumps(cfg, indent=2))
 
 
+META = ".linuxlivepaper.json"  # per-folder sidecar: {"<stem>": {"transition": "blur", ...}}
+
+
+def get_meta(path):
+    p = Path(path)
+    try:
+        return json.loads((p.parent / META).read_text()).get(p.stem, {})
+    except (OSError, ValueError):
+        return {}
+
+
+def set_meta(path, **kw):
+    p = Path(path)
+    f = p.parent / META
+    try:
+        data = json.loads(f.read_text())
+    except (OSError, ValueError):
+        data = {}
+    data.setdefault(p.stem, {}).update(kw)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    os.replace(tmp, f)
+
+
 @dataclass
 class Item:
     kind: str            # "live" | "video" | "gif"
@@ -92,4 +116,8 @@ if __name__ == "__main__":
         assert sorted(i.kind for i in items) == ["gif", "live", "video", "video"], items
         live = next(i for i in items if i.kind == "live")
         assert live.path.endswith("IMG_1.JPG") and live.motion.endswith("IMG_1.MOV")
+        set_meta(live.path, transition="zoom")
+        set_meta(Path(d, "IMG_1.MOV"), x=1)
+        assert get_meta(live.motion) == {"transition": "zoom", "x": 1} and get_meta(Path(d, "b.mp4")) == {}
+        assert len(scan(d)) == 4  # sidecar is hidden
     print("library ok")

@@ -12,8 +12,8 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GLib, GObject, Gtk, Pango, PangoCairo  # noqa: E402
 
-from . import livemake, thumbs  # noqa: E402
-from .playback import media_file  # noqa: E402
+from . import effects, library, livemake, thumbs  # noqa: E402
+from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file  # noqa: E402
 
 YELLOW = (0.96, 0.76, 0.07)
 PAD = 16                     # horizontal padding so edge handles stay grabbable
@@ -325,12 +325,16 @@ class EditorPage(Adw.NavigationPage):
         self.preview_pool = ThreadPoolExecutor(max_workers=1)
         self.req = 0
         self.stream, self.tick, self.proxies = None, 0, set()
+        self.opts = dict(effects.DEFAULT)
+        self.style = DEFAULT_STYLE
+        self.canvas, self.trying = None, False
 
         self.tl = Timeline(src, self.D, vw / vh if vh else 16 / 9)
         self.tl.connect("changed", self._changed)
 
         self.pic = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, vexpand=True, hexpand=True)
-        frame = Gtk.Overlay(css_classes=["viewer", "card"], overflow=Gtk.Overflow.HIDDEN, child=self.pic)
+        frame = Gtk.Overlay(css_classes=["viewer", "card"], overflow=Gtk.Overflow.HIDDEN, child=self.pic, hexpand=True)
+        self.frame = frame
         self.spinner = Gtk.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, width_request=32,
                                    height_request=32)
         frame.add_overlay(self.spinner)
@@ -368,9 +372,12 @@ class EditorPage(Adw.NavigationPage):
         header = Adw.HeaderBar()
         header.pack_end(self.save_btn)
 
+        top = Gtk.Box(spacing=12, vexpand=True)
+        top.append(frame)
+        top.append(self._side_panel())
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_start=18, margin_end=18,
                       margin_top=12, margin_bottom=18)
-        for wdg in (frame, controls, self.tl, hint):
+        for wdg in (top, controls, self.tl, hint):
             box.append(wdg)
         tv = Adw.ToolbarView(content=box)
         tv.add_top_bar(header)
@@ -383,6 +390,117 @@ class EditorPage(Adw.NavigationPage):
         self._show_frame(self.tl.k)
         self._update_label()
 
+    # --- effects panel --------------------------------------------------------------------------
+    def _combo(self, title, subtitle, choices, current, on_change):
+        """Adw.ComboRow over (id, label) choices."""
+        ids = [c[0] for c in choices]
+        row = Adw.ComboRow(title=title, subtitle=subtitle, model=Gtk.StringList.new([c[1] for c in choices]),
+                           selected=ids.index(current))
+        row.connect("notify::selected", lambda r, _: on_change(ids[r.get_selected()]))
+        return row
+
+    def _side_panel(self):
+        page = Adw.PreferencesPage(width_request=330)
+        look = Adw.PreferencesGroup(title="Look")
+        look.add(self._combo("Filter", "Color grade", [(k, v[0]) for k, v in effects.LOOKS.items()],
+                             self.opts["look"], lambda v: self._set_opt("look", v)))
+        look.add(self._combo("Effect", "Stylised motion", [(k, v[0]) for k, v in effects.EFFECTS.items()],
+                             self.opts["effect"], lambda v: self._set_opt("effect", v)))
+        page.add(look)
+        motion = Adw.PreferencesGroup(title="Motion")
+        motion.add(self._combo("Speed", None, [(v, f"{v:g}×") for v in effects.SPEEDS], self.opts["speed"],
+                               lambda v: self._set_opt("speed", v)))
+        motion.add(self._combo("Direction", "Bounce plays forward, then back", list(effects.DIRECTIONS.items()),
+                               self.opts["direction"], lambda v: self._set_opt("direction", v)))
+        page.add(motion)
+        press = Adw.PreferencesGroup(title="Press effect",
+                                     description="How the still turns into motion when you press and hold it.")
+        press.add(self._combo("Transition", None, [(k, v[0]) for k, v in STYLES.items()], self.style,
+                              self._set_style))
+        try_row = Adw.ActionRow(title="Try it", subtitle="Press and hold to preview the saved result")
+        self.try_btn = Gtk.Button(icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER,
+                                  css_classes=["circular"], tooltip_text="Press and hold")
+        hold = Gtk.GestureClick()
+        hold.connect("pressed", lambda *_: self._try_press())
+        hold.connect("released", lambda *_: self._try_release())
+        hold.connect("cancel", lambda *_: self._try_release())
+        self.try_btn.add_controller(hold)
+        try_row.add_suffix(self.try_btn)
+        press.add(try_row)
+        page.add(press)
+        reset = Gtk.Button(label="Reset effects", halign=Gtk.Align.CENTER, css_classes=["flat"])
+        reset.connect("clicked", lambda *_: self._reset())
+        grp = Adw.PreferencesGroup()
+        grp.add(reset)
+        page.add(grp)
+        self.panel = page
+        return page
+
+    def _reset(self):
+        parent = self.panel.get_parent()
+        parent.remove(self.panel)
+        self.opts, self.style = dict(effects.DEFAULT), DEFAULT_STYLE
+        parent.append(self._side_panel())
+        self._changed(None, "cover")
+
+    def _set_opt(self, key, value):
+        if self.opts[key] == value:
+            return
+        self.opts[key] = value
+        was_playing = self.stream is not None
+        self.stop()
+        if was_playing or key in ("speed", "direction"):
+            self.toggle_play()  # motion settings only make sense in motion
+        else:
+            self._show_frame(self.tl.k if self.tl.s <= self.tl.p <= self.tl.e else self.tl.p)
+
+    def _set_style(self, style):
+        self.style = style
+
+    def _try_press(self):
+        """Render the selection like it will be saved, then run the real press transition over the cover frame."""
+        self.stop()
+        s, e, k = self.tl.s, self.tl.e, self.tl.k
+        opts = dict(self.opts)
+        self.spinner.start()
+        self.trying = True
+
+        def work():
+            try:
+                path = effects.preview(self.src, s, e, opts, thumbs.CACHE / "previews")
+                still = thumbs.grab_frame(path, min(effects.out_time(k - s, e - s, opts),
+                                                    effects.out_length(e - s, opts) - 0.05))
+            except Exception:
+                path = still = None
+            GLib.idle_add(start, path, still)
+
+        def start(path, still):
+            self.spinner.stop()
+            if not (path and still):
+                return
+            self.proxies.add(path)
+            self.canvas = LiveCanvas(Gdk.Texture.new_for_pixbuf(still), path, style=self.style)
+            self.frame.set_child(self.canvas)
+            if self.trying:
+                self.canvas.press()
+            else:  # released while rendering: show the still a moment, then go back
+                GLib.timeout_add(600, self._try_done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _try_release(self):
+        self.trying = False
+        canvas = self.canvas
+        if canvas:
+            canvas.on_idle = self._try_done
+            canvas.release()
+
+    def _try_done(self):
+        if self.canvas:
+            self.canvas.stop()
+            self.canvas = None
+            self.frame.set_child(self.pic)
+        return False
+
     # --- preview --------------------------------------------------------------------------------
     def _show_frame(self, t):
         self.req += 1
@@ -392,7 +510,7 @@ class EditorPage(Adw.NavigationPage):
     def _grab(self, t, req):
         if req != self.req:  # a newer request superseded this one
             return
-        pb = thumbs.grab_frame(self.src, t, 720)
+        pb = thumbs.grab_frame(self.src, t, 720, effects.frame_chain(self.opts))
 
         def done():
             if req == self.req and pb and self.stream is None:
@@ -403,14 +521,15 @@ class EditorPage(Adw.NavigationPage):
         if self.stream or self.spinner.get_spinning():
             self.stop()
             return
-        s, e = self.tl.s, self.tl.e
+        self._try_done()
+        s, e, opts = self.tl.s, self.tl.e, dict(self.opts)
         self.spinner.start()
         self.play_btn.set_icon_name("media-playback-pause-symbolic")
         req = self.req = self.req + 1
 
         def work():
             try:
-                path = thumbs.mp4_proxy(self.src, s, e, 540)
+                path = effects.preview(self.src, s, e, opts, thumbs.CACHE / "previews")
             except Exception:
                 path = None
             GLib.idle_add(start, path)
@@ -423,19 +542,20 @@ class EditorPage(Adw.NavigationPage):
             self.stream = media_file(path, muted=False, loop=True)
             hid = self.stream.connect("invalidate-contents", lambda st: (st.disconnect(hid), self.pic.set_paintable(st)))
             self.stream.play()
-            self.tick = GLib.timeout_add(40, self._on_tick, s)
+            self.tick = GLib.timeout_add(40, self._on_tick, s, e - s, opts)
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_tick(self, s):
+    def _on_tick(self, s, length, opts):
         if not self.stream:
             self.tick = 0
             return False
-        self.tl.p = s + self.stream.get_timestamp() / 1e6
+        self.tl.p = s + effects.src_time(self.stream.get_timestamp() / 1e6, length, opts)
         self.tl.queue_draw()
         self._update_label()
         return True
 
     def stop(self):
+        self._try_done()
         self.req += 1
         self.spinner.stop()
         self.play_btn.set_icon_name("media-playback-start-symbolic")
@@ -503,11 +623,12 @@ class EditorPage(Adw.NavigationPage):
         self.stop()
         self.save_btn.set_sensitive(False)
         self.save_btn.set_label("Saving…")
-        s, e, k = self.tl.s, self.tl.e, self.tl.k
+        s, e, k, opts, style = self.tl.s, self.tl.e, self.tl.k, dict(self.opts), self.style
 
         def work():
             try:
-                res, err = livemake.make_live(self.src, s, e, min(k - s, e - s - 0.04)), None
+                res, err = livemake.make_live(self.src, s, e, k - s, opts=opts), None
+                library.set_meta(res[0], transition=style)
             except Exception as ex:  # surfaced as a toast
                 res, err = None, str(ex)
             GLib.idle_add(self.on_saved, self, res, err)

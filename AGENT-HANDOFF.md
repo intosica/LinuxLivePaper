@@ -32,7 +32,15 @@ The user's decisions:
 - ✅ Press-and-hold transition (`playback.py: LiveCanvas`): the still pushes in and smears into a radial motion blur +
   gaussian blur, the video cross-fades in through it and sharpens (0.55 s); release reverses it (0.40 s). Knobs at the
   top of `playback.py` (`T_IN`, `T_OUT`, `BLUR_PX`, `ZOOM_BLUR`, `HOLD_ZOOM`). Space works as hold too.
-- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake,playback}`.
+  Styles (`playback.STYLES`): Immersive blur (default), Zoom, Fade, Instant. Stored per item in the folder sidecar
+  `.linuxlivepaper.json` (`library.get_meta/set_meta`, keyed by stem). Changeable in the viewer header dropdown.
+- ✅ Baked-in effects (`effects.py`): Filter (10 looks), Effect (glitch, VHS, dreamy, pulse, shake, rainbow, pixel,
+  mirror), Speed 0.5–2×, Direction forward/reverse/bounce. One ffmpeg filter_complex (`effects.graph`) renders both the
+  editor preview (`effects.preview`, 540p ultrafast, cached in `~/.cache/linuxlivepaper/previews`) and the saved MOV,
+  so the preview is WYSIWYG. Paused frames use `effects.frame_chain` via `thumbs.grab_frame(..., chain)`.
+  Editor side panel (Adw.PreferencesPage): Look, Motion, Press effect + "Try it" press-and-hold, Reset effects.
+  Cover time is mapped through speed/direction (`effects.out_time`); playhead back via `effects.src_time`.
+- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake,playback,effects}`.
 
 ### Hard-won facts (don't relearn these)
 - GTK's GStreamer `Gtk.MediaFile.seek()` while **paused** reports success but doesn't render the frame (black).
@@ -47,6 +55,9 @@ The user's decisions:
   `pactl -f json list sink-inputs` filtered by `application.process.id`.
 - Audio: playback with sound works (verified via `pactl list sink-inputs`). The user's 23 screencasts in ~/Videos/Screencasts
   have **no audio track**, so anything made from them is silent. Grid hover is muted on purpose; the viewer and editor play sound.
+- Adding a look/effect = one dict entry in `effects.py` (an ffmpeg chain that keeps the frame size; internal pad
+  labels must be unique, prefix them `fx`). The self-check renders every entry and checks size + duration.
+  Gotcha: `blend` on yuv420p tints pink/green → `dreamy` converts to `gbrp` first.
 - Test video with audio: `/media/montel/Extreme SSD/Yu-Gi-Oh Arc-V Episode 18 English SubbedDubbed Aniwatch.mp4` (21:55, 1080p).
   Test GIFs: `/home/montel/Documents/GifDeck/GIFs/`.
 
@@ -81,12 +92,11 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - Every non-trivial module gets one runnable self-check (`if __name__ == "__main__":` asserts).
 
 ## Next steps (suggested order)
-1. More effects. The press transition is done; next are editor effects baked into the MOV (see ROADMAP Phase 4).
-   Maybe make the press transition style selectable (blur / zoom / none) and stored per item.
-2. Creator: grow `editor.py` into the full editor: `project.py` + `render.py` (ffmpeg filter graph), then speed/crop/
-   filters/effects/text panels beside the timeline (ROADMAP Phases 2–4). Preview = proxy render of the selection.
+1. Text overlays (drawtext: font, color, position, simple animations) and stickers (image/GIF overlay) in the editor
+   panel; then crop/rotate/canvas (ROADMAP Phases 3–4). Extend `effects.graph`; keep preview == export.
+2. Filter intensity slider + .cube LUT import (`lut3d`).
 3. Gallery polish: date sections, Gio.FileMonitor live reload, context menu (trash, open folder), fullscreen.
-3. Package it: a `.desktop` file + icon.
+4. Package it: a `.desktop` file + icon.
 
 ## Log
 - 2026-11-02: Phase 0. Static IPA analysis.
@@ -95,3 +105,4 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - 2026-11-02: Fixed GIF import/viewing (ffmpeg thumbs + MP4 proxies). Removed photos. Single library folder (default ~/Videos/LinuxLivePaper, settable).
   Replaced the seconds-typing CreateDialog with the timeline editor (`editor.py`). Audio checked: it works; the screencasts are silent.
 - 2026-11-02: Fixed live audio being muted after hover previews (PipeWire mute restore). Added the immersive press transition (`playback.py`).
+- 2026-11-02: Baked-in effects (`effects.py`: looks, effects, speed, reverse/bounce) in an editor side panel; press transition selectable per item (blur/zoom/fade/instant).

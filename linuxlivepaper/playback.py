@@ -12,6 +12,14 @@ BLUR_PX = 22.0             # peak gaussian blur radius
 ZOOM_BLUR = 0.09           # peak radial motion-blur spread (fraction of size)
 ZOOM_BLUR_COPIES = 7
 HOLD_ZOOM = 0.035          # how much the image pushes in while held
+# Press styles: id → (label, blur scale, push-in scale, duration scale). "blur" is the iOS-like immersive one.
+STYLES = {
+    "blur": ("Immersive blur", 1.0, 1.0, 1.0),
+    "zoom": ("Zoom", 0.0, 2.0, 0.8),
+    "fade": ("Fade", 0.0, 0.0, 0.7),
+    "none": ("Instant", 0.0, 0.0, 0.0),
+}
+DEFAULT_STYLE = "blur"
 
 
 def media_file(path, muted=True, loop=False):
@@ -49,18 +57,20 @@ def smoothstep(a, b, x):
     return x * x * (3 - 2 * x)
 
 
-def curves(p):
+def curves(p, style=DEFAULT_STYLE):
     """Transition state at progress p (0 = still, 1 = fully live): (video mix, blur 0..1, push-in zoom)."""
-    return smoothstep(0.25, 0.75, p), math.sin(math.pi * min(max(p, 0.0), 1.0)), 1 + HOLD_ZOOM * smoothstep(0, 1, p)
+    _, blur, zoom, _ = STYLES.get(style, STYLES[DEFAULT_STYLE])
+    mix = smoothstep(0.25, 0.75, p) if blur else smoothstep(0, 1, p)
+    return mix, blur * math.sin(math.pi * min(max(p, 0.0), 1.0)), 1 + zoom * HOLD_ZOOM * smoothstep(0, 1, p)
 
 
 class LiveCanvas(Gtk.Widget):
     """Draws the still and the motion video. press() runs the iOS-style transition: the still pushes in and smears
     into a radial motion blur, the video fades in through the blur and sharpens. release() reverses it."""
 
-    def __init__(self, still, motion_path, on_idle=None):
+    def __init__(self, still, motion_path, on_idle=None, style=DEFAULT_STYLE):
         super().__init__(hexpand=True, vexpand=True, overflow=Gtk.Overflow.HIDDEN)
-        self.still, self.path, self.on_idle = still, motion_path, on_idle
+        self.still, self.path, self.on_idle, self.style = still, motion_path, on_idle, style
         self.stream = None
         self.p, self.target = 0.0, 0.0
         self.tick_id = 0
@@ -102,7 +112,8 @@ class LiveCanvas(Gtk.Widget):
         now = clock.get_frame_time() / 1e6
         dt = 0.0 if self.last is None else min(now - self.last, 0.05)
         self.last = now
-        step = dt / (T_IN if self.target > self.p else T_OUT)
+        dur = (T_IN if self.target > self.p else T_OUT) * STYLES.get(self.style, STYLES[DEFAULT_STYLE])[3]
+        step = dt / dur if dur else 1.0
         self.p = min(self.p + step, self.target) if self.target > self.p else max(self.p - step, self.target)
         self.queue_draw()
         if self.p != self.target:
@@ -123,7 +134,7 @@ class LiveCanvas(Gtk.Widget):
         iw, ih = self.still.get_intrinsic_width(), self.still.get_intrinsic_height()
         if not (W and H and iw and ih):
             return
-        mix, blur, zoom = curves(self.p)
+        mix, blur, zoom = curves(self.p, self.style)
         if not self._video_ready():
             mix = 0.0
         fit = min(W / iw, H / ih)
@@ -161,4 +172,5 @@ if __name__ == "__main__":
     assert mix == 1.0 and blur < 1e-9 and abs(zoom - (1 + HOLD_ZOOM)) < 1e-9
     mix, blur, _ = curves(0.5)
     assert mix == 0.5 and blur == 1.0  # peak smear right at the crossover
+    assert curves(0.5, "fade")[1:] == (0.0, 1.0) and curves(1, "zoom")[2] > 1 + HOLD_ZOOM
     print("playback ok")

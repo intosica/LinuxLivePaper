@@ -36,9 +36,10 @@ def video_duration(src):
     return probe(src)[0]
 
 
-def grab_frame(src, t, height=None):
-    """Exact frame at t seconds as a GdkPixbuf (or None)."""
-    vf = ["-vf", f"scale=-2:{height}"] if height else []
+def grab_frame(src, t, height=None, chain=""):
+    """Exact frame at t seconds as a GdkPixbuf (or None), optionally through an ffmpeg filter chain."""
+    vf = ",".join(c for c in (chain, f"scale=-2:{height}" if height else "") if c)
+    vf = ["-vf", vf] if vf else []
     png = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", src, "-frames:v", "1", *vf,
                           "-f", "image2pipe", "-c:v", "png", "-"], capture_output=True).stdout
     if not png:

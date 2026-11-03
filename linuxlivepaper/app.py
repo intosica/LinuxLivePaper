@@ -11,7 +11,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from . import library, thumbs  # noqa: E402
 from .editor import EditorPage  # noqa: E402
-from .playback import LiveCanvas, media_file, play_stream  # noqa: E402
+from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, play_stream  # noqa: E402
 
 APP_ID = "io.github.linuxlivepaper"
 TILE = 220
@@ -169,7 +169,8 @@ class LiveView(Gtk.Overlay):
         super().__init__()
         self.item = item
         self.canvas = LiveCanvas(Gdk.Texture.new_from_filename(item.path), item.motion,
-                                 on_idle=lambda: self.hint.set_visible(True))
+                                 on_idle=lambda: self.hint.set_visible(True),
+                                 style=library.get_meta(item.path).get("transition", DEFAULT_STYLE))
         self.set_child(self.canvas)
         self.add_overlay(badge("LIVE", "media-playlist-repeat-symbolic"))
         self.hint = Gtk.Label(label="Press and hold to play", css_classes=["hint"],
@@ -200,6 +201,11 @@ class Viewer(Adw.NavigationPage):
         self.make_btn = Gtk.Button(label="Make Live Image", css_classes=["suggested-action"])
         self.make_btn.connect("clicked", lambda *_: win.open_editor(self.objs[self.index].item.motion))
         self.header.pack_end(self.make_btn)
+        self.style_ids = list(STYLES)
+        self.style_dd = Gtk.DropDown.new_from_strings([v[0] for v in STYLES.values()])
+        self.style_dd.set_tooltip_text("Press effect for this live image")
+        self.style_dd.connect("notify::selected", self._style_changed)
+        self.header.pack_end(self.style_dd)
         self.frame = Gtk.Overlay(css_classes=["viewer"], hexpand=True, vexpand=True)
         self.frame.set_child(Gtk.Box())
         for icon, step, align in (("go-previous-symbolic", -1, Gtk.Align.START),
@@ -230,6 +236,14 @@ class Viewer(Adw.NavigationPage):
             return False
         return True
 
+    def _style_changed(self, dd, _):
+        if getattr(self, "_syncing", False) or not isinstance(self.view, LiveView):
+            return
+        style = self.style_ids[dd.get_selected()]
+        self.view.canvas.style = style
+        library.set_meta(self.view.item.path, transition=style)
+        self.grab_focus()
+
     def _key_up(self, _c, keyval, *_):
         if keyval == Gdk.KEY_space and isinstance(self.view, LiveView):
             self.view.release()
@@ -252,6 +266,7 @@ class Viewer(Adw.NavigationPage):
         item = self.objs[self.index].item
         self.set_title(item.name)
         self.make_btn.set_visible(item.kind != "live")
+        self.style_dd.set_visible(item.kind == "live")
         if item.kind == "live":
             view = LiveView(item)
         elif item.kind == "video":
@@ -265,6 +280,11 @@ class Viewer(Adw.NavigationPage):
                 if self.view is v:
                     self.stream = play_stream(path, v)
             playable(item, ready)
+        if item.kind == "live":
+            self._syncing = True
+            self.style_dd.set_selected(self.style_ids.index(view.canvas.style)
+                                       if view.canvas.style in self.style_ids else 0)
+            self._syncing = False
         view.set_hexpand(True)
         view.set_vexpand(True)
         self.frame.set_child(view)
