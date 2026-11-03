@@ -12,21 +12,32 @@ from .library import library_dir
 def make_live(src, start=0.0, end=None, key_time=None, out_dir=None, name=None, opts=None):
     """Render [start, end] of src (video or GIF) through effects `opts` → <name>.mov, and grab the frame at
     key_time (source seconds after start, mapped through speed/reverse) → <name>.jpg. Defaults to the library folder."""
+    jpg, mov = out_paths(out_dir, name)
+    opts = {**effects.DEFAULT, **(opts or {})}
+    effects.render(src, start, end, mov, opts, extra=live_tags())
+    length = (end if end is not None else effects.thumbs.video_duration(str(src))) - start
+    key = effects.out_time(key_time or 0.0, length, opts)
+    still(mov, min(max(0.0, key), effects.out_length(length, opts) - 0.05), jpg)
+    return jpg, mov
+
+
+def out_paths(out_dir=None, name=None):
     out_dir = Path(out_dir or library_dir())
     out_dir.mkdir(parents=True, exist_ok=True)
     name = name or time.strftime("LLP_%Y%m%d_%H%M%S")
-    mov, jpg = out_dir / f"{name}.mov", out_dir / f"{name}.jpg"
-    cid = str(uuid.uuid4()).upper()
-    opts = {**effects.DEFAULT, **(opts or {})}
-    effects.render(src, start, end, mov, opts, extra=[
-        "-movflags", "use_metadata_tags", "-metadata", f"com.apple.quicktime.content.identifier={cid}",
-        "-metadata", "com.apple.quicktime.software=LinuxLivePaper"])
-    length = (end if end is not None else effects.thumbs.video_duration(str(src))) - start
-    key = effects.out_time(key_time or 0.0, length, opts)
-    key = min(max(0.0, key), effects.out_length(length, opts) - 0.05)
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{key:.3f}", "-i", str(mov),
+    return out_dir / f"{name}.jpg", out_dir / f"{name}.mov"
+
+
+def live_tags():
+    """ffmpeg output args that tag a MOV as the motion half of a live image."""
+    return ["-movflags", "use_metadata_tags", "-metadata",
+            f"com.apple.quicktime.content.identifier={str(uuid.uuid4()).upper()}",
+            "-metadata", "com.apple.quicktime.software=LinuxLivePaper"]
+
+
+def still(mov, t, jpg):
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", str(mov),
                     "-frames:v", "1", "-q:v", "2", str(jpg)], check=True)
-    return jpg, mov
 
 
 if __name__ == "__main__":

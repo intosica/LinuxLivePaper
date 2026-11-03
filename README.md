@@ -15,19 +15,28 @@ cd ~/Documents/LinuxLivePaper
 Requirements: `/usr/bin/python3` with PyGObject (GTK 4 + libadwaita ≥ 1.5), GStreamer (good/bad/libav) and `ffmpeg`/`ffprobe`.
 
 ## Using it
-- The gallery shows your **LinuxLivePaper folder** (default `~/Videos/LinuxLivePaper`, recursive, newest first).
-  Change it in ☰ → *Library Folder…*. Use the filters at the top: **All · Live · Videos · GIFs**.
+- The gallery shows your **LinuxLivePaper folder** (default `~/Videos/LinuxLivePaper`, recursive) as an
+  iOS-Photos-style grid: square tiles, edge to edge, oldest at the top and newest at the bottom.
+  Change the folder in ☰ → *Library Folder…*. Tabs at the top: **All · Live · Collections**.
   Standalone photos are not shown. Use the import button to copy videos/GIFs into the folder.
+- **Right-click** any tile → *Add to Collection* (existing or new) or *Delete* (to the Trash). Deleting from All/Live
+  never removes the collection copy; inside a collection, *Remove from Collection* removes only that copy.
+- **Collections** are folders in `<library>/collection/<Name>/`. Each card shows the system folder icon, or a `.png`
+  you pick. Create one from **+** → *Collection…*; right-click a card (or the ✎ button inside it) to rename,
+  change the icon or delete it. Click a card to see its items.
 - Hover over a LIVE, video or GIF tile to play it (muted). Click a tile to open it.
 - In the viewer, **press and hold** a live image to play it with sound (Space also plays it). Use ←/→ to move
   between items and Esc to go back. The dropdown in the header picks the press effect
   (Immersive blur, Zoom, Fade, Instant) for that live image.
-- Press **+** (or *Make Live Image* in the viewer) to open the editor on a video or GIF. Drag the yellow handles to trim,
+- **+** → *Live Image from Video or GIF…* (or *Make Live Image* in the viewer) opens the editor on a video or GIF. Drag the yellow handles to trim,
   drag inside the selection to move it, and drag **COVER** to pick the still. Click to place the red playhead.
   Scroll to zoom, Shift+scroll to pan, and drag the overview strip to jump around long videos. Space plays the
   selection with sound, ←/→ steps one frame (Shift for 1 s). Saves go to the library folder.
 - The editor's side panel sets the **Filter**, **Effect**, **Speed**, **Direction** (forward/reverse/bounce) and
-  **Press effect**. Hold *Try it* to preview exactly what will be saved.
+  **Press effect**. Hold *Try it* to preview exactly what will be saved. *Save to collection* also files it in a collection.
+- **+** → *Live Collage…*: pick a layout (2–9 cells), shape (9:16, 3:4, 1:1, 16:9), length, borders. Click a cell to
+  fill it with a video, GIF or live video; for the selected cell drag the yellow window on its timeline to choose the
+  part that plays, and set its **volume**, speed, direction, filter and effect. Space plays the whole collage.
 
 A *live image* is a still and a video that share a name in the same folder (`x.jpg` + `x.mov`).
 That means Live Photos copied over from an iPhone show up as LIVE too.

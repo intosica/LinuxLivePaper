@@ -1,4 +1,5 @@
-"""LinuxLivePaper GTK4/libadwaita app: gallery grid + viewer; the editor lives in editor.py."""
+"""LinuxLivePaper GTK4/libadwaita app: iOS-Photos-style gallery (All · Live · Collections) + viewer.
+The editor lives in editor.py, the collage maker in collage_page.py."""
 import os
 import shutil
 import threading
@@ -10,17 +11,22 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from . import library, thumbs  # noqa: E402
+from .collage_page import CollagePage  # noqa: E402
 from .editor import EditorPage  # noqa: E402
+from .widgets import collection_dialog, icon_widget  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, play_stream  # noqa: E402
 
 APP_ID = "io.github.linuxlivepaper"
-TILE = 220
-FILTERS = [("All", None), ("Live", "live"), ("Videos", "video"), ("GIFs", "gif")]
+TILE = 170        # minimum tile size; the grid stretches tiles so the columns fill the width
+TABS = [("All", None), ("Live", "live"), ("Collections", "collections")]
 CSS = """
-.tile { border-radius: 14px; background: alpha(@view_fg_color, 0.06); }
-.tile:hover { box-shadow: 0 0 0 3px @accent_bg_color; }
-.badge { background: rgba(0,0,0,0.55); color: white; border-radius: 7px; padding: 2px 7px;
-         margin: 8px; font-size: 0.8em; font-weight: 800; letter-spacing: 1px; }
+gridview.photos, gridview.photos > child { padding: 0; margin: 0; border-radius: 0; background: none; }
+.tile { background: alpha(@view_fg_color, 0.06); }
+.badge { background: rgba(0,0,0,0.45); color: white; border-radius: 6px; padding: 1px 6px;
+         margin: 6px; font-size: 0.75em; font-weight: 800; letter-spacing: 1px; }
+.badge.end { margin: 6px; }
+flowbox.collections > flowboxchild { padding: 6px; border-radius: 12px; }
+.collection-name { font-weight: 700; }
 .viewer { background: black; }
 .hint { color: alpha(white, 0.7); margin: 16px; }
 """
@@ -73,14 +79,26 @@ class ItemObj(GObject.Object):
         self.loading = False
 
 
-class Tile(Gtk.Overlay):
-    """Fixed-size tile; the picture is an overlay child so its natural size doesn't stretch the row.
-    Hovering plays the item muted."""
+class Square(Gtk.Widget):
+    """Empty widget that is always as tall as it is wide, so grid tiles are perfect squares at any width."""
 
-    def __init__(self):
-        super().__init__(css_classes=["tile"], overflow=Gtk.Overflow.HIDDEN, margin_start=4, margin_end=4,
-                         margin_top=4, margin_bottom=4)
-        self.set_child(Gtk.Box(width_request=TILE, height_request=TILE))
+    def do_get_request_mode(self):
+        return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
+
+    def do_measure(self, orientation, for_size):
+        if orientation == Gtk.Orientation.HORIZONTAL:
+            return TILE, TILE, -1, -1
+        side = for_size if for_size > 0 else TILE
+        return side, side, -1, -1
+
+
+class Tile(Gtk.Overlay):
+    """Square photo-grid tile, 1 px apart from its neighbours (iOS Photos look); the picture is an overlay so
+    its natural size never stretches the row. Hovering plays the item muted; right-click opens the item menu."""
+
+    def __init__(self, on_menu):
+        super().__init__(css_classes=["tile"], overflow=Gtk.Overflow.HIDDEN, margin_end=1, margin_bottom=1)
+        self.set_child(Square())
         self.pic = Gtk.Picture(content_fit=Gtk.ContentFit.COVER, can_shrink=True)
         self.add_overlay(self.pic)
         self.badge = None
@@ -92,6 +110,9 @@ class Tile(Gtk.Overlay):
         motion.connect("enter", lambda *_: self._schedule_play())
         motion.connect("leave", lambda *_: self.stop())
         self.add_controller(motion)
+        menu = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        menu.connect("pressed", lambda _g, _n, x, y: self.obj and on_menu(self, x, y, self.obj.item))
+        self.add_controller(menu)
 
     def bind(self, obj):
         self.stop()
@@ -116,7 +137,9 @@ class Tile(Gtk.Overlay):
         elif o.item.kind == "gif":
             self.badge = badge("GIF")
         elif o.duration:
-            self.badge = badge(fmt_time(o.duration), "media-playback-start-symbolic")
+            self.badge = badge(fmt_time(o.duration))
+            self.badge.set_halign(Gtk.Align.END)
+            self.badge.set_valign(Gtk.Align.END)
         if self.badge:
             self.add_overlay(self.badge)
 
@@ -292,93 +315,298 @@ class Viewer(Adw.NavigationPage):
         self.grab_focus()
 
 
-class Window(Adw.ApplicationWindow):
-    def __init__(self, app):
-        super().__init__(application=app, title="LinuxLivePaper", default_width=1280, default_height=860)
+class MediaGrid(Gtk.Stack):
+    """Square photo grid over a list of library Items, with an empty-state page."""
+
+    def __init__(self, win, empty_title, empty_desc, collection=None):
+        super().__init__(vexpand=True, hexpand=True)
+        self.win, self.collection = win, collection
         self.store = Gio.ListStore(item_type=ItemObj)
         self.kind = None
         self.filter = Gtk.CustomFilter.new(lambda o: self.kind is None or o.item.kind == self.kind)
         self.model = Gtk.FilterListModel(model=self.store, filter=self.filter)
-
         factory = Gtk.SignalListItemFactory()
-        factory.connect("setup", lambda _f, li: li.set_child(Tile()))
+        factory.connect("setup", lambda _f, li: li.set_child(Tile(self._menu)))
         factory.connect("bind", lambda _f, li: li.get_child().bind(li.get_item()))
         factory.connect("unbind", lambda _f, li: li.get_child().unbind())
-        self.grid = Gtk.GridView(model=Gtk.NoSelection(model=self.model), factory=factory, max_columns=12,
-                                 min_columns=2, single_click_activate=True, margin_start=8, margin_end=8)
+        self.grid = Gtk.GridView(model=Gtk.NoSelection(model=self.model), factory=factory, max_columns=16,
+                                 min_columns=3, single_click_activate=True, css_classes=["photos"])
         self.grid.connect("activate", self._open)
+        self.status = Adw.StatusPage(icon_name="camera-photo-symbolic", title=empty_title, description=empty_desc)
+        self.add_named(self.status, "status")
+        self.add_named(Gtk.ScrolledWindow(child=self.grid), "grid")
 
-        self.status = Adw.StatusPage(icon_name="video-x-generic-symbolic", title="Loading your collection…")
-        self.stack = Gtk.Stack()
-        self.stack.add_named(self.status, "status")
-        self.stack.add_named(Gtk.ScrolledWindow(child=self.grid, vexpand=True), "grid")
+    def set_items(self, items):
+        # keep already-loaded thumbnails when the same file is still there
+        old = {self.store.get_item(i).item.path: self.store.get_item(i) for i in range(self.store.get_n_items())}
+        objs = []
+        for it in items:
+            o = old.get(it.path)
+            if o is None or o.item.mtime != it.mtime:
+                o = ItemObj(it)
+            objs.append(o)
+        self.store.splice(0, self.store.get_n_items(), objs)
+        self._update()
+
+    def set_kind(self, kind):
+        self.kind = kind
+        self.filter.changed(Gtk.FilterChange.DIFFERENT)
+        self._update()
+
+    def _update(self):
+        self.set_visible_child_name("grid" if self.model.get_n_items() else "status")
+
+    def _open(self, _grid, pos):
+        objs = [self.model.get_item(i) for i in range(self.model.get_n_items())]
+        self.win.nav.push(Viewer(self.win, objs, pos))
+
+    def _menu(self, tile, x, y, item):
+        self.win.item_menu(tile, x, y, item, self.collection)
+
+
+class CollectionsView(Gtk.Stack):
+    """Collection cards: the custom .png icon or the system folder icon, the name and the item count."""
+
+    def __init__(self, win):
+        super().__init__(vexpand=True, hexpand=True)
+        self.win = win
+        self.flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, min_children_per_line=2,
+                                max_children_per_line=10, column_spacing=6, row_spacing=6, valign=Gtk.Align.START,
+                                margin_start=18, margin_end=18, margin_top=18, margin_bottom=18,
+                                css_classes=["collections"], activate_on_single_click=True)
+        self.flow.connect("child-activated", lambda _f, child: win.open_collection(child.collection))
+        new = Gtk.Button(label="New Collection", halign=Gtk.Align.CENTER, css_classes=["pill", "suggested-action"])
+        new.connect("clicked", lambda *_: win.new_collection())
+        self.status = Adw.StatusPage(icon_name="folder-symbolic", title="No collections yet", child=new,
+                                     description="Group your live images into collections. "
+                                     "Right-click anything and choose Add to Collection, or create one here.")
+        self.add_named(self.status, "status")
+        self.add_named(Gtk.ScrolledWindow(child=self.flow), "grid")
+
+    def set_collections(self, rows):
+        """rows: [(Collection, item count, icon pixbuf or None)]"""
+        self.flow.remove_all()
+        for c, n, pb in rows:
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, width_request=150)
+            if pb:
+                pic = Gtk.Picture(paintable=Gdk.Texture.new_for_pixbuf(pb), content_fit=Gtk.ContentFit.CONTAIN,
+                                  height_request=128, can_shrink=True)
+                box.append(pic)
+            else:
+                box.append(icon_widget(None, 128))
+            box.append(Gtk.Label(label=c.name, css_classes=["collection-name"], ellipsize=3, max_width_chars=18))
+            box.append(Gtk.Label(label=f"{n} item{'s' if n != 1 else ''}", css_classes=["dim-label", "caption"]))
+            child = Gtk.FlowBoxChild(child=box, tooltip_text=c.name)
+            child.collection = c
+            click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+            click.connect("pressed", lambda _g, _n, x, y, w=child: self.win.collection_menu(w, x, y, w.collection))
+            child.add_controller(click)
+            self.flow.append(child)
+        self.set_visible_child_name("grid" if rows else "status")
+
+
+def load_collections():
+    """Worker-thread part of a collections refresh: counts and decoded icons."""
+    from gi.repository import GdkPixbuf
+    rows = []
+    for c in library.collections():
+        pb = None
+        if c.icon:
+            try:
+                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(c.icon), 128, 128, True)
+            except GLib.Error:
+                pass
+        rows.append((c, len(c.items()), pb))
+    return rows
+
+
+class CollectionPage(Adw.NavigationPage):
+    def __init__(self, win, collection):
+        super().__init__(title=collection.name)
+        self.win, self.collection = win, collection
+        self.grid = MediaGrid(win, "This collection is empty",
+                              "Right-click a live image in All or Live and choose Add to Collection.", collection)
+        header = Adw.HeaderBar()
+        edit = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Rename or change the icon")
+        edit.connect("clicked", lambda *_: win.edit_collection(self.collection))
+        header.pack_end(edit)
+        tv = Adw.ToolbarView(content=self.grid)
+        tv.add_top_bar(header)
+        self.set_child(tv)
+        self.refresh()
+
+    def refresh(self):
+        c = self.collection
+
+        def work():
+            items = c.items()
+            GLib.idle_add(self.grid.set_items, items)
+        threading.Thread(target=work, daemon=True).start()
+
+
+class Window(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="LinuxLivePaper", default_width=1280, default_height=860)
+        self.library_grid = MediaGrid(self, "Nothing here yet", "")
+        self.collections_view = CollectionsView(self)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.stack.add_named(self.library_grid, "library")
+        self.stack.add_named(self.collections_view, "collections")
 
         header = Adw.HeaderBar()
         switch = Gtk.Box(css_classes=["linked"])
         first = None
-        for label, kind in FILTERS:
+        for label, kind in TABS:
             b = Gtk.ToggleButton(label=label, group=first)
             first = first or b
-            b.connect("toggled", lambda btn, k=kind: btn.get_active() and self._set_kind(k))
+            b.connect("toggled", lambda btn, k=kind: btn.get_active() and self._set_tab(k))
             switch.append(b)
-        first.set_active(True)
         header.set_title_widget(switch)
-        create = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Create a live image from a video or GIF")
-        create.connect("clicked", self._pick_source)
+        create_menu = Gio.Menu()
+        create_menu.append("Live Image from Video or GIF…", "win.new-live")
+        create_menu.append("Live Collage…", "win.new-collage")
+        create_menu.append("Collection…", "win.new-collection")
+        header.pack_start(Gtk.MenuButton(icon_name="list-add-symbolic", menu_model=create_menu,
+                                         tooltip_text="Create"))
         imp = Gtk.Button(icon_name="document-open-symbolic", tooltip_text="Import videos and GIFs into the library")
         imp.connect("clicked", self._import)
-        header.pack_start(create)
         header.pack_start(imp)
         menu = Gio.Menu()
         menu.append("Library Folder…", "win.prefs")
         menu.append("Open Library Folder", "win.open-folder")
         menu.append("Rescan", "win.rescan")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
-        for name, fn in (("prefs", self._prefs), ("rescan", self.rescan),
+        for name, fn in (("prefs", self._prefs), ("rescan", self.rescan), ("new-live", self._pick_source),
+                         ("new-collage", lambda: self.nav.push(CollagePage(self._saved))),
+                         ("new-collection", self.new_collection),
                          ("open-folder", lambda: Gtk.FileLauncher.new(
-                             Gio.File.new_for_path(str(library.library_dir()))).launch(self, None, None))):
+                             Gio.File.new_for_path(str(library.library_dir()))).launch(self, None, None)),
+                         ("delete", self._delete_ctx), ("add-to-new", self._add_to_new),
+                         ("edit-collection", lambda: self.edit_collection(self.ctx_collection)),
+                         ("delete-collection", self._delete_collection)):
             act = Gio.SimpleAction(name=name)
             act.connect("activate", lambda *_a, f=fn: f())
             self.add_action(act)
+        add_to = Gio.SimpleAction(name="add-to", parameter_type=GLib.VariantType("s"))
+        add_to.connect("activate", lambda _a, v: self._add_to(library.get_collection(v.get_string())))
+        self.add_action(add_to)
+        self.ctx_item = self.ctx_collection = None
 
         tv = Adw.ToolbarView(content=self.stack)
         tv.add_top_bar(header)
-        self.toasts = Adw.ToastOverlay(child=tv)
         self.nav = Adw.NavigationView()
-        self.nav.add(Adw.NavigationPage(child=self.toasts, title="Gallery", tag="gallery"))
-        self.set_content(self.nav)
+        self.nav.add(Adw.NavigationPage(child=tv, title="Gallery", tag="gallery"))
+        self.toasts = Adw.ToastOverlay(child=self.nav)  # around every page, so toasts show from any page
+        self.set_content(self.toasts)
+        first.set_active(True)
         self.rescan()
 
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
 
-    def _set_kind(self, kind):
-        self.kind = kind
-        self.filter.changed(Gtk.FilterChange.DIFFERENT)
-        self._update_status()
-
-    def _update_status(self):
-        if self.model.get_n_items():
-            self.stack.set_visible_child_name("grid")
-            return
-        self.status.set_title("Nothing here yet")
-        self.status.set_description(f"Your library is {library.library_dir()}.\n"
-                                    "Press + to create a live image, or import videos and GIFs.")
-        self.stack.set_visible_child_name("status")
+    def _set_tab(self, kind):
+        if kind == "collections":
+            self.stack.set_visible_child_name("collections")
+        else:
+            self.library_grid.set_kind(kind)
+            self.stack.set_visible_child_name("library")
 
     def rescan(self):
+        """Reload everything that's on screen: the library, the collections and an open collection page."""
+        self.library_grid.status.set_description(f"Your library is {library.library_dir()}.\n"
+                                                 "Press + to create a live image or collage, or import videos and GIFs.")
+
         def work():
             items = library.scan()
-            GLib.idle_add(self._populate, items)
+            rows = load_collections()
+            GLib.idle_add(lambda: (self.library_grid.set_items(items), self.collections_view.set_collections(rows)))
         threading.Thread(target=work, daemon=True).start()
+        for page in self.nav.get_navigation_stack():
+            if isinstance(page, CollectionPage):
+                page.refresh()
 
-    def _populate(self, items):
-        self.store.splice(0, self.store.get_n_items(), [ItemObj(i) for i in items])
-        self._update_status()
+    # --- context menus --------------------------------------------------------------------------
+    def _popup(self, widget, x, y, menu):
+        pm = Gtk.PopoverMenu.new_from_model(menu)
+        pm.set_parent(widget)
+        pm.set_has_arrow(False)
+        r = Gdk.Rectangle()
+        r.x, r.y, r.width, r.height = int(x), int(y), 1, 1
+        pm.set_pointing_to(r)
+        pm.connect("closed", lambda p: GLib.idle_add(p.unparent))
+        pm.popup()
 
-    def _open(self, _grid, pos):
-        objs = [self.model.get_item(i) for i in range(self.model.get_n_items())]
-        self.nav.push(Viewer(self, objs, pos))
+    def item_menu(self, widget, x, y, item, collection=None):
+        self.ctx_item, self.ctx_collection = item, collection
+        add = Gio.Menu()
+        for c in library.collections():
+            if collection is None or c.name != collection.name:
+                mi = Gio.MenuItem.new(c.name, None)
+                mi.set_action_and_target_value("win.add-to", GLib.Variant.new_string(c.name))
+                add.append_item(mi)
+        add.append("New Collection…", "win.add-to-new")
+        menu = Gio.Menu()
+        menu.append_submenu("Add to Collection", add)
+        menu.append("Remove from Collection" if collection else "Delete", "win.delete")
+        self._popup(widget, x, y, menu)
+
+    def collection_menu(self, widget, x, y, collection):
+        self.ctx_collection = collection
+        menu = Gio.Menu()
+        menu.append("Edit Collection…", "win.edit-collection")
+        menu.append("Delete Collection", "win.delete-collection")
+        self._popup(widget, x, y, menu)
+
+    def _delete_ctx(self):
+        """Delete from All/Live trashes the library files; inside a collection it removes only that collection's
+        copy. They're separate files (hard links), so neither touches the other."""
+        item, col = self.ctx_item, self.ctx_collection
+        library.delete_item(item)
+        self.toast(f"Removed {item.name} from {col.name}" if col else f"Moved {item.name} to the Trash")
+        self.rescan()
+
+    def _add_to(self, collection):
+        item = self.ctx_item
+        try:
+            added = library.add_to_collection(item, collection)
+        except OSError as ex:
+            return self.toast(f"Couldn't add: {ex}")
+        self.toast(f"Added {item.name} to {collection.name}" if added else f"Already in {collection.name}")
+        self.rescan()
+
+    def _add_to_new(self):
+        collection_dialog(self, self._add_to)
+
+    def new_collection(self):
+        collection_dialog(self, lambda c: (self.toast(f"Created {c.name}"), self.rescan()))
+
+    def open_collection(self, collection):
+        self.nav.push(CollectionPage(self, collection))
+
+    def edit_collection(self, collection):
+        def done(c):
+            for page in self.nav.get_navigation_stack():
+                if isinstance(page, CollectionPage) and page.collection.path == collection.path:
+                    page.collection = c
+                    page.set_title(c.name)
+            self.rescan()
+        collection_dialog(self, done, collection)
+
+    def _delete_collection(self):
+        c = self.ctx_collection
+        dlg = Adw.AlertDialog(heading=f"Delete {c.name}?", body="The collection folder goes to the Trash. "
+                              "Your library items in All and Live are not affected.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("delete", "Delete")
+        dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+
+        def respond(_d, resp):
+            if resp == "delete":
+                library.delete_collection(c)
+                self.toast(f"Deleted {c.name}")
+                self.rescan()
+        dlg.connect("response", respond)
+        dlg.present(self)
 
     # --- creating & importing -------------------------------------------------------------------
     def open_editor(self, path):
@@ -387,7 +615,7 @@ class Window(Adw.ApplicationWindow):
     def _saved(self, page, res, err):
         if err:
             page.save_btn.set_sensitive(True)
-            page.save_btn.set_label("Save Live Image")
+            page.save_btn.set_label(page.SAVE_LABEL)
             self.toast(f"Saving failed: {err}")
             return
         self.nav.pop_to_tag("gallery")
@@ -421,7 +649,8 @@ class Window(Adw.ApplicationWindow):
         dlg = Adw.PreferencesDialog(title="Preferences")
         page = Adw.PreferencesPage()
         group = Adw.PreferencesGroup(title="Library", description="The gallery shows this folder, and new live "
-                                     "images are saved here. Existing files are not moved.")
+                                     "images are saved here. Collections live in its collection/ subfolder. "
+                                     "Existing files are not moved.")
         row = Adw.ActionRow(title="LinuxLivePaper folder", subtitle=str(library.library_dir()))
         change = Gtk.Button(label="Change…", valign=Gtk.Align.CENTER)
         reset = Gtk.Button(icon_name="edit-undo-symbolic", valign=Gtk.Align.CENTER,

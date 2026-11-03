@@ -5,13 +5,18 @@ Read this first. Update it before you stop (state, files touched, next steps, lo
 ## Goal
 **LinuxLivePaper** (`/home/montel/Documents/LinuxLivePaper`) is a **Linux-exclusive entertainment app** for
 *live images* (stills that play when pressed, iPhone-Live-Photo style), inspired by the iOS app *intoLive*.
-1. **Gallery** of the LinuxLivePaper library folder (live images, videos, GIFs; **no standalone photos**) in an attractive grid.
+1. **Gallery** of the LinuxLivePaper library folder (live images, videos, GIFs; **no standalone photos**), styled like
+   **iOS Photos**: perfect-square tiles touching each other; tabs **All · Live · Collections** (no Videos/GIFs tabs).
 2. **Creator** with intoLive-style video effects/editing that outputs live images.
 
 The user's decisions:
 - iOS/iPhone compatibility doesn't matter for now ("we can worry about the format working outside of the Linux version later").
 - The library is ONE user-settable folder, default `~/Videos/LinuxLivePaper`; creations are saved there.
 - The creator must be timeline-based (no typing seconds).
+- Collections live in `<library>/collection/<Collection Name>/` (folder per collection, named by the collection).
+  Icon: the system folder icon unless the user picks a `.png`. Deleting from All/Live must NOT delete the collection copy.
+- Right-click on anything → Delete / Add to Collection. Creators have a "Save to collection" option.
+- Performance matters ("no throttle, pure optimization"); the user often has YouTube playing while testing.
 - Windows comes later. It's not a desktop-wallpaper engine (that would be a separate Rust project).
 
 ## Read in this order
@@ -21,8 +26,9 @@ The user's decisions:
 4. `docs/INTOLIVE-ANALYSIS.md`: intoLive feature map, to use as the parity checklist for the creator
 
 ## Current state
-- ✅ Gallery (`linuxlivepaper/app.py`, `library.py`, `thumbs.py`): grid of the library folder, filters All/Live/Videos/GIFs,
-  badges, hover-to-play, viewer (press-and-hold live with sound, video with controls, GIF, ←/→/Esc/Space),
+- ✅ Gallery (`linuxlivepaper/app.py`, `library.py`, `thumbs.py`): iOS-Photos-style grid (`MediaGrid`: `Square` tiles
+  1 px apart, oldest first like iOS), tabs All/Live/Collections, badges, hover-to-play, right-click menu (Add to
+  Collection ▸ / New Collection…, Delete — or "Remove from Collection" inside a collection), viewer (press-and-hold live with sound, video with controls, GIF, ←/→/Esc/Space),
   import button (copies into the library), ☰ menu: Library Folder… (Adw.PreferencesDialog), Open Library Folder, Rescan.
   Library path persisted in `~/.config/linuxlivepaper/config.json` (`{"library": "..."}`).
 - ✅ Timeline editor (`editor.py`: `Timeline` DrawingArea + `EditorPage`), opened by **+** or the viewer's *Make Live Image*:
@@ -40,7 +46,24 @@ The user's decisions:
   so the preview is WYSIWYG. Paused frames use `effects.frame_chain` via `thumbs.grab_frame(..., chain)`.
   Editor side panel (Adw.PreferencesPage): Look, Motion, Press effect + "Try it" press-and-hold, Reset effects.
   Cover time is mapped through speed/direction (`effects.out_time`); playhead back via `effects.src_time`.
-- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake,playback,effects}`.
+- ✅ Collections (`library.Collection`, `app.CollectionsView/CollectionPage`, `widgets.collection_dialog`):
+  cards with the themed `folder` icon or the chosen PNG (stored as `.icon.png` inside the collection folder), name,
+  item count; click → the collection's grid; right-click → Edit (rename + icon) / Delete (to Trash).
+  `add_to_collection` **hard-links** the files (falls back to copy), so deleting from All/Live (trash) leaves the
+  collection's copy intact and vice versa. Per-item meta (press style) is copied into the collection's sidecar.
+  `library.scan()` skips the top-level `collection/` folder, so collection copies don't show twice in All.
+- ✅ Collage maker (`collage.py` model/render + `collage_page.py` UI, **+ → Live Collage…**): 10 layouts (2/3/4/6/9
+  cells, mixed), shapes 9:16/3:4/1:1/16:9, length 1.5–5 s, borders none/thin/thick, black/white. Per cell: clip
+  (video, GIF or live image `.mov`), start (fixed-length window on the cell timeline, `Timeline(fixed=True)`),
+  volume + mute, speed, direction, filter, effect. Cover time + press effect + Save to collection.
+  intoLive itself has no layout collage (it has PIP video stickers and "2-Split/3-Split"); this is our version.
+- **Collage performance design**: the preview never runs the collage graph. Each cell gets its own cached 360p
+  proxy (`effects.preview(..., loop=True)`, parallel pool, ~0.5 s each, only the changed cell re-renders) and
+  `CollageCanvas` composites the playing `Gtk.MediaFile`s with GtkSnapshot. A cell switches from its still to video on
+  its first decoded frame (no blank flash). Full 1080×1920 ffmpeg render only on save (~2.5–4.5 s for 4 cells under
+  load); cells are scaled down to cell size *before* filters, x264 `-preset faster` (measured: NVENC was no faster —
+  decode/filters dominate).
+- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake,playback,effects,collage}`.
 
 ### Hard-won facts (don't relearn these)
 - GTK's GStreamer `Gtk.MediaFile.seek()` while **paused** reports success but doesn't render the frame (black).
@@ -58,6 +81,8 @@ The user's decisions:
 - Adding a look/effect = one dict entry in `effects.py` (an ffmpeg chain that keeps the frame size; internal pad
   labels must be unique, prefix them `fx`). The self-check renders every entry and checks size + duration.
   Gotcha: `blend` on yuv420p tints pink/green → `dreamy` converts to `gbrp` first.
+- PyGObject: `Gdk.RGBA(red=…)` kwargs are silently ignored (transparent!). Use `rgba.parse("#…")`.
+- `Gio.File.trash()` on test files lands in the user's real Trash (`~/.local/share/Trash`); clean up after tests.
 - Test video with audio: `/media/montel/Extreme SSD/Yu-Gi-Oh Arc-V Episode 18 English SubbedDubbed Aniwatch.mp4` (21:55, 1080p).
   Test GIFs: `/home/montel/Documents/GifDeck/GIFs/`.
 
@@ -92,11 +117,11 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - Every non-trivial module gets one runnable self-check (`if __name__ == "__main__":` asserts).
 
 ## Next steps (suggested order)
-1. Text overlays (drawtext: font, color, position, simple animations) and stickers (image/GIF overlay) in the editor
-   panel; then crop/rotate/canvas (ROADMAP Phases 3–4). Extend `effects.graph`; keep preview == export.
+1. Text overlays (drawtext) and stickers (image/GIF overlay, PIP) in the editor and collage cells; crop/rotate.
 2. Filter intensity slider + .cube LUT import (`lut3d`).
-3. Gallery polish: date sections, Gio.FileMonitor live reload, context menu (trash, open folder), fullscreen.
-4. Package it: a `.desktop` file + icon.
+3. Gallery polish: date sections, scroll to newest on open, Gio.FileMonitor live reload, multi-select, fullscreen.
+4. Collage: drag to swap cells, per-cell pan/zoom inside its frame, shared clock if cell drift ever shows.
+5. Package it: a `.desktop` file + icon.
 
 ## Log
 - 2026-11-02: Phase 0. Static IPA analysis.
@@ -105,4 +130,5 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - 2026-11-02: Fixed GIF import/viewing (ffmpeg thumbs + MP4 proxies). Removed photos. Single library folder (default ~/Videos/LinuxLivePaper, settable).
   Replaced the seconds-typing CreateDialog with the timeline editor (`editor.py`). Audio checked: it works; the screencasts are silent.
 - 2026-11-02: Fixed live audio being muted after hover previews (PipeWire mute restore). Added the immersive press transition (`playback.py`).
+- 2026-11-03: Collage maker (per-cell volume/speed/direction/filter/effect), Collections (folder per collection, custom PNG icon), iOS-Photos grid, tabs All/Live/Collections, right-click Delete/Add to Collection, Save to collection in creators.
 - 2026-11-02: Baked-in effects (`effects.py`: looks, effects, speed, reverse/bounce) in an editor side panel; press transition selectable per item (blur/zoom/fade/instant).

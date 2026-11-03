@@ -94,27 +94,29 @@ def has_audio(src):
                                 "-of", "csv=p=0", str(src)], capture_output=True, text=True).stdout.strip())
 
 
-def render(src, start, end, out, opts=None, height=None, fast=False, extra=()):
+def render(src, start, end, out, opts=None, height=None, fast=False, extra=(), loop=False):
     """Render [start, end] of src through the effect graph to out (H.264/AAC)."""
     opts = {**DEFAULT, **(opts or {})}
     audio = has_audio(src)
     _, w, h = thumbs.probe(str(src))
-    trim = ["-ss", f"{start:.3f}"] + (["-to", f"{end:.3f}"] if end is not None else [])
+    trim = (["-stream_loop", "-1"] if loop else []) + ["-ss", f"{start:.3f}"] + \
+        (["-t", f"{end - start:.3f}"] if end is not None else [])
     cmd = ["ffmpeg", "-v", "error", "-y", *trim, "-i", str(src), "-filter_complex", graph(opts, audio, out_size(w, h, height)),
            "-map", "[vout]", *(["-map", "[aout]", "-c:a", "aac"] if audio else []),
-           "-c:v", "libx264", *(["-preset", "ultrafast", "-crf", "23"] if fast else ["-crf", "18"]), *extra, str(out)]
+           "-c:v", "libx264", *(["-preset", "ultrafast", "-crf", "23"] if fast else ["-preset", "faster", "-crf", "18"]), *extra, str(out)]
     subprocess.run(cmd, check=True, capture_output=True)
     return out
 
 
-def preview(src, start, end, opts, cache_dir):
-    """Cached low-res render of the selection for the editor's looping preview."""
-    key = hashlib.sha1(f"{src}:{os.stat(src).st_mtime_ns}:{start:.3f}:{end:.3f}:{sorted(opts.items())}".encode())
+def preview(src, start, end, opts, cache_dir, height=540, loop=False):
+    """Cached low-res render of the selection for looping previews (`loop`: repeat a too-short source)."""
+    key = hashlib.sha1(f"{src}:{os.stat(src).st_mtime_ns}:{start:.3f}:{end:.3f}:{sorted(opts.items())}:{height}:{loop}"
+                       .encode())
     out = Path(cache_dir) / (key.hexdigest() + ".mp4")
     if not out.exists():
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(".tmp.mp4")
-        render(src, start, end, tmp, opts, height=540, fast=True)
+        render(src, start, end, tmp, opts, height=height, fast=True, loop=loop)
         os.replace(tmp, out)
     return str(out)
 

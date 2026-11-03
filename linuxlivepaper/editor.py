@@ -13,6 +13,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GLib, GObject, Gtk, Pango, PangoCairo  # noqa: E402
 
 from . import effects, library, livemake, thumbs  # noqa: E402
+from .widgets import CollectionRow  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file  # noqa: E402
 
 YELLOW = (0.96, 0.76, 0.07)
@@ -36,9 +37,10 @@ class Timeline(Gtk.DrawingArea):
     """Emits changed(what) with what in start|end|move|cover|scrub. Times are absolute seconds."""
     __gsignals__ = {"changed": (GObject.SignalFlags.RUN_FIRST, None, (str,))}
 
-    def __init__(self, src, duration, aspect):
+    def __init__(self, src, duration, aspect, fixed=False):
+        """fixed: the selection length is set by the caller; dragging only moves it, and no cover marker."""
         super().__init__(content_height=HEIGHT, hexpand=True, focusable=False)
-        self.src, self.D, self.aspect = src, max(duration, 0.1), aspect
+        self.src, self.D, self.aspect, self.fixed = src, max(duration, 0.1), aspect, fixed
         self.s, self.e = 0.0, min(DEFAULT_SEL, self.D)
         self.k = self.p = 0.0
         self.k = (self.s + self.e) / 2
@@ -97,6 +99,10 @@ class Timeline(Gtk.DrawingArea):
 
     # --- input ----------------------------------------------------------------------------------
     def _hit(self, x, y):
+        h = self._hit_any(x, y)
+        return "move" if self.fixed and h in ("start", "end", "cover") else h
+
+    def _hit_any(self, x, y):
         if y < RU_Y:
             return "overview"
         if y >= CV_Y and abs(x - self.x(self.k)) < 28:
@@ -289,7 +295,7 @@ class Timeline(Gtk.DrawingArea):
             cr.rectangle(hx + HW / 2 - 1, ST_Y + ST_H / 2 - 10, 2, 20)
             cr.fill()
         # cover marker
-        xk = self.x(self.k)
+        xk = -1000 if self.fixed else self.x(self.k)
         cr.set_source_rgba(1, 1, 1, 0.9)
         cr.rectangle(xk - 1, ST_Y + 3, 2, ST_H - 6)
         cr.fill()
@@ -316,6 +322,7 @@ class Timeline(Gtk.DrawingArea):
 
 class EditorPage(Adw.NavigationPage):
     """Pick a stretch of a video/GIF and save it as a live image."""
+    SAVE_LABEL = "Save Live Image"
 
     def __init__(self, src, on_saved):
         super().__init__(title="Create Live Image")
@@ -367,7 +374,7 @@ class EditorPage(Adw.NavigationPage):
             "Drag the yellow handles to trim · drag inside the selection to move it · drag COVER to pick the still · "
             "click to move the playhead · scroll to zoom, Shift+scroll to pan · drag the top bar to jump around"))
 
-        self.save_btn = Gtk.Button(label="Save Live Image", css_classes=["suggested-action"])
+        self.save_btn = Gtk.Button(label=self.SAVE_LABEL, css_classes=["suggested-action"])
         self.save_btn.connect("clicked", self._save)
         header = Adw.HeaderBar()
         header.pack_end(self.save_btn)
@@ -428,6 +435,10 @@ class EditorPage(Adw.NavigationPage):
         try_row.add_suffix(self.try_btn)
         press.add(try_row)
         page.add(press)
+        save = Adw.PreferencesGroup(title="Save")
+        self.collection_row = CollectionRow()
+        save.add(self.collection_row)
+        page.add(save)
         reset = Gtk.Button(label="Reset effects", halign=Gtk.Align.CENTER, css_classes=["flat"])
         reset.connect("clicked", lambda *_: self._reset())
         grp = Adw.PreferencesGroup()
@@ -624,11 +635,14 @@ class EditorPage(Adw.NavigationPage):
         self.save_btn.set_sensitive(False)
         self.save_btn.set_label("Saving…")
         s, e, k, opts, style = self.tl.s, self.tl.e, self.tl.k, dict(self.opts), self.style
+        col = self.collection_row.collection()
 
         def work():
             try:
                 res, err = livemake.make_live(self.src, s, e, k - s, opts=opts), None
                 library.set_meta(res[0], transition=style)
+                if col:
+                    library.add_to_collection(library.Item("live", str(res[0]), str(res[1]), 0), col)
             except Exception as ex:  # surfaced as a toast
                 res, err = None, str(ex)
             GLib.idle_add(self.on_saved, self, res, err)
