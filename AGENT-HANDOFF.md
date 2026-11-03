@@ -63,7 +63,18 @@ The user's decisions:
   its first decoded frame (no blank flash). Full 1080×1920 ffmpeg render only on save (~2.5–4.5 s for 4 cells under
   load); cells are scaled down to cell size *before* filters, x264 `-preset faster` (measured: NVENC was no faster —
   decode/filters dominate).
-- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake,playback,effects,collage}`.
+- ✅ Overlays (`overlays.py` + `OverlayLayer` in `editor.py`): text and image/GIF stickers baked into the live image.
+  `overlays.text(...)`/`overlays.sticker(path)` are plain dicts (x/y/size as canvas fractions, opacity, optional
+  `start`/`end` window); `overlays.graph()` appends `drawtext` / `overlay` to the effects chain, `render()` and
+  `preview()` mirror `effects.render/preview` with `overlays=`, and `livemake.make_live(..., overlay_list=…)` bakes
+  them in (cover still is grabbed from the MOV, so it carries them). **GIF alpha works**: `format=rgba` before
+  scaling is what keeps transparency (a pal8 GIF scaled first loses it); `-stream_loop -1` keeps GIFs animating on
+  long clips. Editor UI: *Overlays* group (Text / Sticker / Selected combo / Size / Opacity / text field / Remove),
+  drag on the preview to move, scroll to resize, click to select. The layer hides while playing or during *Try it*
+  so the baked preview (real drawtext + animated GIF) is what you see.
+  Known gaps: one text style (bold Sans; colour/opacity only), no rotation or keyframes, no per-overlay time window
+  UI, collages have no overlays yet.
+- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake,playback,effects,collage,overlays}`.
 
 ### Hard-won facts (don't relearn these)
 - GTK's GStreamer `Gtk.MediaFile.seek()` while **paused** reports success but doesn't render the frame (black).
@@ -117,8 +128,8 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - Every non-trivial module gets one runnable self-check (`if __name__ == "__main__":` asserts).
 
 ## Next steps (suggested order)
-1. Text overlays (drawtext) and stickers (image/GIF overlay, PIP) in the editor and collage cells; crop/rotate.
-2. Filter intensity slider + .cube LUT import (`lut3d`).
+1. Overlays in collage cells (reuse `overlays.graph` in `collage.command`), sticker rotation/keyframes, text styles.
+2. Crop/rotate/flip and Ken Burns for clips; filter intensity slider + .cube LUT import (`lut3d`).
 3. Gallery polish: date sections, scroll to newest on open, Gio.FileMonitor live reload, multi-select, fullscreen.
 4. Collage: drag to swap cells, per-cell pan/zoom inside its frame, shared clock if cell drift ever shows.
 5. Package it: a `.desktop` file + icon.
@@ -132,3 +143,4 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - 2026-11-02: Fixed live audio being muted after hover previews (PipeWire mute restore). Added the immersive press transition (`playback.py`).
 - 2026-11-03: Collage maker (per-cell volume/speed/direction/filter/effect), Collections (folder per collection, custom PNG icon), iOS-Photos grid, tabs All/Live/Collections, right-click Delete/Add to Collection, Save to collection in creators.
 - 2026-11-02: Baked-in effects (`effects.py`: looks, effects, speed, reverse/bounce) in an editor side panel; press transition selectable per item (blur/zoom/fade/instant).
+- 2026-11-03: Text overlays and image/GIF stickers (`overlays.py`), placed by dragging on the editor preview; GIF alpha preserved; baked into the saved MOV and cover still.

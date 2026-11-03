@@ -5,16 +5,18 @@ import time
 import uuid
 from pathlib import Path
 
-from . import effects
+from . import effects, overlays as ov
 from .library import library_dir
 
 
-def make_live(src, start=0.0, end=None, key_time=None, out_dir=None, name=None, opts=None):
+def make_live(src, start=0.0, end=None, key_time=None, out_dir=None, name=None, opts=None, overlay_list=()):
     """Render [start, end] of src (video or GIF) through effects `opts` → <name>.mov, and grab the frame at
     key_time (source seconds after start, mapped through speed/reverse) → <name>.jpg. Defaults to the library folder."""
     jpg, mov = out_paths(out_dir, name)
     opts = {**effects.DEFAULT, **(opts or {})}
-    effects.render(src, start, end, mov, opts, extra=live_tags())
+    render = ov.render if overlay_list else effects.render
+    kw = {"overlays": overlay_list} if overlay_list else {}
+    render(src, start, end, mov, opts, extra=live_tags(), **kw)
     length = (end if end is not None else effects.thumbs.video_duration(str(src))) - start
     key = effects.out_time(key_time or 0.0, length, opts)
     still(mov, min(max(0.0, key), effects.out_length(length, opts) - 0.05), jpg)

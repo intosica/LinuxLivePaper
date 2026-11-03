@@ -79,6 +79,16 @@ def make_thumb(item):
         return None
 
 
+def alpha_frame(path, height=360):
+    """First frame of an image/GIF as a PNG buffer with its alpha intact (stickers)."""
+    key = CACHE / "stickers" / (_key(path, height) + ".png")
+    if not key.exists():
+        key.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(path), "-frames:v", "1",
+                        "-vf", f"scale=-1:'min({height},ih)'", str(key)], check=True)
+    return key
+
+
 def mp4_proxy(src, start=None, end=None, height=720):
     """Cached H.264 MP4 of src (optionally trimmed). Used for GIF playback (GTK's GStreamer
     player can't play GIFs) and for frame-exact looping of the editor selection."""

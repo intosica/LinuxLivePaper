@@ -10,13 +10,18 @@ from concurrent.futures import ThreadPoolExecutor
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GLib, GObject, Gtk, Pango, PangoCairo  # noqa: E402
+gi.require_version("Graphene", "1.0")
+from gi.repository import Adw, Gdk, GLib, GObject, Graphene, Gtk, Pango, PangoCairo  # noqa: E402
 
-from . import effects, library, livemake, thumbs  # noqa: E402
+from . import effects, library, livemake, overlays, thumbs  # noqa: E402
 from .widgets import CollectionRow  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file  # noqa: E402
 
 YELLOW = (0.96, 0.76, 0.07)
+SELECT = Gdk.RGBA()
+SELECT.parse("#3584e4")
+OVERLAY_WHITE = Gdk.RGBA()
+OVERLAY_WHITE.parse("white")
 PAD = 16                     # horizontal padding so edge handles stay grabbable
 OV_Y, OV_H = 2, 30           # overview filmstrip (whole video) with the zoomed view window
 RU_Y, RU_H = 40, 18          # ruler
@@ -320,6 +325,94 @@ class Timeline(Gtk.DrawingArea):
         self._text(cr, (xs + xe) / 2, ST_Y - 17, label, 8, (0, 0, 0, 0.9), True, True)
 
 
+class OverlayLayer(Gtk.Widget):
+    """The preview's sticker/text layer: draws overlays on the video rect and moves/scales the selected one."""
+
+    def __init__(self, page):
+        super().__init__(hexpand=True, vexpand=True)
+        self.page = page
+        click = Gtk.GestureClick()
+        click.connect("pressed", self._pressed)
+        self.add_controller(click)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-update", self._dragged)
+        drag.connect("drag-begin", lambda g, x, y: self._pressed(None, 1, x, y))
+        self.add_controller(drag)
+        scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.connect("scroll", self._scroll)
+
+    def rect(self):
+        """The video rect inside this widget (the picture is letterboxed)."""
+        w, h = self.get_width(), self.get_height()
+        a = self.page.aspect
+        vw, vh = (w, w / a) if w / a <= h else (h * a, h)
+        return (w - vw) / 2, (h - vh) / 2, vw, vh
+
+    def box(self, o):
+        ox, oy, vw, vh = self.rect()
+        if o["kind"] == "text":
+            lay = self.page.text_layout(o, vw)
+            tw, th = lay.get_pixel_size()
+            return ox + o["x"] * vw - tw / 2, oy + o["y"] * vh - th / 2, tw, th
+        tex = self.page.sticker_texture(o)
+        tw = o["size"] * vw
+        th = tw / (tex.get_intrinsic_aspect_ratio() or 1) if tex else tw
+        return ox + o["x"] * vw - tw / 2, oy + o["y"] * vh - th / 2, tw, th
+
+    def _pressed(self, _g, _n, x, y):
+        for i in reversed(range(len(self.page.overlays))):
+            bx, by, bw, bh = self.box(self.page.overlays[i])
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                self.page.select_overlay(i)
+                return
+        self.page.select_overlay(None)
+
+    def _dragged(self, _g, dx, dy):
+        o = self.page.overlay()
+        if not o:
+            return
+        _, _, vw, vh = self.rect()
+        o["x"] = min(1.0, max(0.0, o["x"] + dx / vw))
+        o["y"] = min(1.0, max(0.0, o["y"] + dy / vh))
+        self.queue_draw()
+
+    def _scroll(self, _c, _dx, dy):
+        o = self.page.overlay()
+        if not o:
+            return False
+        o["size"] = min(2.0, max(0.03, o["size"] * (0.92 if dy > 0 else 1.08)))
+        self.page.sync_overlay_ui()
+        self.queue_draw()
+        return True
+
+    def do_snapshot(self, snap):
+        for i, o in enumerate(self.page.overlays):
+            bx, by, bw, bh = self.box(o)
+            if bw < 1 or bh < 1:
+                continue
+            r = rect(bx, by, bw, bh)
+            if o["kind"] == "text":
+                snap.save()
+                snap.translate(Graphene.Point().init(bx, by))
+                snap.append_layout(self.page.text_layout(o, bw), OVERLAY_WHITE)
+                snap.restore()
+            else:
+                tex = self.page.sticker_texture(o)
+                if tex:
+                    snap.save()
+                    snap.translate(Graphene.Point().init(bx, by))
+                    tex.snapshot(snap, bw, bh)
+                    snap.restore()
+            if i == self.page.ov_sel:
+                for e in (rect(bx - 4, by - 4, bw + 8, 2), rect(bx - 4, by + bh + 2, bw + 8, 2),
+                          rect(bx - 4, by - 4, 2, bh + 8), rect(bx + bw + 2, by - 4, 2, bh + 8)):
+                    snap.append_color(SELECT, e)
+
+
+def rect(x, y, w, h):
+    return Graphene.Rect().init(x, y, w, h)
+
+
 class EditorPage(Adw.NavigationPage):
     """Pick a stretch of a video/GIF and save it as a live image."""
     SAVE_LABEL = "Save Live Image"
@@ -334,6 +427,9 @@ class EditorPage(Adw.NavigationPage):
         self.stream, self.tick, self.proxies = None, 0, set()
         self.opts = dict(effects.DEFAULT)
         self.style = DEFAULT_STYLE
+        self.overlays, self.ov_sel = [], None
+        self._textures = {}
+        self.aspect = vw / vh if vh else 16 / 9
         self.canvas, self.trying = None, False
 
         self.tl = Timeline(src, self.D, vw / vh if vh else 16 / 9)
@@ -344,6 +440,9 @@ class EditorPage(Adw.NavigationPage):
         self.frame = frame
         self.spinner = Gtk.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, width_request=32,
                                    height_request=32)
+        self.layer = OverlayLayer(self)
+        self.layer.set_can_target(False)
+        frame.add_overlay(self.layer)
         frame.add_overlay(self.spinner)
 
         self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", tooltip_text="Play selection (Space)",
@@ -435,6 +534,41 @@ class EditorPage(Adw.NavigationPage):
         try_row.add_suffix(self.try_btn)
         press.add(try_row)
         page.add(press)
+        extra = Adw.PreferencesGroup(title="Overlays",
+                                     description="Text and stickers drawn over the video. Drag them on the "
+                                                 "preview; scroll to resize.")
+        buttons = Gtk.Box(spacing=6)
+        for label, icon, fn in (("Text", "insert-text-symbolic", self._add_text),
+                                ("Sticker", "insert-image-symbolic", self._add_sticker)):
+            b = Gtk.Button(label=label, icon_name=icon, hexpand=True)
+            b.connect("clicked", lambda _b, f=fn: f())
+            buttons.append(b)
+        extra.add(buttons)
+        self.ov_combo = Adw.ComboRow(title="Selected")
+        self.ov_combo.connect("notify::selected", lambda r, _: self._pick_overlay(r.get_selected()))
+        self.ov_combo_names = []
+        extra.add(self.ov_combo)
+        self.ov_size = Adw.ActionRow(title="Size")
+        self.ov_size_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.03, 1.5, 0.01)
+        self.ov_size_scale.set_hexpand(True)
+        self.ov_size_scale.set_size_request(140, -1)
+        self.ov_size_scale.connect("value-changed", lambda sc: self._set_overlay("size", sc.get_value()))
+        self.ov_size.add_suffix(self.ov_size_scale)
+        extra.add(self.ov_size)
+        self.ov_opacity = Adw.ActionRow(title="Opacity")
+        self.ov_opacity_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0.1, 1, 0.05)
+        self.ov_opacity_scale.set_hexpand(True)
+        self.ov_opacity_scale.set_size_request(140, -1)
+        self.ov_opacity_scale.connect("value-changed", lambda sc: self._set_overlay("opacity", sc.get_value()))
+        self.ov_opacity.add_suffix(self.ov_opacity_scale)
+        extra.add(self.ov_opacity)
+        self.ov_text = Adw.EntryRow(title="Text")
+        self.ov_text.connect("changed", lambda r: self._set_overlay("text", r.get_text(), rebuild=False))
+        extra.add(self.ov_text)
+        rm = Gtk.Button(label="Remove overlay", halign=Gtk.Align.CENTER, css_classes=["destructive-action", "pill"])
+        rm.connect("clicked", lambda *_: self._remove_overlay())
+        extra.add(rm)
+        page.add(extra)
         save = Adw.PreferencesGroup(title="Save")
         self.collection_row = CollectionRow()
         save.add(self.collection_row)
@@ -445,12 +579,118 @@ class EditorPage(Adw.NavigationPage):
         grp.add(reset)
         page.add(grp)
         self.panel = page
+        self.sync_overlay_ui()
         return page
+
+    # --- overlays -------------------------------------------------------------------------------
+    def overlay(self):
+        return self.overlays[self.ov_sel] if self.ov_sel is not None else None
+
+    def text_layout(self, o, width_px):
+        lay = self.create_pango_layout()
+        lay.set_text(o.get("text") or "", -1)
+        desc = Pango.FontDescription.from_string(f"Sans Bold {max(6, int(width_px * o.get('size', 0.09)))}")
+        lay.set_font_description(desc)
+        attrs = Pango.AttrList()
+        c = Gdk.RGBA()
+        c.parse(o.get("color", "#ffffff"))
+        attrs.insert(Pango.attr_foreground_new(int(c.red * 65535), int(c.green * 65535), int(c.blue * 65535)))
+        state = Pango.attr_foreground_alpha_new(int(c.alpha * 65535 * o.get("opacity", 1.0)))
+        if hasattr(Pango, "attr_foreground_alpha_new"):
+            attrs.insert(state)
+        lay.set_attributes(attrs)
+        return lay
+
+    def sticker_texture(self, o):
+        tex = self._textures.get(o.get("id"))
+        if tex is None:
+            try:
+                tex = Gdk.Texture.new_from_filename(str(thumbs.alpha_frame(o["path"])))
+            except GLib.Error:
+                tex = False
+            self._textures[o.get("id")] = tex
+        return tex or None
+
+    def _add_text(self):
+        self._next_id = getattr(self, "_next_id", 0) + 1
+        self.overlays.append(overlays.text("Your text", id=self._next_id))
+        self.select_overlay(len(self.overlays) - 1)
+
+    def _add_sticker(self, path=None):
+        if path is None:
+            f = Gtk.FileFilter(name="Images and GIFs")
+            for m in ("image/*",):
+                f.add_mime_type(m)
+            store = Gio.ListStore(item_type=Gtk.FileFilter)
+            store.append(f)
+
+            def picked(d, res):
+                try:
+                    self._add_sticker(d.open_finish(res).get_path())
+                except GLib.Error:
+                    pass
+            Gtk.FileDialog(title="Choose a sticker", filters=store,
+                           initial_folder=Gio.File.new_for_path(str(library.library_dir()))).open(self.get_root(),
+                                                                                              None, picked)
+            return
+        self._next_id += 1
+        self.overlays.append(overlays.sticker(path, id=self._next_id))
+        self.select_overlay(len(self.overlays) - 1)
+
+    def _remove_overlay(self):
+        if self.ov_sel is None:
+            return
+        self.overlays.pop(self.ov_sel)
+        self.select_overlay(None if not self.overlays else min(self.ov_sel, len(self.overlays) - 1))
+
+    def _set_overlay(self, key, value, rebuild=True):
+        o = self.overlay()
+        if not o:
+            return
+        o[key] = value
+        self._textures.pop(o.get("id"), None)
+        if rebuild:
+            self.layer.queue_draw()
+            self._changed(None, "cover")
+
+    def _pick_overlay(self, i):
+        if getattr(self, "_ov_syncing", False):  # the combo is being rebuilt, not clicked
+            return
+        self.select_overlay(i if self.overlays else None)
+
+    def select_overlay(self, i):
+        self.ov_sel = None if i is None or not self.overlays else min(i, len(self.overlays) - 1)
+        self.sync_overlay_ui()
+        self.layer.queue_draw()
+
+    def sync_overlay_ui(self):
+        """Refresh the overlay picker and the size/opacity/text rows from the selected overlay."""
+        self.ov_combo_names = [("Text: " + (o.get("text") or "")[:18]) if o["kind"] == "text"
+                               else "Sticker: " + os.path.basename(o["path"])[:18] for o in self.overlays]
+        self._ov_syncing = True
+        self.ov_combo.set_model(Gtk.StringList.new(self.ov_combo_names or ["No overlays yet"]))
+        self.ov_combo.set_sensitive(bool(self.overlays))
+        if self.ov_sel is not None:
+            self.ov_combo.set_selected(self.ov_sel)
+        self._ov_syncing = False
+        o = self.overlay()
+        for row in (self.ov_size, self.ov_opacity, self.ov_text):
+            row.set_visible(bool(o))
+        if o:
+            self.ov_size_scale.set_value(o["size"])
+            self.ov_opacity_scale.set_value(o.get("opacity", 1.0))
+            self.ov_text.set_text(o.get("text") or "")
+            self.ov_text.set_visible(o["kind"] == "text")
+        self.layer.set_can_target(bool(self.overlays))
+        if self.stream is None and not self.trying:
+            self.layer.set_visible(bool(self.overlays))
 
     def _reset(self):
         parent = self.panel.get_parent()
         parent.remove(self.panel)
         self.opts, self.style = dict(effects.DEFAULT), DEFAULT_STYLE
+        self.overlays, self.ov_sel = [], None
+        self._textures = {}
         parent.append(self._side_panel())
         self._changed(None, "cover")
 
@@ -478,7 +718,7 @@ class EditorPage(Adw.NavigationPage):
 
         def work():
             try:
-                path = effects.preview(self.src, s, e, opts, thumbs.CACHE / "previews")
+                path = self._preview_path(s, e, opts)
                 still = thumbs.grab_frame(path, min(effects.out_time(k - s, e - s, opts),
                                                     effects.out_length(e - s, opts) - 0.05))
             except Exception:
@@ -490,6 +730,7 @@ class EditorPage(Adw.NavigationPage):
             if not (path and still):
                 return
             self.proxies.add(path)
+            self.layer.set_visible(False)
             self.canvas = LiveCanvas(Gdk.Texture.new_for_pixbuf(still), path, style=self.style)
             self.frame.set_child(self.canvas)
             if self.trying:
@@ -510,9 +751,16 @@ class EditorPage(Adw.NavigationPage):
             self.canvas.stop()
             self.canvas = None
             self.frame.set_child(self.pic)
+            self.layer.set_visible(bool(self.overlays))
         return False
 
     # --- preview --------------------------------------------------------------------------------
+    def _preview_path(self, s, e, opts):
+        if self.overlays:
+            return overlays.preview(self.src, s, e, opts, thumbs.CACHE / "previews",
+                                    overlay_list=[dict(o) for o in self.overlays])
+        return effects.preview(self.src, s, e, opts, thumbs.CACHE / "previews")
+
     def _show_frame(self, t):
         self.req += 1
         req = self.req
@@ -540,7 +788,7 @@ class EditorPage(Adw.NavigationPage):
 
         def work():
             try:
-                path = effects.preview(self.src, s, e, opts, thumbs.CACHE / "previews")
+                path = self._preview_path(s, e, opts)
             except Exception:
                 path = None
             GLib.idle_add(start, path)
@@ -550,6 +798,7 @@ class EditorPage(Adw.NavigationPage):
             if req != self.req or not path:
                 return self.stop()
             self.proxies.add(path)
+            self.layer.set_visible(False)
             self.stream = media_file(path, muted=False, loop=True)
             hid = self.stream.connect("invalidate-contents", lambda st: (st.disconnect(hid), self.pic.set_paintable(st)))
             self.stream.play()
@@ -577,6 +826,7 @@ class EditorPage(Adw.NavigationPage):
             self.stream.set_playing(False)
             self.stream = None
             self._show_frame(self.tl.p)
+        self.layer.set_visible(bool(self.overlays))
 
     def _cleanup(self):
         self.stop()
@@ -635,11 +885,12 @@ class EditorPage(Adw.NavigationPage):
         self.save_btn.set_sensitive(False)
         self.save_btn.set_label("Saving…")
         s, e, k, opts, style = self.tl.s, self.tl.e, self.tl.k, dict(self.opts), self.style
+        ovs = [dict(o) for o in self.overlays]
         col = self.collection_row.collection()
 
         def work():
             try:
-                res, err = livemake.make_live(self.src, s, e, k - s, opts=opts), None
+                res, err = livemake.make_live(self.src, s, e, k - s, opts=opts, overlay_list=ovs), None
                 library.set_meta(res[0], transition=style)
                 if col:
                     library.add_to_collection(library.Item("live", str(res[0]), str(res[1]), 0), col)

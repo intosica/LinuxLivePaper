@@ -34,6 +34,10 @@ Requirements: `/usr/bin/python3` with PyGObject (GTK 4 + libadwaita ≥ 1.5), GS
   selection with sound, ←/→ steps one frame (Shift for 1 s). Saves go to the library folder.
 - The editor's side panel sets the **Filter**, **Effect**, **Speed**, **Direction** (forward/reverse/bounce) and
   **Press effect**. Hold *Try it* to preview exactly what will be saved. *Save to collection* also files it in a collection.
+- **Text & stickers**: in the editor's *Overlays* group, *Text* adds a caption and *Sticker* adds any image or
+  GIF (alpha is kept, and the GIF animates in the preview and in the saved file). Drag an overlay on the preview
+  to move it; scroll over the preview to resize the selected one. Pick the overlay in *Selected* to edit its text,
+  size and opacity, or remove it.
 - **+** → *Live Collage…*: pick a layout (2–9 cells), shape (9:16, 3:4, 1:1, 16:9), length, borders. Click a cell to
   fill it with a video, GIF or live video; for the selected cell drag the yellow window on its timeline to choose the
   part that plays, and set its **volume**, speed, direction, filter and effect. Space plays the whole collage.
