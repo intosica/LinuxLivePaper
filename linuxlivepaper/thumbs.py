@@ -37,10 +37,21 @@ def video_duration(src):
 
 
 def grab_frame(src, t, height=None, chain=""):
-    """Exact frame at t seconds as a GdkPixbuf (or None), optionally through an ffmpeg filter chain."""
+    """Frame at t seconds as a GdkPixbuf (or None), optionally through an ffmpeg filter chain.
+
+    Seeking to the very last frame of a file yields nothing, so fall back a little when the exact time is empty."""
+    at = max(0.0, t)
+    for back in (0.0, 0.2, 0.6):
+        pb = _frame_at(src, max(0.0, at - back), height, chain)
+        if pb is not None:
+            return pb
+    return _frame_at(src, 0.0, height, chain) if at else None
+
+
+def _frame_at(src, t, height=None, chain=""):
     vf = ",".join(c for c in (chain, f"scale=-2:{height}" if height else "") if c)
     vf = ["-vf", vf] if vf else []
-    png = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{max(0.0, t):.3f}", "-i", src, "-frames:v", "1", *vf,
+    png = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", src, "-frames:v", "1", *vf,
                           "-f", "image2pipe", "-c:v", "png", "-"], capture_output=True).stdout
     if not png:
         return None

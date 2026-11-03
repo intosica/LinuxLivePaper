@@ -32,15 +32,21 @@ Requirements: `/usr/bin/python3` with PyGObject (GTK 4 + libadwaita ≥ 1.5), GS
   drag inside the selection to move it, and drag **COVER** to pick the still. Click to place the red playhead.
   Scroll to zoom, Shift+scroll to pan, and drag the overview strip to jump around long videos. Space plays the
   selection with sound, ←/→ steps one frame (Shift for 1 s). Saves go to the library folder.
+- **Double-click anywhere on a timeline** to bring the yellow selection (or a collage cell's window) to that spot —
+  much faster than dragging it across. The preview follows the timeline live, including while it plays.
 - The editor's side panel sets the **Filter**, **Effect**, **Speed**, **Direction** (forward/reverse/bounce) and
   **Press effect**. Hold *Try it* to preview exactly what will be saved. *Save to collection* also files it in a collection.
-- **Text & stickers**: in the editor's *Overlays* group, *Text* adds a caption and *Sticker* adds any image or
+- **Text & stickers**: in the *Overlays* group, *Text* adds a caption and *Sticker* adds any image or
   GIF (alpha is kept, and the GIF animates in the preview and in the saved file). Drag an overlay on the preview
-  to move it; scroll over the preview to resize the selected one. Pick the overlay in *Selected* to edit its text,
-  size and opacity, or remove it.
+  to move it; scroll over the preview to resize the selected one. Pick the overlay in *Selected* to change its text,
+  font, bold, size, opacity, rotation, outline width and the stretch of the clip it shows on (*Whole clip* off
+  gives *Starts at* / *Ends at*).
 - **+** → *Live Collage…*: pick a layout (2–9 cells), shape (9:16, 3:4, 1:1, 16:9), length, borders. Click a cell to
   fill it with a video, GIF or live video; for the selected cell drag the yellow window on its timeline to choose the
-  part that plays, and set its **volume**, speed, direction, filter and effect. Space plays the whole collage.
+  part that plays (drag its ends to stretch or shrink it — a window shorter than the clip needs freezes on the last
+  frame; *Fit* resets it), and set its **volume**, speed, direction, filter and effect. Space plays the whole collage,
+  *Try it* previews the saved result, and overlays work the same as in the editor (over the whole canvas; clicking an
+  empty spot selects the cell under it). Changes show up live, while playing too.
 
 A *live image* is a still and a video that share a name in the same folder (`x.jpg` + `x.mov`).
 That means Live Photos copied over from an iPhone show up as LIVE too.

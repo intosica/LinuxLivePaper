@@ -29,6 +29,9 @@ flowbox.collections > flowboxchild { padding: 6px; border-radius: 12px; }
 .collection-name { font-weight: 700; }
 .viewer { background: black; }
 .hint { color: alpha(white, 0.7); margin: 16px; }
+.hold { background: alpha(currentColor, 0.12); border-radius: 999px; padding: 5px 14px; }
+.hold:hover { background: alpha(currentColor, 0.22); }
+.hold.holding { background: #3584e4; color: white; }
 """
 pool = ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4) // 2))
 
@@ -688,6 +691,15 @@ class App(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
         (self.props.active_window or Window(self)).present()
+
+    def do_shutdown(self):
+        for w in self.get_windows():  # stop playback before the display goes away
+            nav = getattr(w, "nav", None)
+            for page in (nav.get_navigation_stack() if nav else []):
+                stop = getattr(page, "stop", None)
+                if stop:
+                    stop()
+        Adw.Application.do_shutdown(self)
 
 
 def main():

@@ -15,10 +15,11 @@ gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk, Pango  # noqa: E402
 
-from . import collage, effects, library, livemake, thumbs  # noqa: E402
+from . import collage, effects, library, livemake, overlays, thumbs  # noqa: E402
 from .editor import Timeline  # noqa: E402
-from .playback import DEFAULT_STYLE, STYLES, media_file  # noqa: E402
-from .widgets import CollectionRow  # noqa: E402
+from .overlay_ui import OverlayHost  # noqa: E402
+from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file  # noqa: E402
+from .widgets import CollectionRow, HoldButton  # noqa: E402
 
 PROXY_H = 360
 pool = ThreadPoolExecutor(max_workers=max(2, min(6, (os.cpu_count() or 4) // 2)))
@@ -109,7 +110,7 @@ class CollageCanvas(Gtk.Widget):
                     snap.append_color(ACCENT, e)
 
 
-class CollagePage(Adw.NavigationPage):
+class CollagePage(OverlayHost, Adw.NavigationPage):
     SAVE_LABEL = "Save Live Collage"
 
     def __init__(self, on_saved):
@@ -120,13 +121,18 @@ class CollagePage(Adw.NavigationPage):
         self.sel = 0
         self.style = DEFAULT_STYLE
         self.streams, self.playing, self.gen, self.tl = [], False, 0, None
+        self.canvas_live = None
+        self.canvas_widget, self.trying, self._try_gen = None, False, 0
 
         self.canvas = CollageCanvas(self)
         self.spinner = Gtk.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, width_request=32,
                                    height_request=32)
         stage = Gtk.Overlay(child=self.canvas, css_classes=["viewer", "card"], overflow=Gtk.Overflow.HIDDEN,
                             hexpand=True)
+        self.ov_init()
+        stage.add_overlay(self.layer)
         stage.add_overlay(self.spinner)
+        self.stage = stage
 
         self.play_btn = Gtk.Button(icon_name="media-playback-start-symbolic", tooltip_text="Play (Space)",
                                    css_classes=["circular", "suggested-action"])
@@ -242,6 +248,15 @@ class CollagePage(Adw.NavigationPage):
             grp.add(self._combo("Effect", [(k, v[0]) for k, v in effects.EFFECTS.items()], o["effect"],
                                 lambda v: self._set_opt("effect", v)))
         page.add(grp)
+        if cell:
+            win = Adw.ActionRow(title="Window", subtitle=f"{collage.window(cell, c['duration']):.2f} s of the clip"
+                                                        + ("" if cell.get("len") is None else " (custom)"))
+            fit = Gtk.Button(label="Fit", valign=Gtk.Align.CENTER, tooltip_text="Use exactly what the collage needs")
+            fit.connect("clicked", lambda *_: self._fit_window())
+            win.add_suffix(fit)
+            grp.add(win)
+        self.ov_regroup()
+        page.add(self.overlay_group)
 
         live = Adw.PreferencesGroup(title="Live image")
         cover = Adw.ActionRow(title="Cover", subtitle="Moment used as the still")
@@ -254,6 +269,10 @@ class CollagePage(Adw.NavigationPage):
         live.add(cover)
         live.add(self._combo("Press effect", [(k, v[0]) for k, v in STYLES.items()], self.style,
                              lambda v: setattr(self, "style", v)))
+        try_row = Adw.ActionRow(title="Try it", subtitle="Press and hold to see the collage as it will be saved")
+        self.try_btn = HoldButton(label="Hold", on_press=self._try_press, on_release=self._try_release)
+        try_row.add_suffix(self.try_btn)
+        live.add(try_row)
         live.add(keep)
         page.add(live)
         page.collection_row = keep
@@ -364,11 +383,11 @@ class CollagePage(Adw.NavigationPage):
             self.clip_lbl.set_label(f"Cell {self.sel + 1} is empty")
             return
         D = cell["dur"]
-        need = min(collage.src_length(self.c["duration"], cell["opts"]), D)
+        need = collage.window(cell, self.c["duration"])
         dur, vw, vh = D, *thumbs.probe(cell["src"])[1:]
         self.tl = Timeline(cell["src"], dur, vw / vh if vh else 16 / 9, fixed=True)
-        cell["start"] = min(cell["start"], max(0.0, D - need))
-        self.tl.s, self.tl.e = cell["start"], cell["start"] + need
+        cell["start"] = min(cell["start"], max(0.0, D - min(need, D)))
+        self.tl.s, self.tl.e = cell["start"], min(D, cell["start"] + need)
         self.tl.p = cell["start"]
         if D > 60:
             self.tl.zoom_to_selection()
@@ -379,26 +398,129 @@ class CollagePage(Adw.NavigationPage):
     def _label(self):
         cell = self.c["cells"][self.sel]
         if cell:
-            self.clip_lbl.set_label(f"Cell {self.sel + 1}: {Path(cell['src']).name} · from "
-                                    f"{cell['start']:.2f} s")
+            self.clip_lbl.set_label(f"Cell {self.sel + 1}: {Path(cell['src']).name} · "
+                                    f"{cell['start']:.2f}–{cell['start'] + collage.window(cell, self.c['duration']):.2f} s")
 
     def _tl_changed(self, tl, what):
+        """The yellow window is both movable and stretchable; a shorter window freezes on the last frame."""
         if what not in ("move", "start", "end"):
             return
         cell = self.c["cells"][self.sel]
-        if abs(cell["start"] - tl.s) < 1e-3:
+        need = min(collage.src_length(self.c["duration"], cell["opts"]), cell["dur"])
+        length = round(min(tl.e - tl.s, need), 3)
+        auto = abs(length - need) < 1e-3
+        if abs(cell["start"] - tl.s) < 1e-3 and auto == (cell.get("len") is None):
             return
-        cell["start"] = tl.s
+        cell["start"], cell["len"] = round(tl.s, 3), None if auto else length
+        if tl.e - tl.s > length + 1e-3:  # nothing beyond this is ever used: show the real window
+            tl.set_selection(cell["start"], cell["start"] + length)
         self._label()
-        self.refresh([self.sel], quick=True)
+        self.refresh([self.sel])
+
+    def _fit_window(self):
+        cell = self.c["cells"][self.sel]
+        cell["len"] = None
+        self._rebuild_timeline()
+        self._rebuild_panel()
+        self.refresh([self.sel])
+
+    # --- overlays + try it ----------------------------------------------------------------------
+    def ov_rect(self):
+        _, W, H = collage.ASPECTS[self.c["aspect"]]
+        w, h = self.canvas.get_width(), self.canvas.get_height()
+        s = min(w / W, h / H) if w and h else 0.0
+        return (w - W * s) / 2, (h - H * s) / 2, W * s, H * s
+
+    def ov_duration(self):
+        return self.c["duration"]
+
+    def ov_click(self, x, y):
+        ox, oy, vw, vh = self.ov_rect()
+        if vw <= 0:
+            return
+        i = collage.cell_at(self.c, (x - ox) / vw, (y - oy) / vh)
+        if i is not None:
+            self.select(i, open_empty=True)
+
+    def _try_path(self, c):
+        """Cached low-res render of the whole collage, for the press preview."""
+        import hashlib
+        key = hashlib.sha1(repr([[
+            ([[k, v] for k, v in sorted(x.items()) if k != "dur"] if x else None) for x in c["cells"]],
+            c["layout"], c["aspect"], c["duration"], c["gap"], c["bg"],
+            [overlays.payload(o) for o in c["overlays"]]]).encode()).hexdigest()
+        out = thumbs.CACHE / "collage" / (key + ".mp4")
+        if not out.exists():
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".tmp.mp4")
+            collage.render(c, tmp, height=540, fast=True, overlays=c["overlays"])
+            out.unlink(missing_ok=True)
+            tmp.rename(out)
+        return str(out)
+
+    def _try_press(self):
+        if self.trying or not any(self.c["cells"]):
+            return
+        self.stop()
+        self.trying = True
+        self._try_gen += 1
+        gen = self._try_gen
+        c = {**self.c, "cells": [dict(x) if x else None for x in self.c["cells"]],
+             "overlays": [dict(o) for o in self.overlays]}
+        self.spinner.start()
+        self.ov_layer_on = False
+        self.layer.set_visible(False)
+
+        def work():
+            try:
+                path = self._try_path(c)
+                still = thumbs.grab_frame(path, min(c["cover"], c["duration"] - 0.05))
+            except Exception:
+                path = still = None
+            GLib.idle_add(start, path, still)
+
+        def start(path, still):
+            if gen != self._try_gen:  # released and pressed again meanwhile
+                return
+            self.spinner.stop()
+            if not (path and still):
+                self.trying = False
+                return
+            self.canvas_live = LiveCanvas(Gdk.Texture.new_for_pixbuf(still), path, style=self.style)
+            self.stage.set_child(self.canvas_live)
+            if self.trying:
+                self.canvas_live.press()
+            else:  # released while rendering: show the still a moment, then go back
+                GLib.timeout_add(600, self._try_done)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _try_release(self):
+        self.trying = False
+        cv = getattr(self, "canvas_live", None)
+        if cv:
+            cv.on_idle = self._try_done
+            cv.release()
+        elif self.spinner.get_spinning():
+            self._try_gen += 1
+            self.spinner.stop()
+
+    def _try_done(self):
+        cv = getattr(self, "canvas_live", None)
+        if cv:
+            cv.stop()
+            self.canvas_live = None
+            self.stage.set_child(self.canvas)
+        self.ov_layer_on = True
+        self.layer.set_visible(bool(self.overlays))
+        return False
 
     # --- preview --------------------------------------------------------------------------------
     def refresh(self, cells=None, all_cells=False, quick=False):
         """Show the cover moment of each changed cell (still frames). Playback restarts if it was running."""
-        idx = range(len(self.c["cells"])) if all_cells or cells is None else cells
+        idx = list(range(len(self.c["cells"])) if all_cells or cells is None else cells)
         if self.playing:
-            self.stop()
-            self.toggle_play()
+            if not quick:  # keep playing: re-render only the cells that changed and swap them in
+                self._swap(idx)
             return
         self.gen += 1
         gen = self.gen
@@ -407,7 +529,7 @@ class CollagePage(Adw.NavigationPage):
             if not cell:
                 continue
             o = {**effects.DEFAULT, **cell["opts"]}
-            need = collage.src_length(self.c["duration"], o)
+            need = collage.window(cell, self.c["duration"])
             t = cell["start"] + effects.src_time(min(self.c["cover"], self.c["duration"] - 0.04), need, o)
             t = t % max(cell["dur"], 0.05)  # short clips loop
             pool.submit(self._grab, gen, i, cell["src"], t, effects.frame_chain(o))
@@ -422,6 +544,37 @@ class CollagePage(Adw.NavigationPage):
                 self.paint[i] = Gdk.Texture.new_for_pixbuf(pb)
                 self.canvas.queue_draw()
         GLib.idle_add(done)
+
+    def _swap(self, idx):
+        """Re-render the proxies of `idx` in place, without interrupting playback of the others."""
+        D, cover = self.c["duration"], self.c["cover"]
+        for i in idx:
+            cell = self.c["cells"][i]
+            if not cell:
+                continue
+            o = {**effects.DEFAULT, **cell["opts"]}
+            s = cell["start"]
+            fut = pool.submit(effects.preview, cell["src"], s, s + collage.window(cell, D), o,
+                              thumbs.CACHE / "previews", PROXY_H, True)
+
+            def done(fut, i=i):
+                if not self.playing:
+                    return
+                try:
+                    path = fut.result()
+                except Exception:
+                    return
+                if not path or i >= len(self.streams):
+                    return
+                old = self.streams[i]
+                m = media_file(path, muted=self.c["cells"][i]["volume"] == 0, loop=True)
+                m.set_volume(self.c["cells"][i]["volume"])
+                m.connect("invalidate-contents", self._frame, i)
+                self.streams[i] = m
+                m.play()
+                if old:
+                    old.set_playing(False)
+            fut.add_done_callback(lambda f: GLib.idle_add(done, f))
 
     def toggle_play(self):
         if self.playing:
@@ -439,7 +592,7 @@ class CollagePage(Adw.NavigationPage):
         for i, cell in cells:
             o = {**effects.DEFAULT, **cell["opts"]}
             s = cell["start"]
-            jobs[i] = pool.submit(effects.preview, cell["src"], s, s + collage.src_length(D, o), o,
+            jobs[i] = pool.submit(effects.preview, cell["src"], s, s + collage.window(cell, D), o,
                                   thumbs.CACHE / "previews", PROXY_H, True)
 
         def wait():
@@ -479,6 +632,7 @@ class CollagePage(Adw.NavigationPage):
     def stop(self):
         was = self.playing
         self.playing = False
+        self._try_done()
         self.gen += 1
         self.spinner.stop()
         self.play_btn.set_icon_name("media-playback-start-symbolic")
@@ -504,7 +658,7 @@ class CollagePage(Adw.NavigationPage):
         def work():
             try:
                 jpg, mov = livemake.out_paths()
-                collage.render(c, mov, extra=livemake.live_tags())
+                collage.render(c, mov, extra=livemake.live_tags(), overlays=[dict(o) for o in self.overlays])
                 livemake.still(mov, min(c["cover"], c["duration"] - 0.05), jpg)
                 library.set_meta(jpg, transition=style)
                 if col:

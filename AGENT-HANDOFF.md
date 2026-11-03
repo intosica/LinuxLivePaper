@@ -54,8 +54,10 @@ The user's decisions:
   `library.scan()` skips the top-level `collection/` folder, so collection copies don't show twice in All.
 - ✅ Collage maker (`collage.py` model/render + `collage_page.py` UI, **+ → Live Collage…**): 10 layouts (2/3/4/6/9
   cells, mixed), shapes 9:16/3:4/1:1/16:9, length 1.5–5 s, borders none/thin/thick, black/white. Per cell: clip
-  (video, GIF or live image `.mov`), start (fixed-length window on the cell timeline, `Timeline(fixed=True)`),
-  volume + mute, speed, direction, filter, effect. Cover time + press effect + Save to collection.
+  (video, GIF or live image `.mov`), a source window on the cell timeline (`Timeline(fixed=True)`: drag either end
+  to stretch/shrink — shorter freezes the last frame, *Fit* resets; double-click jumps it), volume + mute, speed,
+  direction, filter, effect. Canvas-level overlays, press effect + *Try it*, Save to collection, and clicking an
+  empty canvas spot selects the cell under it (`ov_click` → `collage.cell_at`).
   intoLive itself has no layout collage (it has PIP video stickers and "2-Split/3-Split"); this is our version.
 - **Collage performance design**: the preview never runs the collage graph. Each cell gets its own cached 360p
   proxy (`effects.preview(..., loop=True)`, parallel pool, ~0.5 s each, only the changed cell re-renders) and
@@ -63,18 +65,37 @@ The user's decisions:
   its first decoded frame (no blank flash). Full 1080×1920 ffmpeg render only on save (~2.5–4.5 s for 4 cells under
   load); cells are scaled down to cell size *before* filters, x264 `-preset faster` (measured: NVENC was no faster —
   decode/filters dominate).
-- ✅ Overlays (`overlays.py` + `OverlayLayer` in `editor.py`): text and image/GIF stickers baked into the live image.
-  `overlays.text(...)`/`overlays.sticker(path)` are plain dicts (x/y/size as canvas fractions, opacity, optional
-  `start`/`end` window); `overlays.graph()` appends `drawtext` / `overlay` to the effects chain, `render()` and
-  `preview()` mirror `effects.render/preview` with `overlays=`, and `livemake.make_live(..., overlay_list=…)` bakes
-  them in (cover still is grabbed from the MOV, so it carries them). **GIF alpha works**: `format=rgba` before
-  scaling is what keeps transparency (a pal8 GIF scaled first loses it); `-stream_loop -1` keeps GIFs animating on
-  long clips. Editor UI: *Overlays* group (Text / Sticker / Selected combo / Size / Opacity / text field / Remove),
-  drag on the preview to move, scroll to resize, click to select. The layer hides while playing or during *Try it*
-  so the baked preview (real drawtext + animated GIF) is what you see.
-  Known gaps: one text style (bold Sans; colour/opacity only), no rotation or keyframes, no per-overlay time window
-  UI, collages have no overlays yet.
-- Self-checks: `/usr/bin/python3 -m linuxlivepaper.{library,thumbs,livemake,playback,effects,collage,overlays}`.
+- ✅ Overlays (`overlays.py` + `overlay_ui.py`): text and image/GIF stickers baked into the live image, in the
+  editor *and* the collage maker. `overlays.text(...)`/`overlays.sticker(path)` are plain dicts (x/y/size as canvas
+  fractions, opacity, rotation in degrees, `start`/`end` window, text `font`/`bold`/`outline`); `overlays.graph()`
+  appends `drawtext` / `overlay` to the effects chain, `render()` and `preview()` mirror `effects.render/preview`
+  with `overlays=`, and `livemake.make_live(..., overlay_list=…)` bakes them in (cover still is grabbed from the MOV,
+  so it carries them). `collage.command(..., overlays=…)` does the same for collages. **GIF alpha works**:
+  `format=rgba` before scaling is what keeps transparency (a pal8 GIF scaled first loses it); `-stream_loop -1`
+  keeps GIFs animating on long clips. Rotation: text is drawn centred on a transparent full-canvas layer that is
+  then `rotate`d (drawtext has no rotation) and overlaid at `W*(x-.5), H*(y-.5)`; stickers are rotated around their
+  own centre with `rotate=...:ow=rotw(iw):oh=roth(ih)`.
+  Shared UI in `overlay_ui.py`: `OverlayHost` mixin (state, `text_layout`, `sticker_texture`, add/remove/select,
+  hooks `ov_rect`/`ov_duration`/`ov_changed`/`ov_click`) + `OverlayGroup` panel rows (Text, Sticker, Selected, Size,
+  Opacity, Rotation, Outline, Text, Font, Bold, Whole clip → Starts at / Ends at, Remove) + `OverlayLayer`
+  (draws rotated overlays and the selection box, drag to move, scroll to resize, press on empty space calls
+  `ov_click`). The layer hides while playing or during *Try it* so the baked preview is what you see.
+  `Gtk.Snapshot.rotate()` takes **degrees**, and `Gtk.Snapshot.append_layout()` needs a scratch cairo context via
+  `create_pango_layout()` — both were silent-wrong-render bugs for a while.
+  Known gaps: no keyframes or per-overlay animations, one weight per text overlay, collages share one overlay list
+  (not per cell).
+- **Live preview**: while the editor or a collage is playing, edits re-render instead of stopping playback —
+  `EditorPage._rebake()` (debounced 400 ms, restarts only the baked preview) and `CollagePage._swap(idx)`
+  (re-renders the changed cell's proxy and swaps its `Gtk.MediaFile`). Timeline drags follow live too.
+- **Timeline**: drag either yellow end to stretch/shrink the selection (a collage cell window shorter than its clip
+  freezes on the last frame, longer is clamped to what the length needs, *Fit* resets), drag inside to move it, and
+  **double-click anywhere** to jump the window to that spot. `Timeline._hit()` must not downgrade start/end to
+  "move" when `fixed=True` — that was why collage windows could only be moved.
+- **Try it** (`HoldButton` in `widgets.py`) previews exactly what will be saved, in the editor and in collages
+  (cached 540p collage render in `~/.cache/linuxlivepaper/collage`). Two real causes of it "only working sometimes":
+  `thumbs.grab_frame` returned None for a seek at/after the last frame (now falls back `t-0.2`, `t-0.6`, 0), and
+  `Gtk.GestureClick` emits `stopped` the instant the press is claimed, which ended every hold immediately — so the
+  button only ends the hold on `released`.
 
 ### Hard-won facts (don't relearn these)
 - GTK's GStreamer `Gtk.MediaFile.seek()` while **paused** reports success but doesn't render the frame (black).
@@ -128,7 +149,8 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - Every non-trivial module gets one runnable self-check (`if __name__ == "__main__":` asserts).
 
 ## Next steps (suggested order)
-1. Overlays in collage cells (reuse `overlays.graph` in `collage.command`), sticker rotation/keyframes, text styles.
+1. Per-cell overlays in collages (one overlay list per `cell`, reuse `overlays.graph`); keyframes/sticker animations
+   (intoLive has `stickerAnimationComeUp*`, `MarqueeLeftRight/UpDown`, `Rotate*`); more text styles.
 2. Crop/rotate/flip and Ken Burns for clips; filter intensity slider + .cube LUT import (`lut3d`).
 3. Gallery polish: date sections, scroll to newest on open, Gio.FileMonitor live reload, multi-select, fullscreen.
 4. Collage: drag to swap cells, per-cell pan/zoom inside its frame, shared clock if cell drift ever shows.
@@ -144,3 +166,4 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - 2026-11-03: Collage maker (per-cell volume/speed/direction/filter/effect), Collections (folder per collection, custom PNG icon), iOS-Photos grid, tabs All/Live/Collections, right-click Delete/Add to Collection, Save to collection in creators.
 - 2026-11-02: Baked-in effects (`effects.py`: looks, effects, speed, reverse/bounce) in an editor side panel; press transition selectable per item (blur/zoom/fade/instant).
 - 2026-11-03: Text overlays and image/GIF stickers (`overlays.py`), placed by dragging on the editor preview; GIF alpha preserved; baked into the saved MOV and cover still.
+- 2026-11-03: Overlay editing round: shared `overlay_ui.py` (rotation, font/bold, outline width, per-overlay time window, sticker+text in collages), live preview while playing, collage windows stretchable + *Fit* + Try it, timeline double-click, `HoldButton` rework, near-end cover-frame fix, quit-while-playing crash fix.

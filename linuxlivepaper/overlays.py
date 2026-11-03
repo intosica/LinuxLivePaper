@@ -9,12 +9,13 @@ from pathlib import Path
 
 def text(value="Your text", **kw):
     return {"kind": "text", "text": value, "x": 0.5, "y": 0.86, "size": 0.09, "color": "#ffffff",
-            "outline": True, "opacity": 1.0, "start": None, "end": None, **kw}
+            "font": "Sans", "bold": True, "outline": 0.0035, "rotation": 0, "opacity": 1.0,
+            "start": None, "end": None, **kw}
 
 
 def sticker(path, **kw):
-    return {"kind": "sticker", "path": str(path), "x": 0.5, "y": 0.5, "size": 0.35, "opacity": 1.0,
-            "start": None, "end": None, **kw}
+    return {"kind": "sticker", "path": str(path), "x": 0.5, "y": 0.5, "size": 0.35, "rotation": 0,
+            "opacity": 1.0, "start": None, "end": None, **kw}
 
 
 def payload(o):
@@ -36,6 +37,21 @@ def _window(o, dur):
     return s, e
 
 
+def _font(o):
+    family = str(o.get("font") or "Sans")
+    return _esc(family + (":bold" if o.get("bold", True) else ""))
+
+
+def _border(o, H):
+    """Outline width in px: fraction of height (0.0035 ≈ 4 px at 1080), or a plain bool for old payloads."""
+    v = o.get("outline", 0.0035)
+    if v is True:
+        v = 0.0035
+    elif v is False or v is None:
+        v = 0.0
+    return max(0, int(round(H * float(v))))
+
+
 def graph(overlays, W, H, dur, first_input=0):
     """Build (extra ffmpeg inputs, filter tail). The tail expects the label [vout] and yields [ovout]."""
     inputs, steps, label = [], [], "vout"
@@ -46,16 +62,27 @@ def graph(overlays, W, H, dur, first_input=0):
             continue
         out = f"ov{n}"
         alpha = f"{max(0.0, min(1.0, o.get('opacity', 1.0))):.2f}"
+        rot = float(o.get("rotation") or 0.0)
+        turn = f",rotate={rot * 3.141592653589793 / 180:.5f}"
         if o["kind"] == "text":
             fd, tmp = tempfile.mkstemp(prefix="llp-text-", suffix=".txt")
             with open(fd, "w") as fh:
                 fh.write(o.get("text") or "")
-            steps.append(
-                f"[{label}]drawtext=textfile='{_esc(tmp, True)}':fontcolor={o.get('color', '#ffffff')}@{alpha}"
-                f":fontsize={max(8, int(H * o.get('size', 0.09)))}"
-                f":borderw={3 if o.get('outline', True) else 0}:bordercolor=black@0.55"
-                f":x=(w*{o.get('x', 0.5):.4f})-text_w/2:y=(h*{o.get('y', 0.5):.4f})-text_h/2"
-                f":enable='between(t,{s:.3f},{e:.3f})'[{out}]")
+            dt = (f"drawtext=textfile='{_esc(tmp, True)}':fontcolor={o.get('color', '#ffffff')}@{alpha}"
+                  f":fontsize={max(8, int(H * o.get('size', 0.09)))}:font={_font(o)}"
+                  f":borderw={_border(o, H)}:bordercolor={o.get('outline_color', 'black@0.55')}")
+            if abs(rot) < 0.5:
+                steps.append(f"[{label}]{dt}:x=(w*{o.get('x', 0.5):.4f})-text_w/2"
+                             f":y=(h*{o.get('y', 0.5):.4f})-text_h/2"
+                             f":enable='between(t,{s:.3f},{e:.3f})'[{out}]")
+            else:
+                # text can't rotate on its own: draw it centred on a transparent canvas, then turn the canvas
+                # about its centre and place that centre where the overlay belongs
+                px, py = W * (o.get("x", 0.5) - 0.5), H * (o.get("y", 0.5) - 0.5)
+                steps.append(f"color=c=black@0.0:s={W}x{H}:r=30:d={dur:.3f},format=rgba,"
+                             f"{dt}:x=(w-text_w)/2:y=(h-text_h)/2{turn}:ow=iw:oh=ih:c=none[tc{n}];"
+                             f"[{label}][tc{n}]overlay=x={px:.2f}:y={py:.2f}"
+                             f":enable='between(t,{s:.3f},{e:.3f})':eof_action=pass:shortest=0[{out}]")
         else:
             idx = n_input
             n_input += 1
@@ -64,7 +91,8 @@ def graph(overlays, W, H, dur, first_input=0):
             px = max(8, int(W * o.get("size", 0.35)))
             steps.append(
                 f"[{idx}:v]format=rgba,scale={px}:-1:flags=lanczos,colorchannelmixer=aa={alpha},"
-                f"trim=duration={dur:.3f},setpts=PTS-STARTPTS[st{n}];"
+                f"trim=duration={dur:.3f},setpts=PTS-STARTPTS"
+                + (f"{turn}:ow=rotw(iw):oh=roth(ih):c=none" if abs(rot) >= 0.5 else "") + f"[st{n}];"
                 f"[{label}][st{n}]overlay=x=(W*{o.get('x', 0.5):.4f})-w/2:y=(H*{o.get('y', 0.5):.4f})-h/2"
                 f":enable='between(t,{s:.3f},{e:.3f})':eof_action=pass:shortest=0[{out}]")
         label = out
@@ -142,4 +170,15 @@ if __name__ == "__main__":
         assert max(at(160, 20)) < 40, at(160, 20)                             # above it: untouched black
         # the text window really is limited
         assert effects.out_size(320, 240, 120) == (160, 120)
+        # rotation goes through the transparent-canvas path (text) and rotw/roth (sticker)
+        ovs = [text("Turned", rotation=25, font="DejaVu Serif", bold=False, outline=0.0,
+                    start=0.4, end=1.4), sticker(gif, size=0.3, rotation=-30, opacity=0.6,
+                                      start=0.5, end=1.4)]
+        out = render(src, 0, 1.5, d / "r.mp4", overlays=ovs, fast=True)
+        frame = subprocess.run(["ffmpeg", "-v", "error", "-ss", "0.1", "-i", str(out), "-frames:v", "1",
+                                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
+        assert max(frame) < 40, max(frame)                     # before both windows: nothing drawn
+        frame = subprocess.run(["ffmpeg", "-v", "error", "-ss", "0.9", "-i", str(out), "-frames:v", "1",
+                                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
+        assert max(frame) > 150, max(frame)                    # text and sticker are both visible mid-window
     print("overlays ok")

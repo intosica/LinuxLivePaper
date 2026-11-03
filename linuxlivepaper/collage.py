@@ -3,6 +3,7 @@ direction, filter and effect. Rendered as ONE ffmpeg filter_complex (scale/crop 
 import subprocess
 
 from . import effects
+from . import overlays as ovmod
 
 # id → (label, cells as (x, y, w, h) fractions of the canvas)
 LAYOUTS = {
@@ -32,7 +33,7 @@ def new(layout="2h", aspect="9:16"):
 
 
 def new_cell(src):
-    return {"src": str(src), "start": 0.0, "volume": 1.0, "opts": dict(effects.DEFAULT)}
+    return {"src": str(src), "start": 0.0, "len": None, "volume": 1.0, "opts": dict(effects.DEFAULT)}
 
 
 def set_layout(c, layout):
@@ -44,6 +45,14 @@ def set_layout(c, layout):
 def src_length(duration, opts):
     """Source seconds a cell needs so its rendered clip lasts `duration`."""
     return duration * opts["speed"] / (2 if opts["direction"] == "bounce" else 1)
+
+
+def window(cell, duration):
+    """Source seconds taken from the clip: the trim length the user set (or dragged on the timeline), else
+    exactly what the collage duration needs. Shorter than that freezes on the last frame, which is the point."""
+    need = src_length(duration, {**effects.DEFAULT, **cell["opts"]})
+    length = cell.get("len")
+    return need if not length else max(0.2, min(float(length), need))
 
 
 def size(c, height=None):
@@ -70,11 +79,11 @@ def cell_at(c, fx, fy):
     return None
 
 
-def command(c, out, height=None, fast=False, extra=()):
-    """ffmpeg argv rendering the collage to `out`."""
+def command(c, out, height=None, fast=False, extra=(), overlays=()):
+    """ffmpeg argv rendering the collage to `out`; `overlays` are text/stickers drawn over the whole collage."""
     W, H = size(c, height)
     D = c["duration"]
-    inputs, chains, overlays, audio = [], [], [], []
+    inputs, chains, lays, audio = [], [], [], []
     prev = "bg"
     chains.append(f"color=c={c['bg']}:s={W}x{H}:r={FPS}:d={D:.3f}[bg]")
     cells = [(i, cell) for i, cell in enumerate(c["cells"]) if cell]
@@ -82,7 +91,7 @@ def command(c, out, height=None, fast=False, extra=()):
         x, y, w, h = rects(c, W, H)[i]
         o = {**effects.DEFAULT, **cell["opts"]}
         # loop short sources (GIFs) so every cell fills the whole duration
-        inputs += ["-stream_loop", "-1", "-ss", f"{cell['start']:.3f}", "-t", f"{src_length(D, o):.3f}",
+        inputs += ["-stream_loop", "-1", "-ss", f"{cell['start']:.3f}", "-t", f"{window(cell, D):.3f}",
                    "-i", cell["src"]]
         # scale down to the cell first: every later filter (and reverse's frame buffer) works on cell-size frames
         v = [f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=bicubic", f"crop={w}:{h}", "setsar=1"]
@@ -94,7 +103,7 @@ def command(c, out, height=None, fast=False, extra=()):
         v += [f"fps={FPS}", f"tpad=stop_mode=clone:stop_duration={D:.3f}"]
         chains.append(f"[{n}:v]{','.join(v)}[c{n}]")
         nxt = f"o{n}"
-        overlays.append(f"[{prev}][c{n}]overlay={x}:{y}:eof_action=pass[{nxt}]")
+        lays.append(f"[{prev}][c{n}]overlay={x}:{y}:eof_action=pass[{nxt}]")
         prev = nxt
         if cell["volume"] > 0 and effects.has_audio(cell["src"]):
             a = ["asetpts=PTS-STARTPTS"] + ([f"atempo={o['speed']}"] if o["speed"] != 1 else [])
@@ -105,21 +114,27 @@ def command(c, out, height=None, fast=False, extra=()):
             a += [f"volume={cell['volume']:.2f}", "aresample=48000", f"apad=whole_dur={D:.3f}"]
             chains.append(f"[{n}:a:0]{','.join(a)}[a{n}]")
             audio.append(f"[a{n}]")
-    graph = chains + overlays + [f"[{prev}]trim=duration={D:.3f},format=yuv420p[vout]"]
+    graph = chains + lays + [f"[{prev}]trim=duration={D:.3f},format=yuv420p[vout]"]
+    vmap = ["-map", "[vout]"]
+    if overlays:
+        ov_in, steps, label = ovmod.graph(overlays, W, H, D, first_input=len(cells))
+        inputs += ov_in
+        graph += steps + [f"[{label}]format=yuv420p[fin]"]
+        vmap = ["-map", "[fin]"]
     amap = []
     if audio:
         graph.append(f"{''.join(audio)}amix=inputs={len(audio)}:normalize=0:duration=longest,"
                      f"atrim=duration={D:.3f}[aout]")
         amap = ["-map", "[aout]", "-c:a", "aac"]
-    return ["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", ";".join(graph), "-map", "[vout]", *amap,
+    return ["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", ";".join(graph), *vmap, *amap,
             "-c:v", "libx264", *(["-preset", "ultrafast", "-crf", "23"] if fast else ["-preset", "faster", "-crf", "18"]),
             "-r", str(FPS), *extra, str(out)]
 
 
-def render(c, out, height=None, fast=False, extra=()):
+def render(c, out, height=None, fast=False, extra=(), overlays=()):
     if not any(c["cells"]):
         raise ValueError("Add at least one video to the collage")
-    subprocess.run(command(c, out, height, fast, extra), check=True, capture_output=True)
+    subprocess.run(command(c, out, height, fast, extra, overlays), check=True, capture_output=True)
     return out
 
 
@@ -138,6 +153,9 @@ if __name__ == "__main__":
         r = rects(c, 1080, 1080)
         assert r[0][0] == 8 and r[1][0] + r[1][2] == 1072 and r[1][1] + r[1][3] + 8 + r[2][3] == 1072, r
         c["cells"] = [new_cell(a), new_cell(b), None]
+        assert window(new_cell(a), 3.0) == 3.0                     # default: exactly the duration
+        assert window({**new_cell(a), "len": 1.0}, 3.0) == 1.0     # a drag shorter than needed sticks
+        assert window({**new_cell(a), "len": 9.0}, 3.0) == 3.0     # longer than needed is capped
         c["cells"][0].update(volume=0.5, opts={**effects.DEFAULT, "speed": 2.0, "look": "mono"})
         c["cells"][1]["opts"]["direction"] = "bounce"  # a 1 s GIF in a 3 s collage: loops, then bounces
         out = render(c, Path(d, "c.mp4"), height=360, fast=True)
@@ -152,4 +170,9 @@ if __name__ == "__main__":
         j = json.loads(subprocess.run([*probe, str(render(c, Path(d, "m.mp4"), height=240, fast=True))],
                                       capture_output=True, text=True).stdout)
         assert [s["codec_type"] for s in j["streams"]] == ["video"], j
+        # overlays over the whole collage
+        ovs = [ovmod.text("Collage", size=0.12), ovmod.text("Turned", rotation=20, y=0.3)]
+        j = json.loads(subprocess.run([*probe, str(render(c, Path(d, "o.mp4"), height=240, fast=True, overlays=ovs))],
+                                      capture_output=True, text=True).stdout)
+        assert [(s["width"], s["height"]) for s in j["streams"] if s["codec_type"] == "video"] == [(240, 240)], j
     print("collage ok")
