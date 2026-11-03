@@ -1,8 +1,14 @@
 """Multi-video collage: several clips playing at once in a layout, each with its own start, volume, speed,
-direction, filter and effect. Rendered as ONE ffmpeg filter_complex (scale/crop each cell, overlay, amix)."""
+direction, filter and effect. One pass lasts as long as the longest cell; shorter cells loop to fill it. Rendered in two stages: each cell
+once at its final size (parallel, cacheable), then one compose pass that loops them, overlays and mixes audio."""
+import hashlib
+import os
 import subprocess
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
-from . import effects
+from . import effects, thumbs
 from . import overlays as ovmod
 
 # id → (label, cells as (x, y, w, h) fractions of the canvas)
@@ -23,17 +29,42 @@ ASPECTS = {"9:16": ("Portrait 9:16", 1080, 1920), "3:4": ("Portrait 3:4", 1080, 
            "1:1": ("Square", 1080, 1080), "16:9": ("Landscape 16:9", 1920, 1080)}
 GAPS = {0: "None", 8: "Thin", 24: "Thick"}  # px at full size
 BACKGROUNDS = {"black": "Black", "white": "White"}
-DURATIONS = (1.5, 2.0, 3.0, 5.0)
+REPEATS = range(1, 11)  # how many times the whole collage plays back to back in the saved file
+MAX_WINDOW = 30.0  # untrimmed clips use at most this much (drag the window on the timeline for more)
 FPS = 30
 
 
 def new(layout="2h", aspect="9:16"):
-    return {"layout": layout, "aspect": aspect, "duration": 3.0, "gap": 8, "bg": "black", "cover": 0.0,
+    return {"layout": layout, "aspect": aspect, "repeat": 1, "gap": 8, "bg": "black", "cover": 0.0,
             "cells": [None] * len(LAYOUTS[layout][1])}
 
 
 def new_cell(src):
-    return {"src": str(src), "start": 0.0, "len": None, "volume": 1.0, "opts": dict(effects.DEFAULT)}
+    dur, w, h = thumbs.probe(str(src))
+    return {"src": str(src), "start": 0.0, "len": None, "volume": 1.0, "opts": dict(effects.DEFAULT),
+            "zoom": 1.0, "pan": [0.5, 0.5], "dur": dur or 1.0, "ar": w / h if w and h else 16 / 9}
+
+
+def clamp_pan(cell):
+    """Pan as 0..1 of the slack inside the zoomed cell: 0 is flush left/top, 1 flush right/bottom."""
+    pan = cell.get("pan") or (0.5, 0.5)
+    return (min(1.0, max(0.0, float(pan[0]))), min(1.0, max(0.0, float(pan[1]))))
+
+
+def fit_size(cell, w, h, ar=None):
+    """(zoomed width, zoomed height) of a cell's source after the cover scale — both at least w×h."""
+    z = max(1.0, float(cell.get("zoom") or 1.0))
+    ar = ar or cell.get("ar") or 16 / 9
+    tw, th = max(2, round(w * z) // 2 * 2), max(2, round(h * z) // 2 * 2)
+    return max(tw, round(th * ar) // 2 * 2), max(th, round(tw / ar) // 2 * 2)
+
+
+def cell_fit(cell, w, h, ar=None):
+    """Filters filling a w×h cell with no black bars, honouring the cell's zoom and pan (crop stays inside)."""
+    zw, zh = fit_size(cell, w, h, ar)
+    px, py = clamp_pan(cell)
+    return [f"scale={zw}:{zh}:force_original_aspect_ratio=increase:flags=bicubic",
+            f"crop={w}:{h}:(iw-ow)*{px:.4f}:(ih-oh)*{py:.4f}", "setsar=1"]
 
 
 def set_layout(c, layout):
@@ -42,17 +73,28 @@ def set_layout(c, layout):
     c["layout"], c["cells"] = layout, (c["cells"] + [None] * n)[:n]
 
 
-def src_length(duration, opts):
-    """Source seconds a cell needs so its rendered clip lasts `duration`."""
-    return duration * opts["speed"] / (2 if opts["direction"] == "bounce" else 1)
+def window(cell):
+    """Source seconds the cell plays: the trim the user dragged on the timeline, else the rest of the clip."""
+    if cell.get("len"):
+        return max(0.2, float(cell["len"]))
+    return max(0.2, min(float(cell.get("dur") or 1.0) - cell["start"], MAX_WINDOW))
 
 
-def window(cell, duration):
-    """Source seconds taken from the clip: the trim length the user set (or dragged on the timeline), else
-    exactly what the collage duration needs. Shorter than that freezes on the last frame, which is the point."""
-    need = src_length(duration, {**effects.DEFAULT, **cell["opts"]})
-    length = cell.get("len")
-    return need if not length else max(0.2, min(float(length), need))
+def cell_length(cell):
+    """Rendered seconds of one pass of the cell (after speed and bounce)."""
+    return effects.out_length(window(cell), {**effects.DEFAULT, **cell["opts"]})
+
+
+def duration(c):
+    """One pass of the collage = its longest cell; shorter cells loop to fill it."""
+    return max((cell_length(x) for x in c["cells"] if x), default=1.0)
+
+
+def cell_time(cell, t):
+    """Source time the cell shows at collage time t (short cells loop)."""
+    o = {**effects.DEFAULT, **cell["opts"]}
+    t = cell["start"] + effects.src_time(t % max(cell_length(cell), 0.01), window(cell), o)
+    return t % max(float(cell.get("dur") or 1.0), 0.05)  # a window running past the end wraps around
 
 
 def size(c, height=None):
@@ -79,42 +121,60 @@ def cell_at(c, fx, fy):
     return None
 
 
-def command(c, out, height=None, fast=False, extra=(), overlays=()):
-    """ffmpeg argv rendering the collage to `out`; `overlays` are text/stickers drawn over the whole collage."""
-    W, H = size(c, height)
-    D = c["duration"]
-    inputs, chains, lays, audio = [], [], [], []
-    prev = "bg"
-    chains.append(f"color=c={c['bg']}:s={W}x{H}:r={FPS}:d={D:.3f}[bg]")
-    cells = [(i, cell) for i, cell in enumerate(c["cells"]) if cell]
-    for n, (i, cell) in enumerate(cells):
-        x, y, w, h = rects(c, W, H)[i]
-        o = {**effects.DEFAULT, **cell["opts"]}
-        # loop short sources (GIFs) so every cell fills the whole duration
-        inputs += ["-stream_loop", "-1", "-ss", f"{cell['start']:.3f}", "-t", f"{window(cell, D):.3f}",
-                   "-i", cell["src"]]
-        # scale down to the cell first: every later filter (and reverse's frame buffer) works on cell-size frames
-        v = [f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=bicubic", f"crop={w}:{h}", "setsar=1"]
-        v += [f for f in (effects.frame_chain(o), f"setpts=(PTS-STARTPTS)/{o['speed']}") if f]
+def _cell_command(cell, w, h, out, fast):
+    """One pass of a cell at its final size: trim → frame → effects → speed/direction, video + PCM audio."""
+    o = {**effects.DEFAULT, **cell["opts"]}
+    L = cell_length(cell)
+    v = [thumbs.SQUARE] + cell_fit(cell, w, h)  # cell-size frames first: later filters and reverse stay cheap
+    v += [f for f in (effects.frame_chain(o), f"setpts=(PTS-STARTPTS)/{o['speed']}") if f]
+    if o["direction"] == "reverse":
+        v.append("reverse")
+    elif o["direction"] == "bounce":
+        v.append("split[f][b];[b]reverse[r];[f][r]concat=n=2:v=1:a=0")
+    v += [f"fps={FPS}", "tpad=stop_mode=clone:stop_duration=1", f"trim=duration={L:.3f}", "setpts=PTS-STARTPTS",
+          "format=yuv420p"]
+    graph, amap = [f"[0:v]{','.join(v)}[v]"], []
+    if cell["volume"] > 0 and effects.has_audio(cell["src"]):
+        a = ["asetpts=PTS-STARTPTS"] + ([f"atempo={o['speed']}"] if o["speed"] != 1 else [])
         if o["direction"] == "reverse":
-            v.append("reverse")
+            a.append("areverse")
         elif o["direction"] == "bounce":
-            v.append(f"split[c{n}f][c{n}b];[c{n}b]reverse[c{n}r];[c{n}f][c{n}r]concat=n=2:v=1:a=0")
-        v += [f"fps={FPS}", f"tpad=stop_mode=clone:stop_duration={D:.3f}"]
-        chains.append(f"[{n}:v]{','.join(v)}[c{n}]")
-        nxt = f"o{n}"
-        lays.append(f"[{prev}][c{n}]overlay={x}:{y}:eof_action=pass[{nxt}]")
-        prev = nxt
-        if cell["volume"] > 0 and effects.has_audio(cell["src"]):
-            a = ["asetpts=PTS-STARTPTS"] + ([f"atempo={o['speed']}"] if o["speed"] != 1 else [])
-            if o["direction"] == "reverse":
-                a.append("areverse")
-            elif o["direction"] == "bounce":
-                a.append(f"asplit[a{n}f][a{n}b];[a{n}b]areverse[a{n}r];[a{n}f][a{n}r]concat=n=2:v=0:a=1")
-            a += [f"volume={cell['volume']:.2f}", "aresample=48000", f"apad=whole_dur={D:.3f}"]
-            chains.append(f"[{n}:a:0]{','.join(a)}[a{n}]")
-            audio.append(f"[a{n}]")
-    graph = chains + lays + [f"[{prev}]trim=duration={D:.3f},format=yuv420p[vout]"]
+            a.append("asplit[af][ab];[ab]areverse[ar];[af][ar]concat=n=2:v=0:a=1")
+        a += [f"volume={cell['volume']:.2f}", "aresample=48000", "aformat=channel_layouts=stereo", "apad",
+              f"atrim=duration={L:.3f}"]
+        graph.append(f"[0:a:0]{','.join(a)}[a]")
+        amap = ["-map", "[a]", "-c:a", "pcm_s16le"]
+    # loop short sources (GIFs, a window past the end) so the window is always full
+    return ["ffmpeg", "-v", "error", "-y", "-stream_loop", "-1", "-ss", f"{cell['start']:.3f}",
+            "-t", f"{window(cell):.3f}", "-i", cell["src"], "-filter_complex", ";".join(graph), "-map", "[v]", *amap,
+            *thumbs.h264(True, (w, h), 20 if fast else 12), "-r", str(FPS), str(out)]
+
+
+def _cell_file(cell, w, h, fast, d):
+    """Render (or reuse from cache dir d) one cell pass; returns (path, has_audio)."""
+    key = hashlib.sha1(repr(([[k, v] for k, v in sorted(cell.items()) if k not in ("dur", "ar")],
+                             os.stat(cell["src"]).st_mtime_ns, w, h, fast)).encode()).hexdigest()
+    out = Path(d, key + ".mkv")
+    if not out.exists():
+        tmp = out.with_suffix(".tmp.mkv")
+        thumbs.run(_cell_command(cell, w, h, tmp, fast))
+        os.replace(tmp, out)
+    return str(out), effects.has_audio(out)
+
+
+def command(c, cells, out, height=None, fast=False, extra=(), overlays=()):
+    """ffmpeg argv composing pre-rendered cell passes [(index, path, has_audio)] into one pass of the collage."""
+    W, H = size(c, height)
+    D = duration(c)
+    inputs, chains, audio, prev = [], [f"color=c={c['bg']}:s={W}x{H}:r={FPS}:d={D:.3f}[bg]"], [], "bg"
+    for n, (i, path, has_a) in enumerate(cells):
+        x, y, _, _ = rects(c, W, H)[i]
+        inputs += ["-stream_loop", "-1", "-i", path]  # shorter cells loop until the longest one ends
+        chains.append(f"[{prev}][{n}:v]overlay={x}:{y}:eof_action=pass[o{n}]")
+        prev = f"o{n}"
+        if has_a:
+            audio.append(f"[{n}:a:0]")
+    graph = chains + [f"[{prev}]trim=duration={D:.3f},format=yuv420p[vout]"]
     vmap = ["-map", "[vout]"]
     if overlays:
         ov_in, steps, label = ovmod.graph(overlays, W, H, D, first_input=len(cells))
@@ -127,14 +187,28 @@ def command(c, out, height=None, fast=False, extra=(), overlays=()):
                      f"atrim=duration={D:.3f}[aout]")
         amap = ["-map", "[aout]", "-c:a", "aac"]
     return ["ffmpeg", "-v", "error", "-y", *inputs, "-filter_complex", ";".join(graph), *vmap, *amap,
-            "-c:v", "libx264", *(["-preset", "ultrafast", "-crf", "23"] if fast else ["-preset", "faster", "-crf", "18"]),
-            "-r", str(FPS), *extra, str(out)]
+            *thumbs.h264(fast, (W, H)),
+            "-r", str(FPS), "-t", f"{D:.3f}", *extra, str(out)]
 
 
-def render(c, out, height=None, fast=False, extra=(), overlays=()):
+def render(c, out, height=None, fast=False, extra=(), overlays=(), cache=None, repeat=None):
+    """Render the collage to `out`: one pass of the longest cell, played `repeat` (default c["repeat"]) times.
+    cache: directory to keep cell passes in, so editing one cell only re-renders that cell."""
     if not any(c["cells"]):
         raise ValueError("Add at least one video to the collage")
-    subprocess.run(command(c, out, height, fast, extra, overlays), check=True, capture_output=True)
+    repeat = max(1, int(repeat or c.get("repeat") or 1))
+    W, H = size(c, height)
+    with tempfile.TemporaryDirectory() as tmp:
+        d = cache or tmp
+        Path(d).mkdir(parents=True, exist_ok=True)
+        todo = [(i, x, *rects(c, W, H)[i][2:]) for i, x in enumerate(c["cells"]) if x]
+        with ThreadPoolExecutor(max_workers=max(1, min(4, os.cpu_count() or 2))) as ex:
+            files = list(ex.map(lambda t: (t[0], *_cell_file(t[1], t[2], t[3], fast, d)), todo))
+        once = out if repeat == 1 else Path(tmp, "once" + Path(out).suffix)
+        # a hung ffmpeg must never wedge the preview thread pool
+        thumbs.run(command(c, files, once, height, fast, extra if repeat == 1 else (), overlays))
+        if repeat > 1:
+            thumbs.repeat(once, out, repeat, extra)
     return out
 
 
@@ -153,16 +227,26 @@ if __name__ == "__main__":
         r = rects(c, 1080, 1080)
         assert r[0][0] == 8 and r[1][0] + r[1][2] == 1072 and r[1][1] + r[1][3] + 8 + r[2][3] == 1072, r
         c["cells"] = [new_cell(a), new_cell(b), None]
-        assert window(new_cell(a), 3.0) == 3.0                     # default: exactly the duration
-        assert window({**new_cell(a), "len": 1.0}, 3.0) == 1.0     # a drag shorter than needed sticks
-        assert window({**new_cell(a), "len": 9.0}, 3.0) == 3.0     # longer than needed is capped
-        c["cells"][0].update(volume=0.5, opts={**effects.DEFAULT, "speed": 2.0, "look": "mono"})
-        c["cells"][1]["opts"]["direction"] = "bounce"  # a 1 s GIF in a 3 s collage: loops, then bounces
-        out = render(c, Path(d, "c.mp4"), height=360, fast=True)
+        assert abs(window(new_cell(a)) - 4.0) < 0.1                # default: the whole clip
+        assert window({**new_cell(a), "len": 1.0}) == 1.0           # a dragged trim sticks
+        assert window({**new_cell(a), "start": 3.0}) < 1.1          # the rest of the clip after the start
+        c["cells"][0].update(volume=0.5, opts={**effects.DEFAULT, "look": "mono"})
+        c["cells"][1]["opts"]["direction"] = "bounce"  # a 1 s GIF bouncing (2 s) loops twice in the 4 s collage
+        assert abs(duration(c) - 4.0) < 0.1 and abs(cell_length(c["cells"][1]) - 2.0) < 0.1
+        assert abs(cell_time(c["cells"][1], 2.5) - 0.5) < 0.05     # second loop of the short cell
+        out = render(c, Path(d, "c.mp4"), height=360, fast=True, cache=Path(d, "cells"))
         j = json.loads(subprocess.run([*probe, str(out)], capture_output=True, text=True).stdout)
         assert [(s["width"], s["height"]) for s in j["streams"] if s["codec_type"] == "video"] == [(360, 360)], j
-        assert abs(float(j["format"]["duration"]) - 3.0) < 0.1, j["format"]
+        assert abs(float(j["format"]["duration"]) - 4.0) < 0.15, j["format"]
         assert any(s["codec_type"] == "audio" for s in j["streams"])
+        assert len(list(Path(d, "cells").glob("*.mkv"))) == 2
+        c["cells"][0]["opts"]["speed"] = 2.0  # now both last 2 s; played 3 times back to back
+        c["repeat"] = 3
+        j = json.loads(subprocess.run([*probe, str(render(c, Path(d, "r.mp4"), height=360, fast=True,
+                                                          cache=Path(d, "cells")))], capture_output=True, text=True).stdout)
+        assert abs(float(j["format"]["duration"]) - 6.0) < 0.3, j["format"]
+        assert len(list(Path(d, "cells").glob("*.mkv"))) == 3  # the unchanged GIF cell came from the cache
+        c["repeat"] = 1
         set_layout(c, "2h")
         assert len(c["cells"]) == 2 and c["cells"][1]["src"] == str(b)
         c["cells"][0]["volume"] = 0  # muted cells add no audio track
@@ -173,6 +257,16 @@ if __name__ == "__main__":
         # overlays over the whole collage
         ovs = [ovmod.text("Collage", size=0.12), ovmod.text("Turned", rotation=20, y=0.3)]
         j = json.loads(subprocess.run([*probe, str(render(c, Path(d, "o.mp4"), height=240, fast=True, overlays=ovs))],
+                                      capture_output=True, text=True).stdout)
+        assert [(s["width"], s["height"]) for s in j["streams"] if s["codec_type"] == "video"] == [(240, 240)], j
+        # zoom/pan: the crop always fills the cell, whatever the pan is
+        zw, zh = fit_size({"zoom": 2.0}, 360, 640, 16 / 9)
+        assert zw >= 720 and zh >= 640, (zw, zh)
+        assert clamp_pan({"pan": (-3, 9)}) == (0.0, 1.0)
+        assert clamp_pan({}) == (0.5, 0.5)
+        z = {"cells": [dict(c["cells"][0], zoom=2.5, pan=[1.0, 0.0]), None]}
+        z.update({k: v for k, v in c.items() if k != "cells"})
+        j = json.loads(subprocess.run([*probe, str(render(z, Path(d, "z.mp4"), height=240, fast=True))],
                                       capture_output=True, text=True).stdout)
         assert [(s["width"], s["height"]) for s in j["streams"] if s["codec_type"] == "video"] == [(240, 240)], j
     print("collage ok")

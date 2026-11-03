@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".avif"}
-VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
+VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".vob", ".mpg", ".mpeg", ".ts", ".m2ts", ".mts"}  # DVD/MPEG-PS/TS too
 GIF_EXT = {".gif"}
 DEFAULT_LIBRARY = Path.home() / "Videos" / "LinuxLivePaper"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "linuxlivepaper" / "config.json"
@@ -106,6 +106,17 @@ def scan(root=None):
         items += scan_dir(dirpath)
     items.sort(key=lambda i: i.mtime)
     return items
+
+
+def motion_for(path):
+    """The clip to use for a dropped/picked file: videos and GIFs as they are, a live still → its video."""
+    p = Path(path)
+    ext = p.suffix.lower()
+    if ext in VIDEO_EXT or ext in GIF_EXT:
+        return str(p)
+    if ext in IMAGE_EXT:
+        return next((i.motion for i in scan_dir(p.parent) if i.kind == "live" and Path(i.path) == p), None)
+    return None
 
 
 def item_files(item):
@@ -250,6 +261,8 @@ if __name__ == "__main__":
         set_meta(Path(d, "IMG_1.MOV"), x=1)
         assert get_meta(live.motion) == {"transition": "zoom", "x": 1} and get_meta(Path(d, "b.mp4")) == {}
         assert len(scan(d)) == 4  # sidecar is hidden
+        assert motion_for(live.path) == live.motion and motion_for(Path(d, "a.png")) is None
+        assert motion_for(Path(d, "c.gif")).endswith("c.gif") and motion_for(Path(d, "notes.txt")) is None
         assert [i.mtime for i in scan(d)] == sorted(i.mtime for i in scan(d))  # oldest first
     with tempfile.TemporaryDirectory() as d:  # collections
         library_dir = lambda: Path(d)  # noqa: E731

@@ -1,0 +1,80 @@
+# Flatpak manifest for LinuxLivePaper. Build with ../build-flatpak.sh
+app-id: io.github.linuxlivepaper
+runtime: org.gnome.Platform
+runtime-version: "50"
+sdk: org.gnome.Sdk
+command: linuxlivepaper
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --socket=pulseaudio
+  - --device=dri
+  # the library is one user-chosen folder anywhere (default ~/Videos/LinuxLivePaper), sources can be on external drives
+  - --filesystem=home
+  - --filesystem=/media
+  - --filesystem=/run/media
+  - --filesystem=/mnt
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /share/ffmpeg/examples
+  - "*.a"
+modules:
+  # the app drives the ffmpeg/ffprobe CLI with libx264, which the GNOME runtime doesn't ship.
+  # 6.1.x on purpose: same series as the dev machine (Ubuntu 24.04); 7.x parses the drawtext `font=Sans\:bold`
+  # escaping differently and breaks text overlays. Both are built static so the runtime's own libav* (used by GStreamer) stay untouched.
+  - name: x264
+    config-opts: [--enable-static, --enable-pic, --disable-cli]
+    sources:
+      - type: git
+        url: https://code.videolan.org/videolan/x264.git
+        commit: b35605ace3ddf7c1a5d67a2eb553f034aef41d55
+  # NVENC headers pinned to the API the current NVIDIA drivers expose (12.2). The SDK ships 13.1 headers, which
+  # makes ffmpeg refuse to encode on any driver below 13.1 ("Required: 13.1 Found: 13.0") — i.e. hardware encoding
+  # silently fell back to libx264 on the CPU, which is what made the fan spin up. 12.2 works with ffmpeg 6.1 and
+  # every driver since 550.
+  - name: nv-codec-headers
+    buildsystem: simple
+    build-commands:
+      - make install PREFIX=/app
+    sources:
+      - type: git
+        url: https://github.com/FFmpeg/nv-codec-headers.git
+        tag: n12.2.72.0
+  - name: ffmpeg
+    config-opts:
+      - --enable-gpl
+      - --enable-libx264
+      - --enable-libfreetype
+      - --enable-libharfbuzz
+      - --enable-libfontconfig
+      - --enable-ffnvcodec
+      - --enable-nvenc
+      - --enable-static
+      - --disable-shared
+      - --disable-ffplay
+      - --disable-doc
+      - --disable-debug
+    sources:
+      - type: archive
+        url: https://ffmpeg.org/releases/ffmpeg-6.1.2.tar.xz
+        sha256: 3b624649725ecdc565c903ca6643d41f33bd49239922e45c9b1442c63dca4e38
+  - name: linuxlivepaper
+    buildsystem: simple
+    build-commands:
+      - mkdir -p /app/share/linuxlivepaper
+      - cp -r linuxlivepaper /app/share/linuxlivepaper/
+      - find /app/share/linuxlivepaper -name __pycache__ -prune -exec rm -rf {} +
+      - printf '#!/bin/sh\nPYTHONPATH=/app/share/linuxlivepaper exec python3 -m linuxlivepaper "$@"\n' > /app/bin/linuxlivepaper
+      - chmod +x /app/bin/linuxlivepaper
+      - install -Dm644 io.github.linuxlivepaper.desktop -t /app/share/applications
+      - install -Dm644 io.github.linuxlivepaper.svg -t /app/share/icons/hicolor/scalable/apps
+    sources:
+      - type: dir
+        path: ../linuxlivepaper
+        dest: linuxlivepaper
+      - type: file
+        path: io.github.linuxlivepaper.desktop
+      - type: file
+        path: io.github.linuxlivepaper.svg

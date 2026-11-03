@@ -103,8 +103,8 @@ def render(src, start, end, out, opts=None, height=None, fast=False, extra=(), l
         (["-t", f"{end - start:.3f}"] if end is not None else [])
     cmd = ["ffmpeg", "-v", "error", "-y", *trim, "-i", str(src), "-filter_complex", graph(opts, audio, out_size(w, h, height)),
            "-map", "[vout]", *(["-map", "[aout]", "-c:a", "aac"] if audio else []),
-           "-c:v", "libx264", *(["-preset", "ultrafast", "-crf", "23"] if fast else ["-preset", "faster", "-crf", "18"]), *extra, str(out)]
-    subprocess.run(cmd, check=True, capture_output=True)
+           *thumbs.h264(fast, out_size(w, h, height)), *extra, str(out)]
+    thumbs.run(cmd)
     return out
 
 

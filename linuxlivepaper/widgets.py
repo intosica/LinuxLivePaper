@@ -4,9 +4,91 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
 
-from . import library  # noqa: E402
+import os  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from . import library, thumbs  # noqa: E402
 
 NEW = "New Collection…"
+
+
+_thumbs = ThreadPoolExecutor(max_workers=2)
+
+
+class FileBrowser(Gtk.Box):
+    """Slide-out folder browser for the collage maker: thumbnails of the videos, GIFs and live images in a folder.
+    Click a tile → on_pick(clip path); drag a tile onto a cell (it carries a Gdk.FileList, like a file manager)."""
+
+    def __init__(self, folder, on_pick):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6, width_request=280, hexpand=False,
+                         css_classes=["file-browser"])
+        self.on_pick, self.folder, self.gen = on_pick, None, 0
+        bar = Gtk.Box(spacing=4, margin_start=6, margin_end=6, margin_top=6)
+        self.up = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Parent folder", css_classes=["flat"])
+        self.up.connect("clicked", lambda *_: self.load(self.folder.parent))
+        self.title = Gtk.Label(hexpand=True, xalign=0, ellipsize=3, css_classes=["heading"])  # 3 = END
+        other = Gtk.Button(icon_name="folder-open-symbolic", tooltip_text="Open another folder…", css_classes=["flat"])
+        other.connect("clicked", self._other)
+        for w in (self.up, self.title, other):
+            bar.append(w)
+        self.flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=2,
+                                min_children_per_line=2, homogeneous=True, column_spacing=6, row_spacing=6,
+                                valign=Gtk.Align.START, margin_start=6, margin_end=6, margin_bottom=6)
+        self.flow.connect("child-activated", lambda _f, ch: ch.activate_fn())
+        self.append(bar)
+        self.append(Gtk.Label(label="Click to fill the selected cell · drag onto any cell", wrap=True,
+                              css_classes=["dim-label", "caption"], margin_start=6, margin_end=6))
+        self.append(Gtk.ScrolledWindow(child=self.flow, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
+        self.load(folder)
+
+    def _other(self, _b):
+        def picked(d, res):
+            try:
+                self.load(d.select_folder_finish(res).get_path())
+            except GLib.Error:
+                pass
+        Gtk.FileDialog(title="Browse folder", initial_folder=Gio.File.new_for_path(str(self.folder))) \
+            .select_folder(self.get_root(), None, picked)
+
+    def load(self, folder):
+        self.folder = Path(folder)
+        self.gen += 1
+        self.title.set_label(self.folder.name or str(self.folder))
+        self.title.set_tooltip_text(str(self.folder))
+        self.up.set_sensitive(self.folder.parent != self.folder)
+        self.flow.remove_all()
+        try:
+            dirs = sorted((e for e in os.scandir(self.folder) if e.is_dir() and not e.name.startswith(".")),
+                          key=lambda e: e.name.lower())
+        except OSError:
+            dirs = []
+        for e in dirs:
+            self._tile(e.name, Gtk.Image(icon_name="folder-symbolic", pixel_size=48), lambda p=e.path: self.load(p))
+        for it in sorted(library.scan_dir(self.folder), key=lambda i: i.name.lower()):
+            pic = Gtk.Picture(content_fit=Gtk.ContentFit.COVER, height_request=110, can_shrink=True)
+            tile = self._tile(it.name, pic, lambda m=it.motion: self.on_pick(m), it.motion)
+            _thumbs.submit(self._thumb, it, pic, tile, self.gen)
+
+    def _tile(self, name, pic, fn, drag_path=None):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, tooltip_text=name)
+        box.append(pic)
+        box.append(Gtk.Label(label=name, ellipsize=2, css_classes=["caption"]))  # 2 = MIDDLE
+        child = Gtk.FlowBoxChild(child=box, css_classes=["card"])
+        child.activate_fn = fn
+        if drag_path:
+            src = Gtk.DragSource(actions=Gdk.DragAction.COPY)
+            src.connect("prepare", lambda *_: Gdk.ContentProvider.new_for_value(
+                Gdk.FileList.new_from_list([Gio.File.new_for_path(drag_path)])))
+            src.connect("drag-begin", lambda s, _d: s.set_icon(Gtk.WidgetPaintable.new(pic), 20, 20))
+            child.add_controller(src)
+        self.flow.append(child)
+        return child
+
+    def _thumb(self, item, pic, tile, gen):
+        path = thumbs.make_thumb(item)
+        if path and gen == self.gen:
+            GLib.idle_add(lambda: gen == self.gen and pic.set_filename(path) and False)
 
 
 class HoldButton(Gtk.Box):
@@ -123,8 +205,11 @@ def collection_dialog(parent, on_done, collection=None):
     png.add_mime_type("image/png")
     pngs = Gio.ListStore(item_type=Gtk.FileFilter)
     pngs.append(png)
-    choose.connect("clicked", lambda *_: Gtk.FileDialog(title="Choose a .png icon", filters=pngs)
-                   .open(dlg, None, picked))
+    icon_dlg = Gtk.FileDialog(title="Choose a .png icon", filters=pngs)
+    # the alert dialog is already the root of its own tree, so dlg.get_root() parents the picker to a modal dialog
+    # and the file chooser stays behind it; the app window is the parent the portal wants.
+    win = parent if isinstance(parent, Gtk.Window) else parent.get_root()
+    choose.connect("clicked", lambda *_: icon_dlg.open(win, None, picked))
     clear.connect("clicked", lambda *_: (state.update(icon=None, changed=True), show_icon()))
 
     dlg = Adw.AlertDialog(heading="Edit Collection" if collection else "New Collection", extra_child=box,

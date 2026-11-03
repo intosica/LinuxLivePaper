@@ -1,6 +1,7 @@
 """Create a live image (still + motion pair) from a video: the format the gallery pairs on.
 Writes Apple-style identifiers too, so iPhone compatibility can be finished later (see docs/ARCHITECTURE.md)."""
 import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -9,14 +10,21 @@ from . import effects, overlays as ov
 from .library import library_dir
 
 
-def make_live(src, start=0.0, end=None, key_time=None, out_dir=None, name=None, opts=None, overlay_list=()):
-    """Render [start, end] of src (video or GIF) through effects `opts` → <name>.mov, and grab the frame at
-    key_time (source seconds after start, mapped through speed/reverse) → <name>.jpg. Defaults to the library folder."""
+def make_live(src, start=0.0, end=None, key_time=None, out_dir=None, name=None, opts=None, overlay_list=(),
+              repeat=1):
+    """Render [start, end] of src (video or GIF) through effects `opts` → <name>.mov (played `repeat` times back
+    to back), and grab the frame at key_time (source seconds after start, mapped through speed/reverse) → <name>.jpg.
+    Defaults to the library folder."""
     jpg, mov = out_paths(out_dir, name)
     opts = {**effects.DEFAULT, **(opts or {})}
     render = ov.render if overlay_list else effects.render
     kw = {"overlays": overlay_list} if overlay_list else {}
-    render(src, start, end, mov, opts, extra=live_tags(), **kw)
+    if repeat > 1:
+        with tempfile.TemporaryDirectory() as d:
+            once = render(src, start, end, Path(d, "once.mov"), opts, **kw)
+            effects.thumbs.repeat(once, mov, repeat, live_tags())
+    else:
+        render(src, start, end, mov, opts, extra=live_tags(), **kw)
     length = (end if end is not None else effects.thumbs.video_duration(str(src))) - start
     key = effects.out_time(key_time or 0.0, length, opts)
     still(mov, min(max(0.0, key), effects.out_length(length, opts) - 0.05), jpg)
@@ -43,7 +51,6 @@ def still(mov, t, jpg):
 
 
 if __name__ == "__main__":
-    import tempfile
     from .library import scan
     with tempfile.TemporaryDirectory() as d:
         src = Path(d, "src.mp4")
@@ -63,4 +70,7 @@ if __name__ == "__main__":
         assert mov.stat().st_size and jpg.stat().st_size
         jpg, mov = make_live(src, 0.5, 2.5, 1.9, out, "r", {"direction": "reverse", "look": "mono"})
         assert jpg.stat().st_size and 1.9 < effects.thumbs.video_duration(str(mov)) < 2.1
+        jpg, mov = make_live(src, 0.5, 2.5, 1.0, out, "x", repeat=3)
+        assert 5.8 < effects.thumbs.video_duration(str(mov)) < 6.3 and "content.identifier" in subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format_tags", str(mov)], capture_output=True, text=True).stdout
     print("livemake ok")

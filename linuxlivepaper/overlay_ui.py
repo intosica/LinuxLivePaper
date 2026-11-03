@@ -36,12 +36,15 @@ class OverlayLayer(Gtk.Widget):
     def __init__(self, page):
         super().__init__(hexpand=True, vexpand=True)
         self.page = page
+        self._off = (0.0, 0.0)
+        self._pan = False
         click = Gtk.GestureClick()
         click.connect("pressed", self._pressed)
         self.add_controller(click)
         drag = Gtk.GestureDrag()
-        drag.connect("drag-begin", lambda g, x, y: self._pressed(None, 1, x, y))
+        drag.connect("drag-begin", self._begin)
         drag.connect("drag-update", self._dragged)
+        drag.connect("drag-end", lambda *_a: self._end())
         self.add_controller(drag)
         scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
         scroll.connect("scroll", self._scroll)
@@ -58,6 +61,13 @@ class OverlayLayer(Gtk.Widget):
             th = tw / (tex.get_intrinsic_aspect_ratio() or 1) if tex else tw
         return ox + o.get("x", 0.5) * vw - tw / 2, oy + o.get("y", 0.5) * vh - th / 2, tw, th
 
+    def _begin(self, _g, x, y):
+        self._off = (0.0, 0.0)
+        self._pressed(None, 1, x, y)
+        self._pan = not self.page.overlay()
+        if self._pan:
+            self.page.ov_pan(x, y, 0.0, 0.0)
+
     def _pressed(self, _g, _n, x, y):
         # ponytail: hit-testing ignores rotation — close enough to grab, exact boxes are not worth the math
         for i in reversed(range(len(self.page.overlays))):
@@ -68,14 +78,24 @@ class OverlayLayer(Gtk.Widget):
         self.page.select_overlay(None)
         self.page.ov_click(x, y)
 
-    def _dragged(self, _g, dx, dy):
+    def _dragged(self, _g, ox, oy):
+        dx, dy = ox - self._off[0], oy - self._off[1]  # drag-update reports the offset since the drag start
+        self._off = (ox, oy)
+        if self._pan:  # pressed on empty space: pan the picture under it (the collage's cell)
+            self.page.ov_pan(0.0, 0.0, dx, dy)
+            return
         o = self.page.overlay()
-        if not o:
+        if not o or not (dx or dy):
             return
         _, _, vw, vh = self.page.ov_rect()
         o["x"] = min(1.0, max(0.0, o.get("x", 0.5) + dx / max(1.0, vw)))
         o["y"] = min(1.0, max(0.0, o.get("y", 0.5) + dy / max(1.0, vh)))
         self.page.ov_changed()
+
+    def _end(self):
+        if self._pan:
+            self._pan = False
+            self.page.ov_pan_end()
 
     def _scroll(self, _c, _dx, dy):
         o = self.page.overlay()
@@ -288,6 +308,12 @@ class OverlayHost:
 
     def ov_click(self, x, y):
         """A press on the layer that missed every overlay (the collage uses it to pick a cell)."""
+
+    def ov_pan(self, x, y, dx, dy):
+        """A press/drag on the layer that missed every overlay (the collage pans the cell under it)."""
+
+    def ov_pan_end(self):
+        """End of the miss-drag: re-render what was panned."""
 
     # --- shared behaviour ----------------------------------------------------------------------
     def overlay(self):

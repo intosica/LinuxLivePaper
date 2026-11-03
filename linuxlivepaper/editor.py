@@ -6,6 +6,7 @@ import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -39,6 +40,9 @@ def fmt(t, fine=True):
     return f"{int(m)}:{s:05.2f}" if fine else f"{int(m)}:{int(s):02d}"
 
 
+_FILM_STRIP = ThreadPoolExecutor(max_workers=3)  # one pool for every timeline: a pool per instance piled threads up
+
+
 class Timeline(Gtk.DrawingArea):
     """Emits changed(what) with what in start|end|move|cover|scrub. Times are absolute seconds."""
     __gsignals__ = {"changed": (GObject.SignalFlags.RUN_FIRST, None, (str,))}
@@ -53,7 +57,7 @@ class Timeline(Gtk.DrawingArea):
         span = self.D if self.D <= 60 else 30.0
         self.v0, self.v1 = 0.0, span
         self.frames, self.wanted = {}, set()
-        self.pool = ThreadPoolExecutor(max_workers=3)
+        self.pool = _FILM_STRIP
         self.mode, self.mx = None, 0.0
         self.set_draw_func(self._draw)
         drag = Gtk.GestureDrag()
@@ -356,6 +360,7 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         self.stream, self.tick, self.proxies = None, 0, set()
         self.opts = dict(effects.DEFAULT)
         self.style = DEFAULT_STYLE
+        self.repeat = 1  # times the clip plays back to back in the saved file
         self.aspect = vw / vh if vh else 16 / 9
         self.canvas, self.trying = None, False
         self.ov_layer_on = True
@@ -434,7 +439,7 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         return row
 
     def _side_panel(self):
-        page = Adw.PreferencesPage(width_request=330)
+        page = Adw.PreferencesPage(width_request=330, hexpand=False, vexpand=True)
         look = Adw.PreferencesGroup(title="Look")
         look.add(self._combo("Filter", "Color grade", [(k, v[0]) for k, v in effects.LOOKS.items()],
                              self.opts["look"], lambda v: self._set_opt("look", v)))
@@ -446,6 +451,12 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
                                lambda v: self._set_opt("speed", v)))
         motion.add(self._combo("Direction", "Bounce plays forward, then back", list(effects.DIRECTIONS.items()),
                                self.opts["direction"], lambda v: self._set_opt("direction", v)))
+        rp = Adw.SpinRow.new_with_range(1, 10, 1)
+        rp.set_title("Repeat")
+        rp.set_subtitle("Times the clip plays in the saved file")
+        rp.set_value(self.repeat)
+        rp.connect("notify::value", lambda r, _: setattr(self, "repeat", int(r.get_value())))
+        motion.add(rp)
         page.add(motion)
         press = Adw.PreferencesGroup(title="Press effect",
                                      description="How the still turns into motion when you press and hold it.")
@@ -502,7 +513,7 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
     def _reset(self):
         parent = self.panel.get_parent()
         parent.remove(self.panel)
-        self.opts, self.style = dict(effects.DEFAULT), DEFAULT_STYLE
+        self.opts, self.style, self.repeat = dict(effects.DEFAULT), DEFAULT_STYLE, 1
         self.ov_reset()
         parent.append(self._side_panel())
         self._changed(None, "cover")
@@ -530,12 +541,17 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         gen = self._try_gen
         self.stop()
         s, e, k = self.tl.s, self.tl.e, self.tl.k
-        opts = dict(self.opts)
+        opts, n = dict(self.opts), self.repeat
         self.spinner.start()
 
         def work():
             try:
                 path = self._preview_path(s, e, opts)
+                if n > 1:  # Try it shows every repeat, like the saved file
+                    rep = Path(f"{path[:-4]}.x{n}.mp4")
+                    if not rep.exists():
+                        thumbs.repeat(path, rep, n)
+                    path = str(rep)
                 still = thumbs.grab_frame(path, min(effects.out_time(k - s, e - s, opts),
                                                     effects.out_length(e - s, opts) - 0.05))
             except Exception:
@@ -716,13 +732,13 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         self.stop()
         self.save_btn.set_sensitive(False)
         self.save_btn.set_label("Saving…")
-        s, e, k, opts, style = self.tl.s, self.tl.e, self.tl.k, dict(self.opts), self.style
+        s, e, k, opts, style, n = self.tl.s, self.tl.e, self.tl.k, dict(self.opts), self.style, self.repeat
         ovs = [dict(o) for o in self.overlays]
         col = self.collection_row.collection()
 
         def work():
             try:
-                res, err = livemake.make_live(self.src, s, e, k - s, opts=opts, overlay_list=ovs), None
+                res, err = livemake.make_live(self.src, s, e, k - s, opts=opts, overlay_list=ovs, repeat=n), None
                 library.set_meta(res[0], transition=style)
                 if col:
                     library.add_to_collection(library.Item("live", str(res[0]), str(res[1]), 0), col)

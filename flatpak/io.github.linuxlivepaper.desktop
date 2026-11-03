@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LinuxLivePaper
+Comment=Live images: stills that play when you press and hold them
+Exec=linuxlivepaper
+Icon=io.github.linuxlivepaper
+Terminal=false
+Categories=AudioVideo;Video;Graphics;
+StartupNotify=true

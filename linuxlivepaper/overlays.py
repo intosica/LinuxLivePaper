@@ -6,6 +6,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import thumbs
+
 
 def text(value="Your text", **kw):
     return {"kind": "text", "text": value, "x": 0.5, "y": 0.86, "size": 0.09, "color": "#ffffff",
@@ -116,9 +118,8 @@ def render(src, start, end, out, opts=None, overlays=(), height=None, fast=False
     cmd = ["ffmpeg", "-v", "error", "-y", *trim, "-i", str(src), *ov_inputs, "-filter_complex", body,
            "-map", "[fin]" if steps else "[vout]",
            *(["-map", "[aout]", "-c:a", "aac"] if audio else []),
-           "-c:v", "libx264",
-           *(["-preset", "ultrafast", "-crf", "23"] if fast else ["-preset", "faster", "-crf", "18"]), *extra, str(out)]
-    subprocess.run(cmd, check=True, capture_output=True)
+           *thumbs.h264(fast, (W, H)), *extra, str(out)]
+    thumbs.run(cmd)
     return out
 
 
@@ -139,7 +140,6 @@ def preview(src, start, end, opts, cache_dir, height=540, loop=True, overlay_lis
 
 
 def _probe(src):
-    from . import thumbs
     return thumbs.probe(str(src))
 
 

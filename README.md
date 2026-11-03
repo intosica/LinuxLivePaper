@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="flatpak/io.github.linuxlivepaper.svg" alt="LinuxLivePaper logo" width="128" height="128">
+</p>
+
 # LinuxLivePaper
 
 A Linux entertainment app for **live images**: stills that come alive when you press them, the way iPhone
@@ -14,6 +18,13 @@ cd ~/Documents/LinuxLivePaper
 ```
 Requirements: `/usr/bin/python3` with PyGObject (GTK 4 + libadwaita ≥ 1.5), GStreamer (good/bad/libav) and `ffmpeg`/`ffprobe`.
 
+### Flatpak
+```bash
+./build-flatpak.sh          # builds (GNOME 50 runtime + its own ffmpeg/x264), installs for this user,
+flatpak run io.github.linuxlivepaper   # and writes dist/LinuxLivePaper.flatpak
+```
+The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.flatpak/`. Manifest: `flatpak/`.
+
 ## Using it
 - The gallery shows your **LinuxLivePaper folder** (default `~/Videos/LinuxLivePaper`, recursive) as an
   iOS-Photos-style grid: square tiles, edge to edge, oldest at the top and newest at the bottom.
@@ -24,7 +35,7 @@ Requirements: `/usr/bin/python3` with PyGObject (GTK 4 + libadwaita ≥ 1.5), GS
 - **Collections** are folders in `<library>/collection/<Name>/`. Each card shows the system folder icon, or a `.png`
   you pick. Create one from **+** → *Collection…*; right-click a card (or the ✎ button inside it) to rename,
   change the icon or delete it. Click a card to see its items.
-- Hover over a LIVE, video or GIF tile to play it (muted). Click a tile to open it.
+- Live images look like plain stills (no badge). Hover over a live, video or GIF tile to play it (muted). Click a tile to open it.
 - In the viewer, **press and hold** a live image to play it with sound (Space also plays it). Use ←/→ to move
   between items and Esc to go back. The dropdown in the header picks the press effect
   (Immersive blur, Zoom, Fade, Instant) for that live image.
@@ -32,22 +43,26 @@ Requirements: `/usr/bin/python3` with PyGObject (GTK 4 + libadwaita ≥ 1.5), GS
   drag inside the selection to move it, and drag **COVER** to pick the still. Click to place the red playhead.
   Scroll to zoom, Shift+scroll to pan, and drag the overview strip to jump around long videos. Space plays the
   selection with sound, ←/→ steps one frame (Shift for 1 s). Saves go to the library folder.
+  Videos can be MP4, MOV, M4V, WebM, MKV, AVI and DVD/MPEG files (VOB, MPG, TS, M2TS); anamorphic DVD video is shown
+  and saved at its real (square-pixel) shape.
 - **Double-click anywhere on a timeline** to bring the yellow selection (or a collage cell's window) to that spot —
   much faster than dragging it across. The preview follows the timeline live, including while it plays.
 - The editor's side panel sets the **Filter**, **Effect**, **Speed**, **Direction** (forward/reverse/bounce) and
+  **Repeat** (how many times the clip plays back to back in the saved live image, 1–10) and
   **Press effect**. Hold *Try it* to preview exactly what will be saved. *Save to collection* also files it in a collection.
 - **Text & stickers**: in the *Overlays* group, *Text* adds a caption and *Sticker* adds any image or
   GIF (alpha is kept, and the GIF animates in the preview and in the saved file). Drag an overlay on the preview
   to move it; scroll over the preview to resize the selected one. Pick the overlay in *Selected* to change its text,
   font, bold, size, opacity, rotation, outline width and the stretch of the clip it shows on (*Whole clip* off
   gives *Starts at* / *Ends at*).
-- **+** → *Live Collage…*: pick a layout (2–9 cells), shape (9:16, 3:4, 1:1, 16:9), length, borders. Click a cell to
+- **+** → *Live Collage…*: pick a layout (2–9 cells), shape (9:16, 3:4, 1:1, 16:9), borders. Click a cell to
   fill it with a video, GIF or live video; for the selected cell drag the yellow window on its timeline to choose the
-  part that plays (drag its ends to stretch or shrink it — a window shorter than the clip needs freezes on the last
-  frame; *Fit* resets it), and set its **volume**, speed, direction, filter and effect. Space plays the whole collage,
-  *Try it* previews the saved result, and overlays work the same as in the editor (over the whole canvas; clicking an
-  empty spot selects the cell under it). Changes show up live, while playing too — each cell's proxy is
-  re-rendered and swapped in place, and the playhead tracks the running cell.
+  part that plays (the whole clip by default, up to 30 s; drag its ends to stretch or shrink it, *Fit* resets it), and
+  set its **volume**, speed, direction, filter and effect. **The longest cell sets the collage length; shorter cells
+  loop to fill it.** *Repeat* plays the whole collage 1–10 times in the saved file. Space plays the collage,
+  *Try it* previews the saved result (with repeats), and overlays work the same as in the editor (over the whole canvas;
+  clicking an empty spot selects the cell under it). Changes re-render while playing (cell passes are cached, so only
+  the changed cell is re-encoded).
 
 A *live image* is a still and a video that share a name in the same folder (`x.jpg` + `x.mov`).
 That means Live Photos copied over from an iPhone show up as LIVE too.

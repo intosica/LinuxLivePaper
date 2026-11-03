@@ -25,10 +25,31 @@ The user's decisions:
 3. `docs/ROADMAP.md`: phased checklist (tick boxes as you go)
 4. `docs/INTOLIVE-ANALYSIS.md`: intoLive feature map, to use as the parity checklist for the creator
 
+## intoLive reverse-engineering files (where the "decompiled" stuff lives)
+There is **no decompiled C/pseudocode anywhere** — every finding so far is static (strings + Swift reflection metadata).
+- IPA: `~/Documents/intoLive-Live-Wallpapers-IPAOMTK.com.ipa`. Extract: `unzip -oq <ipa> 'Payload/intolive.app/*' -d /tmp/intolive`
+  (main arm64 Swift binary: `/tmp/intolive/Payload/intolive.app/intolive`; `/tmp` is wiped on reboot).
+- `~/Documents/intoLive-Live-Wallpapers-IPAOMTK.com_malimite/`: only the same raw `intolive` Mach-O + an **empty**
+  Malimite database (0 rows) + a screenshot. Nothing decompiled there.
+- **Swift type layouts**: `docs/reference/intolive-re/swift_fields.txt` (2873 types, `Type | field: FieldType`, from
+  `swift_fields.py`, which parses `__swift5_fieldmd` in a second). This is the best map of intoLive's data model —
+  grep it before reaching for Ghidra. Summary in `docs/INTOLIVE-ANALYSIS.md` → "Swift type layouts".
+- Older static dumps: `docs/reference/intolive-*.txt` (class names, English UI strings, nibs, bundled assets).
+- Ghidra: the user's project `/media/montel/Extreme SSD/Games/Resident Evil 6/ghidra project/IntoLive.gpr` has all
+  IPA binaries imported, but auto-analysis of `intolive` takes very long and was still incomplete on 2026-11-03.
+  pyghidra-mcp (port 8000) can open it but symbol search fails with "Analysis incomplete". Only worth it for real
+  algorithm details (e.g. `LiveVideoWriter` for iPhone compatibility). The RE6/BH6 chromadb on that drive is unrelated.
+- **Headless decompile** (no GUI): `docs/reference/intolive-re/ghidra/decompile.sh [binary] [outdir] [regex]` →
+  `~/Documents/intoLive-decomp/src/*.c` (one file per class/namespace, `_global/` for `FUN_*`, `index.tsv`).
+  `FastAnalysis.java` turns off the slow analyzers; `ExportDecomp.java` decompiles in parallel. Re-runs reuse the
+  analyzed project. Binary is already decrypted (cryptid 0) but stripped (6k symbols): ObjC methods get names, Swift
+  funcs are mostly `FUN_*` — map them with `swift_fields.txt` + strings. Tested on SDKConfigurations (30 s); main
+  binary (35 MB `__text`) needs hours and ~12 GB heap — stop pyghidra-mcp first.
+
 ## Current state
 - ✅ Gallery (`linuxlivepaper/app.py`, `library.py`, `thumbs.py`): iOS-Photos-style grid (`MediaGrid`: `Square` tiles
   1 px apart, oldest first like iOS), tabs All/Live/Collections, badges, hover-to-play, right-click menu (Add to
-  Collection ▸ / New Collection…, Delete — or "Remove from Collection" inside a collection), viewer (press-and-hold live with sound, video with controls, GIF, ←/→/Esc/Space),
+  Collection ▸ / New Collection…, Delete — or "Remove from Collection" inside a collection), viewer (press-and-hold live with sound, no on-screen hint, video with controls, GIF, ←/→/Esc/Space),
   import button (copies into the library), ☰ menu: Library Folder… (Adw.PreferencesDialog), Open Library Folder, Rescan.
   Library path persisted in `~/.config/linuxlivepaper/config.json` (`{"library": "..."}`).
 - ✅ Timeline editor (`editor.py`: `Timeline` DrawingArea + `EditorPage`), opened by **+** or the viewer's *Make Live Image*:
@@ -53,18 +74,23 @@ The user's decisions:
   collection's copy intact and vice versa. Per-item meta (press style) is copied into the collection's sidecar.
   `library.scan()` skips the top-level `collection/` folder, so collection copies don't show twice in All.
 - ✅ Collage maker (`collage.py` model/render + `collage_page.py` UI, **+ → Live Collage…**): 10 layouts (2/3/4/6/9
-  cells, mixed), shapes 9:16/3:4/1:1/16:9, length 1.5–5 s, borders none/thin/thick, black/white. Per cell: clip
-  (video, GIF or live image `.mov`), a source window on the cell timeline (`Timeline(fixed=True)`: drag either end
-  to stretch/shrink — shorter freezes the last frame, *Fit* resets; double-click jumps it), volume + mute, speed,
+  cells, mixed), shapes 9:16/3:4/1:1/16:9, borders none/thin/thick, black/white. **Length = the longest cell's pass**
+  (`collage.duration`); shorter cells **loop** to fill it (user's spec: "the longest clip is the collage length, the
+  other one repeats enough just to fit"). **Repeat** 1–10 (`c["repeat"]`) plays the whole pass n times in the saved
+  file (stream copy via `thumbs.repeat`). Per cell: clip (video, GIF or live image `.mov`), a source window on the
+  cell timeline (`Timeline(fixed=True)`; default = rest of the clip after start, capped at `collage.MAX_WINDOW` 30 s;
+  dragging sets `cell["len"]`; *Fit* resets; double-click jumps it), volume + mute, speed,
   direction, filter, effect. Canvas-level overlays, press effect + *Try it*, Save to collection, and clicking an
   empty canvas spot selects the cell under it (`ov_click` → `collage.cell_at`).
   intoLive itself has no layout collage (it has PIP video stickers and "2-Split/3-Split"); this is our version.
-- **Collage performance design**: the preview never runs the collage graph. Each cell gets its own cached 360p
-  proxy (`effects.preview(..., loop=True)`, parallel pool, ~0.5 s each, only the changed cell re-renders) and
-  `CollageCanvas` composites the playing `Gtk.MediaFile`s with GtkSnapshot. A cell switches from its still to video on
-  its first decoded frame (no blank flash). Full 1080×1920 ffmpeg render only on save (~2.5–4.5 s for 4 cells under
-  load); cells are scaled down to cell size *before* filters, x264 `-preset faster` (measured: NVENC was no faster —
-  decode/filters dominate).
+- **Collage render (2026-11-03 rewrite)**: two stages in `collage.render(c, out, height, fast, extra, overlays,
+  cache, repeat)`: (1) each cell's single pass at its final cell size (`_cell_command`: SQUARE → cover-crop → look/
+  effect → speed → reverse/bounce → fps 30 → trim to `cell_length`, PCM audio padded to the same length) in parallel,
+  cached by a hash of the cell in `cache` (UI: `~/.cache/linuxlivepaper/collage/cells`); (2) one compose pass
+  `-stream_loop -1 -i cellN.mkv` → overlay on the background, amix, overlays, `-t duration`. Then `thumbs.repeat` if
+  repeat > 1. Time mapping for stills/playhead: `collage.cell_time(cell, t)`. Paused stills are ffmpeg grabs per cell;
+  Play/Try it play the 540p collage render (`CollagePage._try_path`, Play = 1 pass looping, Try it = all repeats).
+  The page keeps `len_row`/`win_row`/`cover_scale` in sync via `_length_changed()` (called from `refresh`).
 - ✅ Overlays (`overlays.py` + `overlay_ui.py`): text and image/GIF stickers baked into the live image, in the
   editor *and* the collage maker. `overlays.text(...)`/`overlays.sticker(path)` are plain dicts (x/y/size as canvas
   fractions, opacity, rotation in degrees, `start`/`end` window, text `font`/`bold`/`outline`); `overlays.graph()`
@@ -89,8 +115,8 @@ The user's decisions:
   (re-renders the changed cell's proxy, swaps its `Gtk.MediaFile` and seeks it to the old position so the cells
   stay in step). Timeline drags follow live too. `CollagePage._on_tick` drives the timeline playhead from the
   selected cell's stream (`timestamp % window` through `effects.src_time`); without it the red line sat still.
-- **Timeline**: drag either yellow end to stretch/shrink the selection (a collage cell window shorter than its clip
-  freezes on the last frame, longer is clamped to what the length needs, *Fit* resets), drag inside to move it, and
+- **Timeline**: drag either yellow end to stretch/shrink the selection (a collage cell window is exactly what that
+  cell plays and loops, *Fit* resets it to the whole clip), drag inside to move it, and
   **double-click anywhere** to jump the window to that spot. `Timeline._hit()` must not downgrade start/end to
   "move" when `fixed=True` — that was why collage windows could only be moved.
 - **Try it** (`HoldButton` in `widgets.py`) previews exactly what will be saved, in the editor and in collages
@@ -99,7 +125,51 @@ The user's decisions:
   `Gtk.GestureClick` emits `stopped` the instant the press is claimed, which ended every hold immediately — so the
   button only ends the hold on `released`.
 
+- **No "LIVE" badge** anywhere (user asked for clean previews, 2026-11-03): tiles and the viewer show the still only;
+  GIF and video-duration badges stay.
+- **Fullscreen + chrome (2026-11-03)**: `win.fullscreen` action + `F11`, also `F` inside the viewer, double-click on the
+  viewer picture, and the header / ☰ / `fs_btn` buttons; Escape leaves fullscreen first, then pops. Both the *gallery*
+  and the *viewer* are fullscreen-capable. Chrome hides itself: the viewer shows **no "Press and hold" hint** (removed 2026-11-03: it broke immersion);
+  the ←/→ arrows appear **only while the pointer is within `EDGE_PX` (140) of that side edge** (`Viewer._edge_moved`/
+  `_set_edge`/`_arrows`; never while a live image/video plays), and the header + mouse cursor fade out after
+  `CHROME_IDLE_MS` (5 s) of a still mouse and come back on motion (`Viewer.show_chrome`). The gallery header hides the same way (`Window._chrome`, `_moved`) but stays opaque on purpose:
+  `set_extend_content_to_top_edge` made the tab switcher unreadable over the grid.
+- **Collage framing (2026-11-03)**: drag a cell to move the video *inside* its frame (or scroll over it to zoom 1–4×,
+  Framing row → *Reset*); pan is stored per cell as `pan [x, y]` 0..1 and is the same `collage.cell_fit` crop used by
+  the render, so what you drag is what gets saved. Drags are absolute (`_pan0` + total offset, first motion report is
+  the origin), they stop the preview first, and they no longer rebuild the 360 px panel mid-drag (`select(quiet=True)` +
+  `_panel_stale`) — that rebuild-on-press was the "very rough, not smooth" feel.
+- **File browser in the collage maker (2026-11-03)**: `widgets.FileBrowser` in a slide-out pane (handle button on the
+  left edge). Folders first, then library clips with thumbnails; click a tile to fill the selected cell, or drag a tile
+  onto any cell (the `Gtk.DropTarget` on the stage picks the cell under the pointer, following files fill the empty
+  cells). Both panes scroll (`vscrollbar_policy=AUTOMATIC` + `vexpand` — the panel was clipping its last rows).
+- **Collection icons**: the *Choose Icon…* picker must be parented to the app **window**, not `alert.get_root()`
+  (an `Adw.AlertDialog` is already a toplevel, so the portal put the file chooser behind the modal dialog and the user
+  saw "no menu"). `widgets.collection_dialog` now does `icon_dlg.open(parent if isinstance(parent, Gtk.Window) else
+  parent.get_root(), …)`.
+- **GPU acceleration (2026-11-03)**: playback was already hardware-decoded (GStreamer → `nvh264dec`), but every encode
+  (collage play/rebake/save, MP4/GIF proxies) silently fell back to libx264 because the flatpak's ffmpeg was built
+  against the SDK's ffnvcodec headers (NVENC API 13.1) while driver 580.173.02 only exposes 13.0 →
+  "Driver does not support the required nvenc API version. Required: 13.1 Found: 13.0". `flatpak/io.github.linuxlivepaper.yml`
+  now installs `nv-codec-headers` 12.2.72.0 and builds ffmpeg with `--enable-ffnvcodec --enable-nvenc`;
+  `thumbs.nvenc()` returns True and an encode uses ~16× less CPU (1.85 s vs 29.96 s CPU for 600 frames of 1080×1920)
+  — that CPU burn was the loud fan. `LINUXLIVEPAPER_ENCODER=x264` still forces the CPU path.
+- **Editor Repeat** (Motion group SpinRow, `EditorPage.repeat`, not part of `opts` so preview caching is unchanged):
+  `livemake.make_live(..., repeat=n)` renders once, then `thumbs.repeat(once, mov, n, live_tags())`. Try it plays the
+  repeated preview (`<preview>.xN.mp4`).
+- **DVD / MPEG sources**: `library.VIDEO_EXT` includes `.vob .mpg .mpeg .ts .m2ts .mts`. `thumbs.SQUARE`
+  (`scale=trunc(iw*sar/2)*2:ih,setsar=1`) is applied in frame grabs, MP4 proxies and collage cells, and
+  `thumbs.probe` returns the *display* width, so anamorphic DVD (720×480, SAR 32:27) comes out 852×480. Verified with
+  all files in `~/Documents/VOB file examples` (MPEG-2 + MP2, up to 3840×2160): probe, grabs, make_live, collage.
+- **Flatpak**: `./build-flatpak.sh` → `flatpak/io.github.linuxlivepaper.yml` (GNOME 50 runtime; x264 + ffmpeg 6.1.2 (NOT 7.x: drawtext escaping differs)
+  built **static** with gpl/libx264/freetype/harfbuzz/fontconfig so the runtime's GStreamer libav stays untouched;
+  app copied to `/app/share/linuxlivepaper`, launcher `/app/bin/linuxlivepaper`; `--filesystem=home`, `/media`,
+  `/run/media`, `/mnt`). Build state in `.flatpak/` (git-ignored), bundle in `dist/LinuxLivePaper.flatpak`.
+  Inside the sandbox the config/cache live in `~/.var/app/io.github.linuxlivepaper/`.
+
 ### Hard-won facts (don't relearn these)
+- `thumbs.grab_frame(..., chain)`: a chain ending in "," (cell_fit + empty look) used to make ffmpeg fail silently,
+  which left collage cells as "…" forever. `_frame_at` now strips empty pieces.
 - GTK's GStreamer `Gtk.MediaFile.seek()` while **paused** reports success but doesn't render the frame (black).
   So the editor shows exact **ffmpeg frame grabs** (`thumbs.grab_frame`, ~0.25 s on a 1080p episode) while paused,
   and plays a cached **ffmpeg proxy of exactly the selection** (`thumbs.mp4_proxy(src, s, e, 540)`) for looping playback.
@@ -143,8 +213,7 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - GNOME 46 on X11. Installed: ffmpeg 6.1.1, GStreamer 1.24 (libav, avdec_gif, h265 decode), exiftool, Xvfb, xdotool.
   NVENC is available (`h264_nvenc`, `hevc_nvenc`).
 - No new dependencies unless unavoidable (stdlib + PyGObject + ffmpeg CLI).
-- Ghidra MCP (pyghidra-mcp) is its own empty project, not the user's CodeBrowser. Not needed now. Only revisit it for
-  iPhone-compat details (`LiveVideoWriter`, `LiveKeyPhotoWriter`).
+- Ghidra: see "intoLive reverse-engineering files" above. Not needed for current work.
 
 ## Rules
 - Don't copy intoLive assets (videos, fonts, LUTs) into the repo.
@@ -154,9 +223,10 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 1. Per-cell overlays in collages (one overlay list per `cell`, reuse `overlays.graph`); keyframes/sticker animations
    (intoLive has `stickerAnimationComeUp*`, `MarqueeLeftRight/UpDown`, `Rotate*`); more text styles.
 2. Crop/rotate/flip and Ken Burns for clips; filter intensity slider + .cube LUT import (`lut3d`).
-3. Gallery polish: date sections, scroll to newest on open, Gio.FileMonitor live reload, multi-select, fullscreen.
-4. Collage: drag to swap cells, per-cell pan/zoom inside its frame, shared clock if cell drift ever shows.
-5. Package it: a `.desktop` file + icon.
+3. Gallery polish: date sections, scroll to newest on open, Gio.FileMonitor live reload, multi-select.
+4. Collage: drag to swap cells, shared clock if cell drift ever shows. (Per-cell pan/zoom is done; the file browser
+   pane relayouts a beat late when a drag starts — it only expands the stage on the next allocation.)
+5. Flatpak: add AppStream metainfo if it ever goes to Flathub; consider narrowing `--filesystem=home` to portals.
 
 ## Log
 - 2026-11-02: Phase 0. Static IPA analysis.
@@ -169,3 +239,13 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - 2026-11-02: Baked-in effects (`effects.py`: looks, effects, speed, reverse/bounce) in an editor side panel; press transition selectable per item (blur/zoom/fade/instant).
 - 2026-11-03: Text overlays and image/GIF stickers (`overlays.py`), placed by dragging on the editor preview; GIF alpha preserved; baked into the saved MOV and cover still.
 - 2026-11-03: Overlay editing round: shared `overlay_ui.py` (rotation, font/bold, outline width, per-overlay time window, sticker+text in collages), live preview while playing, collage windows stretchable + *Fit* + Try it, timeline double-click, `HoldButton` rework, near-end cover-frame fix, quit-while-playing crash fix.
+- 2026-11-03: Collage length = longest cell, shorter cells loop (two-stage cached render); Repeat ×1–10 for collages and
+  single live images; LIVE badges removed; VOB/MPEG + anamorphic support; fixed blank collage stills (trailing ","
+  in grab chain); Swift reflection dump of intoLive (`docs/reference/intolive-re/`); flatpak build script.
+- 2026-11-03: Viewer/gallery fullscreen + auto-hiding chrome (arrows, hint, header, cursor after 5 s idle), collage
+  cell drag-pan/scroll-zoom with a smooth absolute mapping, slide-out file browser with drag-and-drop onto cells,
+  Choose-Icon portal parenting fix, NVENC re-enabled in the flatpak (nv-codec-headers 12.2), collage/editor side
+  panels scroll properly.
+- 2026-11-03: Viewer immersion pass: removed the "Press and hold to play" hint (`LiveView.hint`/`set_hint`, `.hint` CSS) and made the
+  ←/→ arrows edge-hover only (`EDGE_PX`). Logo (`flatpak/io.github.linuxlivepaper.svg`) centred at the top of README. Pushed to
+  https://github.com/intosica/LinuxLivePaper.git (user's GitHub is authorised on this PC). Screenshots: user will add later.

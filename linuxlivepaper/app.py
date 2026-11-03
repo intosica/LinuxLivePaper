@@ -28,7 +28,10 @@ gridview.photos, gridview.photos > child { padding: 0; margin: 0; border-radius:
 flowbox.collections > flowboxchild { padding: 6px; border-radius: 12px; }
 .collection-name { font-weight: 700; }
 .viewer { background: black; }
-.hint { color: alpha(white, 0.7); margin: 16px; }
+.nav-arrow { min-width: 44px; min-height: 44px; }
+.browse-handle { min-width: 20px; min-height: 120px; padding: 0 2px; border-radius: 999px; }
+.file-browser flowboxchild { padding: 0; border-radius: 10px; }
+.file-browser flowboxchild picture { border-radius: 10px 10px 0 0; }
 .hold { background: alpha(currentColor, 0.12); border-radius: 999px; padding: 5px 14px; }
 .hold:hover { background: alpha(currentColor, 0.22); }
 .hold.holding { background: #3584e4; color: white; }
@@ -135,9 +138,7 @@ class Tile(Gtk.Overlay):
             self.remove_overlay(self.badge)
             self.badge = None
         o = self.obj
-        if o.item.kind == "live":
-            self.badge = badge("LIVE", "media-playlist-repeat-symbolic")
-        elif o.item.kind == "gif":
+        if o.item.kind == "gif":
             self.badge = badge("GIF")
         elif o.duration:
             self.badge = badge(fmt_time(o.duration))
@@ -189,27 +190,26 @@ class Tile(Gtk.Overlay):
 
 class LiveView(Gtk.Overlay):
     """Shows the still; press and hold (or hold Space) to play the motion with sound, like iOS,
-    with the immersive blur transition from playback.LiveCanvas."""
+    with the immersive blur transition from playback.LiveCanvas. on_live(bool) fires when playing starts/ends."""
 
-    def __init__(self, item):
+    def __init__(self, item, on_live=None):
         super().__init__()
-        self.item = item
+        self.item, self.on_live = item, on_live or (lambda _live: None)
         self.canvas = LiveCanvas(Gdk.Texture.new_from_filename(item.path), item.motion,
-                                 on_idle=lambda: self.hint.set_visible(True),
+                                 on_idle=self._idle,
                                  style=library.get_meta(item.path).get("transition", DEFAULT_STYLE))
         self.set_child(self.canvas)
-        self.add_overlay(badge("LIVE", "media-playlist-repeat-symbolic"))
-        self.hint = Gtk.Label(label="Press and hold to play", css_classes=["hint"],
-                              halign=Gtk.Align.CENTER, valign=Gtk.Align.END)
-        self.add_overlay(self.hint)
         press = Gtk.GestureClick()
         press.connect("pressed", lambda *_: self.play())
         press.connect("released", lambda *_: self.release())
         press.connect("cancel", lambda *_: self.release())
         self.add_controller(press)
 
+    def _idle(self):
+        self.on_live(False)
+
     def play(self):
-        self.hint.set_visible(False)
+        self.on_live(True)
         self.canvas.press()
 
     def release(self):
@@ -219,42 +219,124 @@ class LiveView(Gtk.Overlay):
         self.canvas.stop()
 
 
+EDGE_PX = 140  # the pointer must be this close to the left/right edge for that arrow to appear
+CHROME_IDLE_MS = 5000  # header / cursor / arrows hide after the mouse rests this long
+
+
 class Viewer(Adw.NavigationPage):
+    """Full-bleed viewer. No on-screen hints; the ←/→ arrows only appear while the pointer is near that side
+    edge (EDGE_PX) and never while a live image plays; in fullscreen (F, F11, double-click, or the header
+    button) the header bar and cursor hide after a moment of stillness, like a photo app."""
+
     def __init__(self, win, objs, index):
         super().__init__(title="")
         self.win, self.objs, self.index, self.stream, self.view = win, objs, index, None, None
+        self.live, self._idle_id, self._last_xy, self._edge = False, 0, None, 0
         self.header = Adw.HeaderBar()
         self.make_btn = Gtk.Button(label="Make Live Image", css_classes=["suggested-action"])
         self.make_btn.connect("clicked", lambda *_: win.open_editor(self.objs[self.index].item.motion))
+        self.fs_btn = Gtk.Button(action_name="win.fullscreen")
+        self.header.pack_end(self.fs_btn)
         self.header.pack_end(self.make_btn)
         self.style_ids = list(STYLES)
         self.style_dd = Gtk.DropDown.new_from_strings([v[0] for v in STYLES.values()])
         self.style_dd.set_tooltip_text("Press effect for this live image")
         self.style_dd.connect("notify::selected", self._style_changed)
         self.header.pack_end(self.style_dd)
-        self.frame = Gtk.Overlay(css_classes=["viewer"], hexpand=True, vexpand=True)
-        self.frame.set_child(Gtk.Box())
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=180)
+        self.frame = Gtk.Overlay(css_classes=["viewer"], hexpand=True, vexpand=True, child=self.stack)
+        self.arrows = []
         for icon, step, align in (("go-previous-symbolic", -1, Gtk.Align.START),
                                   ("go-next-symbolic", 1, Gtk.Align.END)):
-            b = Gtk.Button(icon_name=icon, halign=align, valign=Gtk.Align.CENTER, margin_start=12,
-                           margin_end=12, css_classes=["osd", "circular"])
+            b = Gtk.Button(icon_name=icon, css_classes=["osd", "circular", "nav-arrow"])
             b.connect("clicked", lambda _b, s=step: self.go(s))
-            self.frame.add_overlay(b)
-        tv = Adw.ToolbarView(content=self.frame)
-        tv.add_top_bar(self.header)
-        self.set_child(tv)
+            r = Gtk.Revealer(child=b, transition_type=Gtk.RevealerTransitionType.CROSSFADE, transition_duration=250,
+                             reveal_child=True, halign=align, valign=Gtk.Align.CENTER, margin_start=12, margin_end=12)
+            self.arrows.append(r)
+            self.frame.add_overlay(r)
+        edge = Gtk.EventControllerMotion()
+        edge.connect("motion", self._edge_moved)
+        edge.connect("leave", lambda *_: self._set_edge(0))
+        self.frame.add_controller(edge)
+        self.tv = Adw.ToolbarView(content=self.frame)
+        self.tv.add_top_bar(self.header)
+        self.set_child(self.tv)
         keys = Gtk.EventControllerKey()
         keys.connect("key-pressed", self._key)
         keys.connect("key-released", self._key_up)
         self.add_controller(keys)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._moved)
+        self.add_controller(motion)
+        dbl = Gtk.GestureClick()
+        dbl.connect("pressed", lambda _g, n, *_: n == 2 and win.activate_action("win.fullscreen"))
+        self.frame.add_controller(dbl)
+        self._fs_id = win.connect("notify::fullscreened", lambda *_: self._fullscreen_changed())
         self.connect("hidden", lambda *_: self._stop())
+        self.connect("destroy", lambda *_: win.disconnect(self._fs_id))
+        self._fullscreen_changed()
         self.show()
 
+    # --- chrome (arrows, header, cursor) --------------------------------------------------------
+    def _fullscreen_changed(self):
+        fs = self.win.is_fullscreen()
+        self.fs_btn.set_icon_name("view-restore-symbolic" if fs else "view-fullscreen-symbolic")
+        self.fs_btn.set_tooltip_text("Leave fullscreen (F)" if fs else "Fullscreen (F)")
+        self.tv.set_extend_content_to_top_edge(fs)  # the picture keeps its size when the header slides away
+        self.show_chrome()
+
+    def show_chrome(self, show=True):
+        fs = self.win.is_fullscreen()
+        self._arrows(show)
+        self.tv.set_reveal_top_bars(show or not fs)
+        self.frame.set_cursor_from_name(None if show or not fs else "none")
+        if self._idle_id:
+            GLib.source_remove(self._idle_id)
+            self._idle_id = 0
+        if show:
+            self._idle_id = GLib.timeout_add(CHROME_IDLE_MS, self._idle)
+
+    def _arrows(self, show=True):
+        ok = show and not self.live and len(self.objs) > 1
+        for r, side in zip(self.arrows, (-1, 1)):
+            r.set_reveal_child(ok and self._edge == side)
+
+    def _edge_moved(self, _c, x, _y):
+        w = self.frame.get_width()
+        self._set_edge(-1 if x < EDGE_PX else 1 if x > w - EDGE_PX else 0)
+
+    def _set_edge(self, edge):
+        if edge != self._edge:
+            self._edge = edge
+            self._arrows(self._idle_id != 0)
+
+    def _idle(self):
+        self._idle_id = 0
+        self.show_chrome(False)
+        return False
+
+    def _moved(self, _c, x, y):
+        if self._last_xy and abs(x - self._last_xy[0]) + abs(y - self._last_xy[1]) < 3:
+            return  # GTK sends synthetic motion when widgets change under a still pointer
+        self._last_xy = (x, y)
+        if not self.live:
+            self.show_chrome()
+
+    def _on_live(self, live):
+        self.live = live
+        self.show_chrome(not live)
+
+    # --- keys -----------------------------------------------------------------------------------
     def _key(self, _c, keyval, *_):
         if keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
             self.go(-1 if keyval == Gdk.KEY_Left else 1)
+        elif keyval in (Gdk.KEY_f, Gdk.KEY_F):
+            self.win.activate_action("win.fullscreen")
         elif keyval == Gdk.KEY_Escape:
-            self.get_ancestor(Adw.NavigationView).pop()
+            if self.win.is_fullscreen():
+                self.win.unfullscreen()
+            else:
+                self.get_ancestor(Adw.NavigationView).pop()
         elif keyval == Gdk.KEY_space and isinstance(self.view, LiveView):
             if not self.view.canvas.is_live():  # ignore key auto-repeat
                 self.view.play()
@@ -289,14 +371,15 @@ class Viewer(Adw.NavigationPage):
 
     def show(self):
         self._stop()
+        self.live = False
         item = self.objs[self.index].item
         self.set_title(item.name)
         self.make_btn.set_visible(item.kind != "live")
         self.style_dd.set_visible(item.kind == "live")
         if item.kind == "live":
-            view = LiveView(item)
+            view = LiveView(item, self._on_live)
         elif item.kind == "video":
-            view = Gtk.Video(media_stream=media_file(item.path, muted=False, loop=True))
+            view = Gtk.Video(media_stream=media_file(item.path, muted=False, loop=True), autohide=True)
             view.get_media_stream().play()
         else:  # gif: loop the MP4 proxy
             view = Gtk.Picture.new_for_filename(item.path)  # first frame until the proxy is ready
@@ -313,8 +396,14 @@ class Viewer(Adw.NavigationPage):
             self._syncing = False
         view.set_hexpand(True)
         view.set_vexpand(True)
-        self.frame.set_child(view)
+        old = self.stack.get_visible_child()
+        self.stack.add_child(view)
+        self.stack.set_visible_child(view)  # crossfade from the previous item
+        if old:
+            GLib.timeout_add(self.stack.get_transition_duration() + 60,
+                             lambda: (old.get_parent() is self.stack and self.stack.remove(old), False)[1])
         self.view = view
+        self.show_chrome()
         self.grab_focus()
 
 
@@ -479,7 +568,10 @@ class Window(Adw.ApplicationWindow):
         menu.append("Open Library Folder", "win.open-folder")
         menu.append("Rescan", "win.rescan")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
-        for name, fn in (("prefs", self._prefs), ("rescan", self.rescan), ("new-live", self._pick_source),
+        self.fs_btn = Gtk.Button(action_name="win.fullscreen")
+        header.pack_end(self.fs_btn)
+        for name, fn in (("fullscreen", lambda: self.unfullscreen() if self.is_fullscreen() else self.fullscreen()),
+                         ("prefs", self._prefs), ("rescan", self.rescan), ("new-live", self._pick_source),
                          ("new-collage", lambda: self.nav.push(CollagePage(self._saved))),
                          ("new-collection", self.new_collection),
                          ("open-folder", lambda: Gtk.FileLauncher.new(
@@ -494,15 +586,52 @@ class Window(Adw.ApplicationWindow):
         add_to.connect("activate", lambda _a, v: self._add_to(library.get_collection(v.get_string())))
         self.add_action(add_to)
         self.ctx_item = self.ctx_collection = None
+        app.set_accels_for_action("win.fullscreen", ["F11"])
+        self._chrome_id = 0
+        self.connect("notify::fullscreened", lambda *_: (self._fullscreen_icon(), self._chrome()))
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._moved)
+        self.add_controller(motion)
+        self._fullscreen_icon()
+        esc = Gtk.EventControllerKey()  # bubble phase: dialogs and the viewer see Escape first
+        esc.connect("key-pressed", lambda _c, kv, *_: kv == Gdk.KEY_Escape and self.is_fullscreen()
+                    and (self.unfullscreen() or True))
+        self.add_controller(esc)
 
-        tv = Adw.ToolbarView(content=self.stack)
-        tv.add_top_bar(header)
+        self.tv = Adw.ToolbarView(content=self.stack)
+        self.tv.add_top_bar(header)
         self.nav = Adw.NavigationView()
-        self.nav.add(Adw.NavigationPage(child=tv, title="Gallery", tag="gallery"))
+        self.nav.add(Adw.NavigationPage(child=self.tv, title="Gallery", tag="gallery"))
         self.toasts = Adw.ToastOverlay(child=self.nav)  # around every page, so toasts show from any page
         self.set_content(self.toasts)
         first.set_active(True)
         self.rescan()
+
+    def _fullscreen_icon(self):
+        fs = self.is_fullscreen()
+        self.fs_btn.set_icon_name("view-restore-symbolic" if fs else "view-fullscreen-symbolic")
+        self.fs_btn.set_tooltip_text("Leave fullscreen (F11)" if fs else "Fullscreen (F11)")
+
+    def _chrome(self, show=True):
+        """Fullscreen hides the header and the cursor, like the viewer; moving the mouse brings them back."""
+        fs = self.is_fullscreen()
+        self.tv.set_reveal_top_bars(show or not fs)
+        self.set_cursor_from_name(None if show or not fs else "none")
+        if self._chrome_id:
+            GLib.source_remove(self._chrome_id)
+            self._chrome_id = 0
+        if fs and show:
+            self._chrome_id = GLib.timeout_add(CHROME_IDLE_MS, self._chrome_later)
+
+    def _chrome_later(self):
+        self._chrome_id = 0
+        self._chrome(False)
+        return False
+
+    def _moved(self, *_a):
+        page = self.nav.get_visible_page()
+        if self.is_fullscreen() and page is not None and page.get_tag() == "gallery":
+            self._chrome()  # the viewer owns its own chrome while it is on top
 
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
