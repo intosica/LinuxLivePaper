@@ -121,6 +121,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self.sel = 0
         self.style = DEFAULT_STYLE
         self.streams, self.playing, self.gen, self.tl = [], False, 0, None
+        self.tick = 0
         self.canvas_live = None
         self.canvas_widget, self.trying, self._try_gen = None, False, 0
 
@@ -573,6 +574,8 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
                 self.streams[i] = m
                 m.play()
                 if old:
+                    if m.is_seekable():  # pick up where the old proxy was, so one edit doesn't desync the cells
+                        m.seek(old.get_timestamp())
                     old.set_playing(False)
             fut.add_done_callback(lambda f: GLib.idle_add(done, f))
 
@@ -621,7 +624,22 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             for m in self.streams:
                 if m:
                     m.play()
+            self.tick = GLib.timeout_add(40, self._on_tick)
         threading.Thread(target=wait, daemon=True).start()
+
+    def _on_tick(self):
+        """Move the playhead along the selected cell's window while the collage plays."""
+        if not self.playing:
+            self.tick = 0
+            return False
+        cell = self.c["cells"][self.sel]
+        m = self.streams[self.sel] if self.sel < len(self.streams) else None
+        if cell and m and self.tl:
+            o = {**effects.DEFAULT, **cell["opts"]}
+            need = collage.window(cell, self.c["duration"])
+            self.tl.p = cell["start"] + effects.src_time(m.get_timestamp() / 1e6 % need, need, o)
+            self.tl.queue_draw()
+        return True
 
     def _frame(self, m, i):
         """Swap a cell from its still to the playing proxy on the first decoded frame (no blank flash)."""
@@ -640,6 +658,9 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             if m:
                 m.set_playing(False)
         self.streams = []
+        if self.tick:
+            GLib.source_remove(self.tick)
+            self.tick = 0
         if was:
             self.refresh(all_cells=True)
 

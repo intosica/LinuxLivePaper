@@ -86,7 +86,9 @@ The user's decisions:
   (not per cell).
 - **Live preview**: while the editor or a collage is playing, edits re-render instead of stopping playback —
   `EditorPage._rebake()` (debounced 400 ms, restarts only the baked preview) and `CollagePage._swap(idx)`
-  (re-renders the changed cell's proxy and swaps its `Gtk.MediaFile`). Timeline drags follow live too.
+  (re-renders the changed cell's proxy, swaps its `Gtk.MediaFile` and seeks it to the old position so the cells
+  stay in step). Timeline drags follow live too. `CollagePage._on_tick` drives the timeline playhead from the
+  selected cell's stream (`timestamp % window` through `effects.src_time`); without it the red line sat still.
 - **Timeline**: drag either yellow end to stretch/shrink the selection (a collage cell window shorter than its clip
   freezes on the last frame, longer is clamped to what the length needs, *Fit* resets), drag inside to move it, and
   **double-click anywhere** to jump the window to that spot. `Timeline._hit()` must not downgrade start/end to

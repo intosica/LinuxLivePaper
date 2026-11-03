@@ -46,7 +46,8 @@ Requirements: `/usr/bin/python3` with PyGObject (GTK 4 + libadwaita ≥ 1.5), GS
   part that plays (drag its ends to stretch or shrink it — a window shorter than the clip needs freezes on the last
   frame; *Fit* resets it), and set its **volume**, speed, direction, filter and effect. Space plays the whole collage,
   *Try it* previews the saved result, and overlays work the same as in the editor (over the whole canvas; clicking an
-  empty spot selects the cell under it). Changes show up live, while playing too.
+  empty spot selects the cell under it). Changes show up live, while playing too — each cell's proxy is
+  re-rendered and swapped in place, and the playhead tracks the running cell.
 
 A *live image* is a still and a video that share a name in the same folder (`x.jpg` + `x.mov`).
 That means Live Photos copied over from an iPhone show up as LIVE too.
