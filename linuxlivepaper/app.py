@@ -111,6 +111,7 @@ class ItemObj(GObject.Object):
         self.texture = None
         self.duration = None
         self.loading = False
+        self.in_collection = Path(item.path).parent.parent.name == library.COLLECTIONS
 
 
 class Square(Gtk.Widget):
@@ -532,7 +533,9 @@ class MediaGrid(Gtk.Stack):
         self.win, self.collection = win, collection
         self.store = Gio.ListStore(item_type=ItemObj)
         self.kind = None
-        self.filter = Gtk.CustomFilter.new(lambda o: self.kind is None or o.item.kind == self.kind)
+        self.show_collected = {}  # tab kind → whether items that live in a collection show there (Preferences)
+        self.load_show_prefs()
+        self.filter = Gtk.CustomFilter.new(self._keep)
         self.model = Gtk.FilterListModel(model=self.store, filter=self.filter)
         factory = Gtk.SignalListItemFactory()
         factory.connect("setup", lambda _f, li: li.set_child(Tile(self._menu)))
@@ -544,6 +547,15 @@ class MediaGrid(Gtk.Stack):
         self.status = Adw.StatusPage(icon_name="camera-photo-symbolic", title=empty_title, description=empty_desc)
         self.add_named(self.status, "status")
         self.add_named(Gtk.ScrolledWindow(child=self.grid), "grid")
+
+    def load_show_prefs(self):
+        cfg = library.load_config()
+        self.show_collected = {None: cfg.get("all_shows_collected", True), "live": cfg.get("live_shows_collected", True)}
+
+    def _keep(self, o):
+        if self.collection is None and o.in_collection and not self.show_collected.get(self.kind, True):
+            return False
+        return self.kind is None or o.item.kind == self.kind
 
     def set_items(self, items):
         # keep already-loaded thumbnails when the same file is still there
@@ -977,6 +989,19 @@ class Window(Adw.ApplicationWindow):
                               "pointer is over them", active=library.load_config().get("hover_play", True))
         hover.connect("notify::active", lambda w, _p: library.set_pref("hover_play", w.get_active()))
         gallery.add(hover)
+        for key, tab in (("all_shows_collected", "All"), ("live_shows_collected", "Live")):
+            row = Adw.SwitchRow(title=f"Show collection items in {tab}", active=library.load_config().get(key, True),
+                                subtitle="Items you added to a collection also appear in this tab" if tab == "All"
+                                else "Live images you added to a collection also appear in this tab")
+
+            def toggled(w, _p, key=key):
+                library.set_pref(key, w.get_active())
+                g = self.library_grid
+                g.load_show_prefs()
+                g.filter.changed(Gtk.FilterChange.DIFFERENT)
+                g._update()
+            row.connect("notify::active", toggled)
+            gallery.add(row)
         page.add(gallery)
         perf = Adw.PreferencesGroup(title="Performance", description="Applies to previews and to saved files.")
         gpu = Adw.SwitchRow(title="GPU acceleration", active=thumbs.gpu_enabled(),
