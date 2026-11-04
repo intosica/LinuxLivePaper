@@ -1,0 +1,5 @@
+Content Bytes Written: 138312 (138.3 kB)
+Installing app/io.github.linuxlivepaper/x86_64/master
+Pruning cache
+Bundle: /home/montel/Documents/LinuxLivePaper/dist/LinuxLivePaper.flatpak
+Run:    flatpak run io.github.linuxlivepaper

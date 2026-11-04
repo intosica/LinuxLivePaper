@@ -1,0 +1,15 @@
+Exporting share/applications/io.github.linuxlivepaper.desktop
+Exporting share/icons/hicolor/scalable/apps/io.github.linuxlivepaper.svg
+Please review the exported files and the metadata
+Committing stage finish to cache
+Exporting io.github.linuxlivepaper to repo
+Commit: 14e724b24cca076a81c9f4eeb1fdc77603c14c918b92c31789aed1dfebe4232c
+Metadata Total: 41
+Metadata Written: 6
+Content Total: 30
+Content Written: 8
+Content Bytes Written: 142801 (142.8 kB)
+Installing app/io.github.linuxlivepaper/x86_64/master
+Pruning cache
+Bundle: /home/montel/Documents/LinuxLivePaper/dist/LinuxLivePaper.flatpak
+Run:    flatpak run io.github.linuxlivepaper

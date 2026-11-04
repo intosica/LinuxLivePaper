@@ -4,6 +4,7 @@ import math
 import os
 import shutil
 import threading
+import weakref
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -46,6 +47,24 @@ def zoom_box(sizes, get, apply):
     sync()
     box.connect("map", lambda *_: sync())  # the other page may have changed the value
     return box
+SELECTED = {}  # path → Item: the multi-selection (shared by every grid)
+TILES = weakref.WeakSet()
+SELECT_KEYS = {"ctrl": ("Ctrl", Gdk.ModifierType.CONTROL_MASK), "shift": ("Shift", Gdk.ModifierType.SHIFT_MASK),
+               "alt": ("Alt", Gdk.ModifierType.ALT_MASK)}
+COLLAGE_LAYOUT = {1: "2h", 2: "2h", 3: "1+2", 4: "4", 5: "6", 6: "6", 7: "9", 8: "9", 9: "9"}  # clips → layout
+
+
+def select_key_mask():
+    return SELECT_KEYS.get(library.load_config().get("select_key", "ctrl"), SELECT_KEYS["ctrl"])[1]
+
+
+def toggle_selected(item):
+    if SELECTED.pop(item.path, None) is None:
+        SELECTED[item.path] = item
+    for t in TILES:
+        t.sync_check()
+
+
 TABS = [("All", None), ("Live", "live"), ("Collections", "collections")]
 CSS = """
 gridview.photos, gridview.photos > child { padding: 0; margin: 0; border-radius: 0; background: none; }
@@ -53,6 +72,8 @@ gridview.photos, gridview.photos > child { padding: 0; margin: 0; border-radius:
 .badge { background: rgba(0,0,0,0.45); color: white; border-radius: 6px; padding: 1px 6px;
          margin: 6px; font-size: 0.75em; font-weight: 800; letter-spacing: 1px; }
 .badge.end { margin: 6px; }
+.check { background: @accent_bg_color; color: white; border-radius: 99px; padding: 3px; margin: 6px; }
+.tile.picked { outline: 3px solid @accent_bg_color; outline-offset: -3px; }
 flowbox.collections > flowboxchild { padding: 6px; border-radius: 12px; }
 .collection-name { font-weight: 700; }
 .viewer { background: black; }
@@ -164,12 +185,26 @@ class Tile(Gtk.Overlay):
         menu = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
         menu.connect("pressed", lambda _g, _n, x, y: self.obj and on_menu(self, x, y, self.obj.item))
         self.add_controller(menu)
+        self.check = Gtk.Image(icon_name="object-select-symbolic", css_classes=["check"], halign=Gtk.Align.START,
+                               valign=Gtk.Align.START, visible=False)
+        self.add_overlay(self.check)
+        self.mods = 0
+        press = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY, propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        press.connect("pressed", lambda g, *_: setattr(self, "mods", g.get_current_event_state()))
+        self.add_controller(press)
+        TILES.add(self)
+
+    def sync_check(self):
+        on = bool(self.obj and self.obj.item.path in SELECTED)
+        self.check.set_visible(on)
+        (self.add_css_class if on else self.remove_css_class)("picked")
 
     def bind(self, obj):
         self.stop()
         self.obj = obj
         self.pic.set_paintable(obj.texture)
         self._set_badge()
+        self.sync_check()
         if self._auto():
             self.hovering = True
             self._play()
@@ -543,7 +578,7 @@ class MediaGrid(Gtk.Stack):
         factory.connect("unbind", lambda _f, li: li.get_child().unbind())
         self.grid = Gtk.GridView(model=Gtk.NoSelection(model=self.model), factory=factory, max_columns=16,
                                  min_columns=3, single_click_activate=True, css_classes=["photos"])
-        self.grid.connect("activate", self._open)
+        self.grid.connect("activate", self._activate)
         self.status = Adw.StatusPage(icon_name="camera-photo-symbolic", title=empty_title, description=empty_desc)
         self.add_named(self.status, "status")
         self.add_named(Gtk.ScrolledWindow(child=self.grid), "grid")
@@ -577,7 +612,20 @@ class MediaGrid(Gtk.Stack):
     def _update(self):
         self.set_visible_child_name("grid" if self.model.get_n_items() else "status")
 
-    def _open(self, _grid, pos):
+    def _activate(self, _grid, pos):
+        tile = self._tile_at(pos)
+        held = tile and tile.mods & select_key_mask()
+        if held or self.win.select_mode:
+            toggle_selected(self.model.get_item(pos).item)
+            self.win.selection_changed()
+        else:
+            self._open(pos)
+
+    def _tile_at(self, pos):
+        item = self.model.get_item(pos)
+        return next((t for t in TILES if t.obj is item), None)
+
+    def _open(self, pos):
         objs = [self.model.get_item(i) for i in range(self.model.get_n_items())]
         self.win.nav.push(Viewer(self.win, objs, pos))
 
@@ -693,6 +741,10 @@ class Window(Adw.ApplicationWindow):
                                                                 self.collections_view.zoom)
         header.pack_start(self.zoom_grid)
         header.pack_start(self.zoom_coll)
+        self.select_mode = False
+        self.select_btn = Gtk.ToggleButton(icon_name="object-select-symbolic", tooltip_text="Select several videos")
+        self.select_btn.connect("toggled", lambda b: self.set_select_mode(b.get_active()))
+        header.pack_start(self.select_btn)
         menu = Gio.Menu()
         menu.append("Preferences…", "win.prefs")
         menu.append("Open Library Folder", "win.open-folder")
@@ -711,6 +763,9 @@ class Window(Adw.ApplicationWindow):
                          ("open-collage4", lambda: self.open_collage(4)),
                          ("export-gif", lambda: self._export_ctx("gif")),
                          ("export-webp", lambda: self._export_ctx("webp")),
+                         ("sel-collage", self._sel_collage), ("sel-delete", self._sel_delete),
+                         ("sel-clear", self.clear_selection),
+                         ("sel-add-new", lambda: collection_dialog(self, self._sel_add_to)),
                          ("delete", self._delete_ctx), ("remove-from", self._remove_from), ("add-to-new", self._add_to_new),
                          ("edit-collection", lambda: self.edit_collection(self.ctx_collection)),
                          ("change-icon", lambda: self.change_icon(self.ctx_collection)),
@@ -721,6 +776,9 @@ class Window(Adw.ApplicationWindow):
         add_to = Gio.SimpleAction(name="add-to", parameter_type=GLib.VariantType("s"))
         add_to.connect("activate", lambda _a, v: self._add_to(library.get_collection(v.get_string())))
         self.add_action(add_to)
+        sel_add = Gio.SimpleAction(name="sel-add-to", parameter_type=GLib.VariantType("s"))
+        sel_add.connect("activate", lambda _a, v: self._sel_add_to(library.get_collection(v.get_string())))
+        self.add_action(sel_add)
         self.ctx_item = self.ctx_collection = None
         app.set_accels_for_action("win.fullscreen", ["F11"])
         self._chrome_id = 0
@@ -736,11 +794,25 @@ class Window(Adw.ApplicationWindow):
 
         self.tv = Adw.ToolbarView(content=self.stack)
         self.tv.add_top_bar(header)
+        self.sel_bar = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_UP)
+        bar = Gtk.ActionBar()
+        self.sel_label = Gtk.Label(label="Select videos")
+        bar.pack_start(self.sel_label)
+        collage = Gtk.Button(label="Live Collage", action_name="win.sel-collage")
+        self.sel_add = Gtk.MenuButton(label="Add to Collection")
+        clear = Gtk.Button(label="Clear", action_name="win.sel-clear")
+        for b in (clear, self.sel_add, collage):
+            bar.pack_end(b)
+        self.sel_btns = [collage, self.sel_add, clear]
+        self.sel_bar.set_child(bar)
+        self.tv.add_bottom_bar(self.sel_bar)
         self.nav = Adw.NavigationView()
         self.nav.add(Adw.NavigationPage(child=self.tv, title="Gallery", tag="gallery"))
         self.toasts = Adw.ToastOverlay(child=self.nav)  # around every page, so toasts show from any page
         self.set_content(self.toasts)
         first.set_active(True)
+        self.apply_select_pref()
+        self.selection_changed()
         self.rescan()
 
     def _fullscreen_icon(self):
@@ -809,6 +881,8 @@ class Window(Adw.ApplicationWindow):
 
     def item_menu(self, widget, x, y, item, collection=None):
         self.ctx_item, self.ctx_collection = item, collection
+        if item.path in SELECTED:
+            return self._popup(widget, x, y, self._selection_menu())
         add = Gio.Menu()
         for c in library.collections():
             if c.path.resolve() != Path(item.path).parent.resolve():
@@ -830,6 +904,25 @@ class Window(Adw.ApplicationWindow):
             menu.append("Save as WebP…", "win.export-webp")
         menu.append("Delete", "win.delete")
         self._popup(widget, x, y, menu)
+
+    def _selection_menu(self):
+        n = len(SELECTED)
+        menu = Gio.Menu()
+        menu.append(f"Live Collage with {n} selected", "win.sel-collage")
+        menu.append_submenu(f"Add {n} selected to Collection", self._collections_menu("win.sel-add-to", "win.sel-add-new"))
+        menu.append(f"Delete {n} selected", "win.sel-delete")
+        menu.append("Clear Selection", "win.sel-clear")
+        return menu
+
+    @staticmethod
+    def _collections_menu(action, new_action):
+        add = Gio.Menu()
+        for c in library.collections():
+            mi = Gio.MenuItem.new(c.name, None)
+            mi.set_action_and_target_value(action, GLib.Variant.new_string(c.name))
+            add.append_item(mi)
+        add.append("New Collection…", new_action)
+        return add
 
     def collection_menu(self, widget, x, y, collection):
         self.ctx_collection = collection
@@ -865,6 +958,66 @@ class Window(Adw.ApplicationWindow):
         except OSError as ex:
             return self.toast(f"Couldn't add: {ex}")
         self.toast(f"Added {item.name} to {collection.name}" if added else f"Already in {collection.name}")
+        self.rescan()
+
+    # --- multi-selection ------------------------------------------------------------------------
+    def selection_changed(self):
+        n = len(SELECTED)
+        self.sel_bar.set_reveal_child(n > 0 or self.select_mode)
+        self.sel_label.set_label(f"{n} selected" if n else "Select videos")
+        for b in self.sel_btns:
+            b.set_sensitive(n > 0)
+        self.sel_add.set_menu_model(self._collections_menu("win.sel-add-to", "win.sel-add-new"))
+
+    def set_select_mode(self, on):
+        self.select_mode = on
+        if not on:
+            self.clear_selection()
+        self.selection_changed()
+
+    def clear_selection(self):
+        SELECTED.clear()
+        for t in TILES:
+            t.sync_check()
+        self.selection_changed()
+
+    def apply_select_pref(self):
+        on = library.load_config().get("select_button", True)
+        self.select_btn.set_visible(on)
+        if not on and self.select_btn.get_active():
+            self.select_btn.set_active(False)
+
+    def _sel_collage(self):
+        items = list(SELECTED.values())
+        if len(items) > 9:
+            self.toast("A collage holds 9 clips: using the first 9")
+            items = items[:9]
+        page = CollagePage(self._saved)
+        page._set_layout(COLLAGE_LAYOUT[len(items)])
+        for i, it in enumerate(items):
+            page.set_clip(i, it.motion)
+        self.nav.push(page)
+        self.set_select_mode(False)
+        self.select_btn.set_active(False)
+
+    def _sel_add_to(self, collection):
+        items, added = list(SELECTED.values()), 0
+        try:
+            for it in items:
+                added += bool(library.add_to_collection(it, collection))
+        except OSError as ex:
+            self.toast(f"Couldn't add: {ex}")
+        else:
+            self.toast(f"Added {added} of {len(items)} to {collection.name}")
+        self.clear_selection()
+        self.rescan()
+
+    def _sel_delete(self):
+        items = list(SELECTED.values())
+        for it in items:
+            library.delete_item(it)
+        self.toast(f"Moved {len(items)} items to the Trash")
+        self.clear_selection()
         self.rescan()
 
     def _add_to_new(self):
@@ -1003,6 +1156,24 @@ class Window(Adw.ApplicationWindow):
             row.connect("notify::active", toggled)
             gallery.add(row)
         page.add(gallery)
+        multi = Adw.PreferencesGroup(title="Multi-select", description="Pick several videos to make a collage "
+                                     "or add them to a collection together. Right-click a selected video for the menu.")
+        btn = Adw.SwitchRow(title="Show Select button", subtitle="The checkmark button in the gallery header",
+                            active=library.load_config().get("select_button", True))
+
+        def btn_toggled(w, _p):
+            library.set_pref("select_button", w.get_active())
+            self.apply_select_pref()
+        btn.connect("notify::active", btn_toggled)
+        multi.add(btn)
+        keys = list(SELECT_KEYS)
+        key = Adw.ComboRow(title="Hold to select", subtitle="Hold this key and click videos to add them to the selection",
+                           model=Gtk.StringList.new([v[0] for v in SELECT_KEYS.values()]))
+        key.set_selected(keys.index(library.load_config().get("select_key", "ctrl")) if
+                         library.load_config().get("select_key", "ctrl") in keys else 0)
+        key.connect("notify::selected", lambda w, _p: library.set_pref("select_key", keys[w.get_selected()]))
+        multi.add(key)
+        page.add(multi)
         perf = Adw.PreferencesGroup(title="Performance", description="Applies to previews and to saved files.")
         gpu = Adw.SwitchRow(title="GPU acceleration", active=thumbs.gpu_enabled(),
                             subtitle="Checking the graphics card…")

@@ -1,0 +1,28 @@
+{
+  "id": "b833eb78b",
+  "name": "Rebuild flatpak",
+  "command": "cd /home/montel/Documents/LinuxLivePaper && ./build-flatpak.sh 2>&1 | tail -5",
+  "status": "completed",
+  "outputPath": ".pi/tasks/01a1a4f7-ccdc-73a1-8ae9-410693c6b177-572855/b833eb78b.output",
+  "cwd": "/home/montel/Documents/LinuxLivePaper",
+  "startTime": 1793773103293,
+  "endTime": 1793773169091,
+  "exitCode": 0,
+  "signal": null,
+  "pid": 711581,
+  "bytesWritten": 229,
+  "isAgent": false,
+  "surviveReload": false,
+  "notified": true,
+  "notifyOnCompletion": true,
+  "triggerOnCompletion": true,
+  "timeoutSeconds": 1800,
+  "shellPolicy": {
+    "policy": "inherit",
+    "executable": "/bin/bash",
+    "argvPrefix": [
+      "-c"
+    ],
+    "dialect": "bash"
+  }
+}
