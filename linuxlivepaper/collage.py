@@ -173,11 +173,7 @@ def _cell_file(cell, w, h, fast, d):
     """Render (or reuse from cache dir d) one cell pass; returns (path, has_audio)."""
     key = hashlib.sha1(repr(([[k, v] for k, v in sorted(cell.items()) if k not in ("dur", "ar")],
                              os.stat(cell["src"]).st_mtime_ns, w, h, fast)).encode()).hexdigest()
-    out = Path(d, key + ".mkv")
-    if not out.exists():
-        tmp = out.with_suffix(".tmp.mkv")
-        thumbs.run(_cell_command(cell, w, h, tmp, fast))
-        os.replace(tmp, out)
+    out = thumbs.cached(Path(d, key + ".mkv"), lambda tmp: thumbs.run(_cell_command(cell, w, h, tmp, fast)))
     return str(out), effects.has_audio(out)
 
 

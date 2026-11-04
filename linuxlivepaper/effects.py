@@ -108,17 +108,12 @@ def render(src, start, end, out, opts=None, height=None, fast=False, extra=(), l
     return out
 
 
-def preview(src, start, end, opts, cache_dir, height=540, loop=False):
+def preview(src, start, end, opts, cache_dir, height=None, loop=False):
     """Cached low-res render of the selection for looping previews (`loop`: repeat a too-short source)."""
     key = hashlib.sha1(f"{src}:{os.stat(src).st_mtime_ns}:{start:.3f}:{end:.3f}:{sorted(opts.items())}:{height}:{loop}"
                        .encode())
     out = Path(cache_dir) / (key.hexdigest() + ".mp4")
-    if not out.exists():
-        out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out.with_suffix(".tmp.mp4")
-        render(src, start, end, tmp, opts, height=height, fast=True, loop=loop)
-        os.replace(tmp, out)
-    return str(out)
+    return str(thumbs.cached(out, lambda tmp: render(src, start, end, tmp, opts, height=height, fast=True, loop=loop)))
 
 
 if __name__ == "__main__":

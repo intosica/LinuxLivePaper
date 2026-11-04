@@ -16,7 +16,7 @@ from gi.repository import Adw, Gdk, GLib, GObject, Graphene, Gtk, Pango, PangoCa
 
 from . import effects, library, livemake, overlays, thumbs  # noqa: E402
 from .overlay_ui import OverlayHost  # noqa: E402
-from .widgets import CollectionRow, HoldButton  # noqa: E402
+from .widgets import CollectionRow, HoldButton, preview_quality_dropdown  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file  # noqa: E402
 
 YELLOW = (0.96, 0.76, 0.07)
@@ -410,6 +410,7 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         self.save_btn.connect("clicked", self._save)
         header = Adw.HeaderBar()
         header.pack_end(self.save_btn)
+        header.pack_start(preview_quality_dropdown())
 
         top = Gtk.Box(spacing=12, vexpand=True)
         top.append(frame)
@@ -548,10 +549,7 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
             try:
                 path = self._preview_path(s, e, opts)
                 if n > 1:  # Try it shows every repeat, like the saved file
-                    rep = Path(f"{path[:-4]}.x{n}.mp4")
-                    if not rep.exists():
-                        thumbs.repeat(path, rep, n)
-                    path = str(rep)
+                    path = str(thumbs.cached(Path(f"{path[:-4]}.x{n}.mp4"), lambda tmp: thumbs.repeat(path, tmp, n)))
                 still = thumbs.grab_frame(path, min(effects.out_time(k - s, e - s, opts),
                                                     effects.out_length(e - s, opts) - 0.05))
             except Exception:
@@ -600,9 +598,9 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
     # --- preview --------------------------------------------------------------------------------
     def _preview_path(self, s, e, opts):
         if self.overlays:
-            return overlays.preview(self.src, s, e, opts, thumbs.CACHE / "previews",
+            return overlays.preview(self.src, s, e, opts, thumbs.CACHE / "previews", height=thumbs.preview_height(),
                                     overlay_list=[dict(o) for o in self.overlays])
-        return effects.preview(self.src, s, e, opts, thumbs.CACHE / "previews")
+        return effects.preview(self.src, s, e, opts, thumbs.CACHE / "previews", height=thumbs.preview_height())
 
     def _show_frame(self, t):
         self.req += 1
@@ -612,7 +610,7 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
     def _grab(self, t, req):
         if req != self.req:  # a newer request superseded this one
             return
-        pb = thumbs.grab_frame(self.src, t, 720, effects.frame_chain(self.opts))
+        pb = thumbs.grab_frame(self.src, t, thumbs.preview_height() and 720, effects.frame_chain(self.opts))  # stills are cheap
 
         def done():
             if req == self.req and pb and self.stream is None:

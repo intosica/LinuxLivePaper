@@ -5,12 +5,16 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 import time
+import uuid
 from pathlib import Path
 
 import gi
 gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import GdkPixbuf, GLib  # noqa: E402
+
+from . import library  # noqa: E402
 
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "linuxlivepaper"
 WIDTH = 480
@@ -72,11 +76,61 @@ def lowres(src, need_w, need_h):
     return f
 
 
-@functools.cache
-def nvenc():
-    """NVIDIA hardware H.264 encoding works here (driver + ffmpeg build). LINUXLIVEPAPER_ENCODER=x264 turns it off."""
+PREVIEW_HEIGHTS = (("Full", 0), ("720p", 720), ("540p", 540), ("360p", 360), ("240p", 240))
+
+
+def preview_height():
+    """Height (px) the editor/collage *previews* are rendered at, None = the source's own size. Saved files never
+    use it. Preference "preview_height" (default 540)."""
+    return library.load_config().get("preview_height", 540) or None
+
+
+def gpu_enabled():
+    """The user's "GPU acceleration" preference (default on); LINUXLIVEPAPER_ENCODER=x264 forces CPU."""
     if os.environ.get("LINUXLIVEPAPER_ENCODER", "").lower() in ("x264", "cpu", "software"):
         return False
+    return bool(library.load_config().get("gpu", True))
+
+
+def nvenc():
+    """Encode on the GPU: wanted (preference) and NVENC works here."""
+    return gpu_enabled() and nvenc_available()
+
+
+_cache_locks, _cache_guard = {}, threading.Lock()
+
+
+def cached(out, build, tries=2):
+    """Path of `out`, built by build(tmp_path) if missing. Safe for concurrent callers (play + re-bake + Try it all
+    ask for the same file): one builds while the others wait, every attempt writes its own temp file that is renamed
+    atomically, and a failed build is retried once (a half-written or racing cache file used to fail a preview
+    until the next Play)."""
+    out = Path(out)
+    with _cache_guard:
+        lock = _cache_locks.setdefault(str(out), threading.Lock())
+    with lock:
+        for attempt in range(tries):
+            if out.exists() and probe(str(out))[0] > 0:  # a truncated/corrupt leftover is rebuilt, not trusted
+                return out
+            out.unlink(missing_ok=True)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_name(f"{out.stem}.{uuid.uuid4().hex[:8]}.tmp{out.suffix}")
+            try:
+                build(tmp)
+                os.replace(tmp, out)
+            except Exception as ex:
+                tmp.unlink(missing_ok=True)
+                log("cache build failed:", out.name, ex)
+                if attempt == tries - 1:
+                    raise
+        if out.exists() and probe(str(out))[0] > 0:
+            return out
+        raise RuntimeError("the preview render produced no playable video")
+
+
+@functools.cache
+def nvenc_available():
+    """NVIDIA hardware H.264 encoding works here (driver + ffmpeg build)."""
     try:
         return subprocess.run(["ffmpeg", "-v", "quiet", "-f", "lavfi", "-i", "color=s=256x256:d=0.1", "-c:v",
                                "h264_nvenc", "-f", "null", "-"], timeout=20).returncode == 0
@@ -206,18 +260,13 @@ def mp4_proxy(src, start=None, end=None, height=720):
     """Cached H.264 MP4 of src (optionally trimmed). Used for GIF playback (GTK's GStreamer
     player can't play GIFs) and for frame-exact looping of the editor selection."""
     out = CACHE / "proxies" / (_key(src, start, end, height) + ".mp4")
-    if out.exists():
-        return str(out)
-    out.parent.mkdir(parents=True, exist_ok=True)
     trim = (["-ss", f"{start:.3f}"] if start is not None else []) + (["-to", f"{end:.3f}"] if end is not None else [])
-    tmp = out.with_suffix(".tmp.mp4")
     _, w, h = probe(src)
     oh = min(height, h // 2 * 2)
-    run(["ffmpeg", "-v", "error", "-y", *trim, "-i", src, "-map", "0:v:0", "-map", "0:a:0?",
+    return str(cached(out, lambda tmp: run(
+        ["ffmpeg", "-v", "error", "-y", *trim, "-i", src, "-map", "0:v:0", "-map", "0:a:0?",
          "-vf", f"{SQUARE},scale=-2:'min({height},trunc(ih/2)*2)',format=yuv420p",
-         *h264(True, (w * oh // max(1, h), oh)), "-c:a", "aac", str(tmp)])
-    os.replace(tmp, out)
-    return str(out)
+         *h264(True, (w * oh // max(1, h), oh)), "-c:a", "aac", str(tmp)])))
 
 
 def repeat(src, out, n, extra=()):
@@ -254,4 +303,25 @@ if __name__ == "__main__":
         assert probe(vob)[1:] == (853, 480), probe(vob)
         assert grab_frame(vob, 0.5).get_width() == 852
         assert probe(mp4_proxy(vob))[1:] == (852, 480), probe(mp4_proxy(vob))
+        # GPU preference off -> x264 whatever the hardware; on -> NVENC only if it works here
+        real = gpu_enabled
+        globals()["gpu_enabled"] = lambda: False
+        assert h264()[1] == "libx264"
+        globals()["gpu_enabled"] = real
+        # concurrent callers for one cache file: built once, nobody fails on a shared temp file; a corrupt leftover is rebuilt
+        calls, outs = [], []
+
+        def build(tmp):
+            calls.append(1)
+            time.sleep(0.3)
+            run(["ffmpeg", "-v", "error", "-y", "-i", gif, "-pix_fmt", "yuv420p", str(tmp)])
+        target = Path(d, "c", "x.mp4")
+        ts = [threading.Thread(target=lambda: outs.append(cached(target, build))) for _ in range(4)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert len(calls) == 1 and len(outs) == 4 and probe(str(target))[0] > 0, (calls, outs)
+        target.write_bytes(b"garbage")
+        cached(target, build)
+        assert len(calls) == 2 and probe(str(target))[0] > 0
+        assert not list(Path(d, "c").glob("*.tmp.*"))
     print("thumbs ok")

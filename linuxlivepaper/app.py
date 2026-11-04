@@ -861,6 +861,27 @@ class Window(Adw.ApplicationWindow):
         row.add_suffix(change)
         group.add(row)
         page.add(group)
+        perf = Adw.PreferencesGroup(title="Performance", description="Applies to previews and to saved files.")
+        gpu = Adw.SwitchRow(title="GPU acceleration", active=thumbs.gpu_enabled(),
+                            subtitle="Checking the graphics card…")
+        gpu.connect("notify::active", lambda w, _p: library.set_pref("gpu", w.get_active()))
+        perf.add(gpu)
+
+        def probed():  # NVENC check runs ffmpeg once; keep it off the UI thread
+            ok = thumbs.nvenc_available()
+            GLib.idle_add(lambda: (gpu.set_subtitle("Encode video on the NVIDIA GPU (NVENC); off = CPU (x264)" if ok
+                                                    else "No NVIDIA hardware encoder found, the CPU is used"),
+                                   gpu.set_sensitive(ok)))
+        threading.Thread(target=probed, daemon=True).start()
+        quality = Adw.ComboRow(title="Preview size", subtitle="Smaller previews render and play faster; the editor "
+                               "and collage also have this in their header. Saving is always full quality.",
+                               model=Gtk.StringList.new([n for n, _ in thumbs.PREVIEW_HEIGHTS]))
+        cur = thumbs.preview_height() or 0
+        quality.set_selected(next((i for i, (_, h) in enumerate(thumbs.PREVIEW_HEIGHTS) if h == cur), 2))
+        quality.connect("notify::selected", lambda w, _p: library.set_pref("preview_height",
+                                                                           thumbs.PREVIEW_HEIGHTS[w.get_selected()][1]))
+        perf.add(quality)
+        page.add(perf)
         dlg.add(page)
         dlg.present(self)
 

@@ -155,6 +155,19 @@ class CollectionRow(Adw.ComboRow):
         return library.get_collection(self.names[i - 1]) if 1 <= i <= len(self.names) else None
 
 
+def preview_quality_dropdown():
+    """Header control: how big previews are rendered (smaller = faster). Saved files always use full quality."""
+    labels = [f"Preview: {n}" for n, _ in thumbs.PREVIEW_HEIGHTS]
+    dd = Gtk.DropDown(model=Gtk.StringList.new(labels), valign=Gtk.Align.CENTER, tooltip_text=(
+        "Preview size: smaller previews render and play faster. Takes effect the next time you press Play. "
+        "Saving always uses full quality."))
+    cur = thumbs.preview_height() or 0
+    dd.set_selected(next((i for i, (_, h) in enumerate(thumbs.PREVIEW_HEIGHTS) if h == cur), 2))
+    dd.connect("notify::selected", lambda w, _p: library.set_pref("preview_height",
+                                                                   thumbs.PREVIEW_HEIGHTS[w.get_selected()][1]))
+    return dd
+
+
 def folder_icon(size):
     """The desktop's own folder icon (follows the user's icon theme)."""
     return Gtk.Image(icon_name="folder", pixel_size=size)

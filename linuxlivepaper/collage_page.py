@@ -19,7 +19,7 @@ from . import collage, effects, library, livemake, overlays, thumbs  # noqa: E40
 from .editor import Timeline  # noqa: E402
 from .overlay_ui import OverlayHost  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file  # noqa: E402
-from .widgets import CollectionRow, FileBrowser, HoldButton  # noqa: E402
+from .widgets import CollectionRow, FileBrowser, HoldButton, preview_quality_dropdown  # noqa: E402
 
 PROXY_H = 360
 # Stills are grabbed uncropped (look + effect applied to the whole frame) and cropped at draw time, so dragging and
@@ -270,6 +270,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self.save_btn.connect("clicked", self._save)
         header = Adw.HeaderBar()
         header.pack_end(self.save_btn)
+        header.pack_start(preview_quality_dropdown())
         self.play_btn.set_tooltip_text("Play the collage (Space)")
 
         # the scroller caps the panel's natural width so the stage gets the spare room
@@ -718,19 +719,15 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
     def _try_path(self, c, repeat=1):
         """Cached low-res render of the whole collage: Play loops one pass, the press preview plays all repeats."""
         import hashlib
+        height = thumbs.preview_height()
         key = hashlib.sha1(repr([[
             ([[k, v] for k, v in sorted(x.items()) if k not in ("dur", "ar")] if x else None) for x in c["cells"]],
             c["layout"], c["aspect"], repeat, c["gap"], c["bg"],
             [overlays.payload(o) for o in c["overlays"]]]).encode()).hexdigest()
-        out = thumbs.CACHE / "collage" / (key + ".mp4")
-        if not out.exists():
-            out.parent.mkdir(parents=True, exist_ok=True)
-            tmp = out.with_suffix(".tmp.mp4")
-            collage.render(c, tmp, height=540, fast=True, overlays=c["overlays"], repeat=repeat,
-                           cache=thumbs.CACHE / "collage" / "cells")
-            out.unlink(missing_ok=True)
-            tmp.rename(out)
-        return str(out)
+        out = thumbs.CACHE / "collage" / (key + f"-{height or 0}.mp4")
+        return str(thumbs.cached(out, lambda tmp: collage.render(
+            c, tmp, height=height, fast=True, overlays=c["overlays"], repeat=repeat,
+            cache=thumbs.CACHE / "collage" / "cells")))
 
     def _try_press(self):
         if self.trying or not any(self.c["cells"]):

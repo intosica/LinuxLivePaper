@@ -123,20 +123,15 @@ def render(src, start, end, out, opts=None, overlays=(), height=None, fast=False
     return out
 
 
-def preview(src, start, end, opts, cache_dir, height=540, loop=True, overlay_list=()):
+def preview(src, start, end, opts, cache_dir, height=None, loop=True, overlay_list=()):
     """Cached low-res render of the selection with overlays, for the editor's looping preview."""
     import hashlib
     key = hashlib.sha1(repr((str(src), Path(src).stat().st_mtime_ns, round(start, 3), round(end, 3),
                              sorted((opts or {}).items()), height, loop, [payload(o) for o in overlay_list],
                              [o.get("id") for o in overlay_list])).encode()).hexdigest()
     out = Path(cache_dir) / (key + ".mp4")
-    if not out.exists():
-        out.parent.mkdir(parents=True, exist_ok=True)
-        tmp = out.with_suffix(".tmp.mp4")
-        render(src, start, end, tmp, opts, overlays=overlay_list, height=height, fast=True, loop=loop)
-        out.unlink(missing_ok=True)
-        tmp.rename(out)
-    return str(out)
+    return str(thumbs.cached(out, lambda tmp: render(src, start, end, tmp, opts, overlays=overlay_list, height=height,
+                                                    fast=True, loop=loop)))
 
 
 def _probe(src):
