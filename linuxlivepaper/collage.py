@@ -75,14 +75,31 @@ def set_layout(c, layout):
 
 def window(cell):
     """Source seconds the cell plays: the trim the user dragged on the timeline, else the rest of the clip."""
-    if cell.get("len"):
-        return max(0.2, float(cell["len"]))
-    return max(0.2, min(float(cell.get("dur") or 1.0) - cell["start"], MAX_WINDOW))
+    n = max(0.2, float(cell["len"])) if cell.get("len") else \
+        max(0.2, min(float(cell.get("dur") or 1.0) - cell["start"], MAX_WINDOW))
+    # reverse/bounce hold every frame in RAM: an hour-long window would eat it all
+    return min(n, MAX_WINDOW) if cell["opts"].get("direction", "forward") != "forward" else n
 
 
 def cell_length(cell):
     """Rendered seconds of one pass of the cell (after speed and bounce)."""
     return effects.out_length(window(cell), {**effects.DEFAULT, **cell["opts"]})
+
+
+def match(c, longest=True):
+    """Make every clip's rendered pass as long as the longest (or shortest) one by resizing its window; a window
+    that would run past the end of its clip slides earlier (and wraps/loops only if the clip is shorter still)."""
+    cells = [x for x in c["cells"] if x]
+    if not cells:
+        return
+    target = (max if longest else min)(cell_length(x) for x in cells)
+    for x in cells:
+        o = {**effects.DEFAULT, **x["opts"]}
+        n = max(0.2, round(target * o["speed"] / (2 if o["direction"] == "bounce" else 1), 3))
+        if abs(cell_length(x) - target) < 0.01:
+            continue
+        x["len"] = n
+        x["start"] = round(max(0.0, min(x["start"], float(x.get("dur") or n) - n)), 3)
 
 
 def duration(c):
@@ -145,8 +162,10 @@ def _cell_command(cell, w, h, out, fast):
         graph.append(f"[0:a:0]{','.join(a)}[a]")
         amap = ["-map", "[a]", "-c:a", "pcm_s16le"]
     # loop short sources (GIFs, a window past the end) so the window is always full
+    zw, zh = fit_size(cell, w, h)
+    low = ["-lowres", str(n)] if fast and (n := thumbs.lowres(cell["src"], zw, zh)) else []
     return ["ffmpeg", "-v", "error", "-y", "-stream_loop", "-1", "-ss", f"{cell['start']:.3f}",
-            "-t", f"{window(cell):.3f}", "-i", cell["src"], "-filter_complex", ";".join(graph), "-map", "[v]", *amap,
+            "-t", f"{window(cell):.3f}", *low, "-i", cell["src"], "-filter_complex", ";".join(graph), "-map", "[v]", *amap,
             *thumbs.h264(True, (w, h), 20 if fast else 12), "-r", str(FPS), str(out)]
 
 
@@ -269,4 +288,14 @@ if __name__ == "__main__":
         j = json.loads(subprocess.run([*probe, str(render(z, Path(d, "z.mp4"), height=240, fast=True))],
                                       capture_output=True, text=True).stdout)
         assert [(s["width"], s["height"]) for s in j["streams"] if s["codec_type"] == "video"] == [(240, 240)], j
+        # match lengths: 4 s clip vs 1 s bounce (2 s) vs 10 s clip at 2x (5 s)
+        m = new("3c")
+        m["cells"] = [new_cell(a), new_cell(a), new_cell(a)]
+        m["cells"][1].update(len=1.0, opts={**effects.DEFAULT, "direction": "bounce"})
+        m["cells"][2]["opts"] = {**effects.DEFAULT, "speed": 2.0}
+        match(m, longest=True)
+        assert all(abs(cell_length(x) - 4.0) < 0.02 for x in m["cells"]), [cell_length(x) for x in m["cells"]]
+        m["cells"][0].update(len=1.0)
+        match(m, longest=False)
+        assert all(abs(cell_length(x) - 1.0) < 0.02 for x in m["cells"]), [cell_length(x) for x in m["cells"]]
     print("collage ok")

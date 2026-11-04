@@ -239,9 +239,11 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self._panel_stale = False
         self.zoom_scale, self.framing_lbl, self._zoom_sync = None, None, False
         self.tick = 0
+        self.at_start = False  # after a pause every cell shows the first frame of its window, in sync
         self.canvas_live = None
         self.canvas_widget, self.trying, self._try_gen = None, False, 0
 
+        pool.submit(lambda: [thumbs.prune(thumbs.CACHE / d, 1.5e9) for d in ("collage", "previews")])
         self.canvas = CollageCanvas(self)
         self.spinner = Gtk.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, width_request=32,
                                    height_request=32)
@@ -351,6 +353,14 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         rp.set_value(c["repeat"])
         rp.connect("notify::value", lambda r, _: self._set_repeat(int(r.get_value())))
         timing.add(rp)
+        match = Adw.ActionRow(title="Match clip lengths", subtitle="Resize every clip's window to the longest or "
+                                                                    "shortest one")
+        for label, longest, tip in (("Longest", True, "Stretch shorter clips to the longest clip"),
+                                    ("Shortest", False, "Trim longer clips to the shortest clip")):
+            b = Gtk.Button(label=label, valign=Gtk.Align.CENTER, tooltip_text=tip)
+            b.connect("clicked", lambda _b, lg=longest: self._match(lg))
+            match.add_suffix(b)
+        timing.add(match)
         page.add(timing)
 
         cell = c["cells"][self.sel]
@@ -463,6 +473,13 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self.c[key] = value
         self.canvas.queue_draw()
         self.refresh(all_cells=True)  # aspect/gaps/background change every cell's framing
+
+    def _match(self, longest):
+        self.stop()
+        collage.match(self.c, longest)
+        self._rebuild_timeline()
+        self._rebuild_panel()
+        self.refresh(all_cells=True)
 
     def _set_repeat(self, n):
         self.c["repeat"] = n  # only the saved file / Try it repeat; Play loops anyway
@@ -623,6 +640,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
 
     def _set_cover(self, t):
         self.c["cover"] = t
+        self.at_start = False
         if not self.playing:
             self.refresh(all_cells=True)
 
@@ -788,7 +806,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             if not cell:
                 continue
             o = {**effects.DEFAULT, **cell["opts"]}
-            t = collage.cell_time(cell, cover)  # short clips loop
+            t = cell["start"] if self.at_start else collage.cell_time(cell, cover)  # short clips loop
             x, y, w, h = collage.rects(self.c, W, H)[i]
             crop = o["effect"] in CROP_EFFECTS
             if crop:
@@ -958,7 +976,11 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             self.stream = None
         self.video = None
         self.canvas.queue_draw()
-        if was:
+        if was:  # pause = back to the start of the yellow window, for every cell
+            self.at_start = True
+            if self.tl and self.c["cells"][self.sel]:
+                self.tl.p = self.c["cells"][self.sel]["start"]
+                self.tl.queue_draw()
             self.refresh(all_cells=True)
 
     # --- save -----------------------------------------------------------------------------------

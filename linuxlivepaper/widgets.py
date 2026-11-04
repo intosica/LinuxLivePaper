@@ -160,6 +160,16 @@ def folder_icon(size):
     return Gtk.Image(icon_name="folder", pixel_size=size)
 
 
+def _texture(pb, size):
+    """Texture for a collection icon, pre-scaled (CPU, high quality) to at most 2× the shown size: a big image
+    squeezed by the GPU on every zoom step left stray bright pixels at its edges."""
+    w, h = pb.get_width(), pb.get_height()
+    k = min(1.0, 2 * size / max(w, h))
+    if k < 1.0:
+        pb = pb.scale_simple(max(1, round(w * k)), max(1, round(h * k)), GdkPixbuf.InterpType.HYPER)
+    return Gdk.Texture.new_for_pixbuf(pb)
+
+
 def icon_widget(icon, size):
     """Collection icon: PNG/JPG/WebP/GIF, animated ones play while on screen; no/bad file -> the folder icon."""
     if not icon:
@@ -167,7 +177,8 @@ def icon_widget(icon, size):
     pic = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True)
     # The picture is an overlay on an empty size_request box: a Picture's natural size is the image's own pixel size,
     # which would otherwise override `size` (collection zoom did nothing for real, big icon files).
-    holder = Gtk.Overlay(child=Gtk.Box(width_request=size, height_request=size), halign=Gtk.Align.CENTER)
+    holder = Gtk.Overlay(child=Gtk.Box(width_request=size, height_request=size), halign=Gtk.Align.CENTER,
+                         overflow=Gtk.Overflow.HIDDEN)
     holder.add_overlay(pic)
     try:
         anim = GdkPixbuf.PixbufAnimation.new_from_file(str(icon))
@@ -175,16 +186,16 @@ def icon_widget(icon, size):
         pb = thumbs.grab_frame(str(icon), 0, size * 2)
         if pb is None:
             return folder_icon(size)
-        pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb))
+        pic.set_paintable(_texture(pb, size))
         return holder
     it = anim.get_iter(None)
-    pic.set_paintable(Gdk.Texture.new_for_pixbuf(it.get_pixbuf()))
+    pic.set_paintable(_texture(it.get_pixbuf(), size))
     if not anim.is_static_image():
         tick = [0]
 
         def step():
             it.advance(None)
-            pic.set_paintable(Gdk.Texture.new_for_pixbuf(it.get_pixbuf()))
+            pic.set_paintable(_texture(it.get_pixbuf(), size))
             tick[0] = GLib.timeout_add(max(20, it.get_delay_time()), step)
             return False
 
@@ -199,6 +210,23 @@ def icon_widget(icon, size):
         pic.connect("map", start)
         pic.connect("unmap", stop)
     return holder
+
+
+def pick_icon(win, on_pick):
+    """Image file chooser (PNG, JPG, WebP, GIF); on_pick(path). `win` must be the app window (see collection_dialog)."""
+    imgs = Gtk.FileFilter(name="Images (PNG, JPG, WebP, GIF)")
+    for m in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+        imgs.add_mime_type(m)
+    filters = Gio.ListStore(item_type=Gtk.FileFilter)
+    filters.append(imgs)
+    dlg = Gtk.FileDialog(title="Choose an icon (PNG, JPG, WebP or GIF)", filters=filters)
+
+    def done(d, res):
+        try:
+            on_pick(d.open_finish(res).get_path())
+        except GLib.Error:
+            pass
+    dlg.open(win, None, done)
 
 
 def collection_dialog(parent, on_done, collection=None):
@@ -224,23 +252,13 @@ def collection_dialog(parent, on_done, collection=None):
         clear.set_visible(bool(state["icon"]))
     show_icon()
 
-    def picked(d, res):
-        try:
-            state["icon"] = d.open_finish(res).get_path()
-        except GLib.Error:
-            return
-        state["changed"] = True
+    def picked(path):
+        state["icon"], state["changed"] = path, True
         show_icon()
-    imgs = Gtk.FileFilter(name="Images (PNG, JPG, WebP, GIF)")
-    for m in ("image/png", "image/jpeg", "image/webp", "image/gif"):
-        imgs.add_mime_type(m)
-    filters = Gio.ListStore(item_type=Gtk.FileFilter)
-    filters.append(imgs)
-    icon_dlg = Gtk.FileDialog(title="Choose an icon (PNG, JPG, WebP or GIF)", filters=filters)
     # the alert dialog is already the root of its own tree, so dlg.get_root() parents the picker to a modal dialog
     # and the file chooser stays behind it; the app window is the parent the portal wants.
     win = parent if isinstance(parent, Gtk.Window) else parent.get_root()
-    choose.connect("clicked", lambda *_: icon_dlg.open(win, None, picked))
+    choose.connect("clicked", lambda *_: pick_icon(win, picked))
     clear.connect("clicked", lambda *_: (state.update(icon=None, changed=True), show_icon()))
 
     dlg = Adw.AlertDialog(heading="Edit Collection" if collection else "New Collection", extra_child=box,

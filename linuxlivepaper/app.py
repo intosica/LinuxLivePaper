@@ -13,7 +13,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 from . import library, thumbs  # noqa: E402
 from .collage_page import CollagePage  # noqa: E402
 from .editor import EditorPage  # noqa: E402
-from .widgets import collection_dialog, icon_widget  # noqa: E402
+from .widgets import collection_dialog, icon_widget, pick_icon  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, play_stream  # noqa: E402
 
 APP_ID = "io.github.linuxlivepaper"
@@ -621,6 +621,7 @@ class Window(Adw.ApplicationWindow):
                              Gio.File.new_for_path(str(library.library_dir()))).launch(self, None, None)),
                          ("delete", self._delete_ctx), ("add-to-new", self._add_to_new),
                          ("edit-collection", lambda: self.edit_collection(self.ctx_collection)),
+                         ("change-icon", lambda: self.change_icon(self.ctx_collection)),
                          ("delete-collection", self._delete_collection)):
             act = Gio.SimpleAction(name=name)
             act.connect("activate", lambda *_a, f=fn: f())
@@ -730,6 +731,7 @@ class Window(Adw.ApplicationWindow):
     def collection_menu(self, widget, x, y, collection):
         self.ctx_collection = collection
         menu = Gio.Menu()
+        menu.append("Change Icon…", "win.change-icon")
         menu.append("Edit Collection…", "win.edit-collection")
         menu.append("Delete Collection", "win.delete-collection")
         self._popup(widget, x, y, menu)
@@ -759,6 +761,15 @@ class Window(Adw.ApplicationWindow):
 
     def open_collection(self, collection):
         self.nav.push(CollectionPage(self, collection))
+
+    def change_icon(self, collection):
+        def picked(path):
+            try:
+                library.set_collection_icon(collection, path)
+            except OSError as ex:
+                return self.toast(f"Couldn't set icon: {ex}")
+            self.rescan()
+        pick_icon(self, picked)
 
     def edit_collection(self, collection):
         def done(c):

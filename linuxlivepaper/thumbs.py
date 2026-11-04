@@ -31,6 +31,47 @@ def log(*parts):
         pass
 
 
+def prune(folder, max_bytes):
+    """Delete the oldest files under `folder` until it holds at most max_bytes (render caches only grow otherwise)."""
+    try:
+        files = sorted((f for f in Path(folder).rglob("*") if f.is_file()), key=lambda f: f.stat().st_mtime)
+        total = sum(f.stat().st_size for f in files)
+        for f in files:
+            if total <= max_bytes:
+                break
+            total -= f.stat().st_size
+            f.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+@functools.lru_cache(maxsize=64)
+def _video_info(src, mtime):
+    """(codec, coded width, coded height) of the first video stream."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                          "stream=codec_name,width,height", "-of", "csv=p=0", src], capture_output=True,
+                         text=True).stdout.strip().split(",")
+    try:
+        return out[0], int(out[1]), int(out[2])
+    except (IndexError, ValueError):
+        return "", 0, 0
+
+
+LOWRES_CODECS = {"mpeg2video", "mpeg1video", "mjpeg"}  # decoders that can decode straight to 1/2, 1/4, 1/8 size
+
+
+def lowres(src, need_w, need_h):
+    """Largest `-lowres` level (0-3) whose decoded frames are still at least need_w x need_h (0 = full size).
+    A 4K MPEG-2 cell shown at 270x480 decodes ~3x faster at 1/4 size."""
+    codec, w, h = _video_info(str(src), os.stat(src).st_mtime_ns)
+    if codec not in LOWRES_CODECS or not w:
+        return 0
+    f = 0
+    while f < 3 and (w >> (f + 1)) >= need_w and (h >> (f + 1)) >= need_h:
+        f += 1
+    return f
+
+
 @functools.cache
 def nvenc():
     """NVIDIA hardware H.264 encoding works here (driver + ffmpeg build). LINUXLIVEPAPER_ENCODER=x264 turns it off."""

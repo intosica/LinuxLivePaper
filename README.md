@@ -61,7 +61,7 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
   fill it with a video, GIF or live video; for the selected cell drag the yellow window on its timeline to choose the
   part that plays (the whole clip by default, up to 30 s; drag its ends to stretch or shrink it, *Fit* resets it), and
   set its **volume**, speed, direction, filter and effect. **The longest cell sets the collage length; shorter cells
-  loop to fill it.** *Repeat* plays the whole collage 1–10 times in the saved file. Space plays the collage,
+  loop to fill it.** **Match clip lengths** (Longest / Shortest) resizes every clip's window to the longest or shortest one. *Repeat* plays the whole collage 1–10 times in the saved file. Space plays the collage,
   *Try it* previews the saved result (with repeats), and overlays work the same as in the editor (over the whole canvas;
   clicking an empty spot selects the cell under it). Changes re-render while playing (cell passes are cached, so only
   the changed cell is re-encoded).
