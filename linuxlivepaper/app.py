@@ -581,7 +581,14 @@ class MediaGrid(Gtk.Stack):
         self.grid.connect("activate", self._activate)
         self.status = Adw.StatusPage(icon_name="camera-photo-symbolic", title=empty_title, description=empty_desc)
         self.add_named(self.status, "status")
-        self.add_named(Gtk.ScrolledWindow(child=self.grid), "grid")
+        scroll = Gtk.ScrolledWindow(child=self.grid)
+        self.add_named(scroll, "grid")
+        # iOS-style: press and drag across tiles to select (or, starting on a selected one, deselect) them all
+        drag = Gtk.GestureDrag(button=Gdk.BUTTON_PRIMARY, propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        drag.connect("drag-begin", self._drag_begin, scroll)
+        drag.connect("drag-update", self._drag_update, scroll)
+        scroll.add_controller(drag)
+        self._drag = None
 
     def load_show_prefs(self):
         cfg = library.load_config()
@@ -620,6 +627,43 @@ class MediaGrid(Gtk.Stack):
             self.win.selection_changed()
         else:
             self._open(pos)
+
+    @staticmethod
+    def _tile_under(scroll, x, y):
+        w = scroll.pick(x, y, Gtk.PickFlags.DEFAULT)
+        while w and not isinstance(w, Tile):
+            w = w.get_parent()
+        return w if w and w.obj else None
+
+    def _drag_begin(self, g, x, y, scroll):
+        self._drag = None
+        if not (self.win.select_mode or g.get_current_event_state() & select_key_mask()):
+            return
+        t = self._tile_under(scroll, x, y)
+        if t:
+            self._drag = {"start": t, "last": t, "paint": t.obj.item.path not in SELECTED, "moved": False}
+
+    def _drag_update(self, g, dx, dy, scroll):
+        d = self._drag
+        if not d:
+            return
+        ok, sx, sy = g.get_start_point()
+        t = self._tile_under(scroll, sx + dx, sy + dy)
+        if not t or t is d["last"]:
+            return
+        if not d["moved"]:  # left the first tile: it's a drag, not a click (stops the click from toggling again)
+            d["moved"] = True
+            g.set_state(Gtk.EventSequenceState.CLAIMED)
+            self._paint(d["start"], d["paint"])
+        d["last"] = t
+        self._paint(t, d["paint"])
+        self.win.selection_changed()
+
+    @staticmethod
+    def _paint(tile, on):
+        item = tile.obj.item
+        if (item.path in SELECTED) != on:
+            toggle_selected(item)
 
     def _tile_at(self, pos):
         item = self.model.get_item(pos)
