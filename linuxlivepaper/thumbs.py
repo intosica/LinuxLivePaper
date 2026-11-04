@@ -273,9 +273,12 @@ def make_thumb(item):
         else:
             pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, WIDTH, -1, True)
             pb = pb.apply_embedded_orientation() or pb
-        if pb.get_has_alpha():  # flatten for JPEG
-            pb = pb.composite_color_simple(pb.get_width(), pb.get_height(),
-                                           GdkPixbuf.InterpType.BILINEAR, 255, 16, 0x202020, 0x202020)
+        if pb.get_has_alpha():  # flatten for JPEG: composite_color_simple stays RGBA, which the flatpak's glycin JPEG encoder rejects
+            w, h = pb.get_width(), pb.get_height()
+            flat = GdkPixbuf.Pixbuf.new(GdkPixbuf.Colorspace.RGB, False, 8, w, h)
+            flat.fill(0x202020ff)
+            pb.composite(flat, 0, 0, w, h, 0, 0, 1, 1, GdkPixbuf.InterpType.BILINEAR, 255)
+            pb = flat
         tmp = out.with_suffix(".tmp")
         pb.savev(str(tmp), "jpeg", ["quality"], ["85"])
         os.replace(tmp, out)

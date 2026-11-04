@@ -157,8 +157,8 @@ class Tile(Gtk.Overlay):
         self.hovering = False
         self._hover_id = 0
         motion = Gtk.EventControllerMotion()
-        motion.connect("enter", lambda *_: self._schedule_play())
-        motion.connect("leave", lambda *_: self.stop())
+        motion.connect("enter", lambda *_: self._auto() or self._schedule_play())
+        motion.connect("leave", lambda *_: self._auto() or self.stop())
         self.add_controller(motion)
         menu = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
         menu.connect("pressed", lambda _g, _n, x, y: self.obj and on_menu(self, x, y, self.obj.item))
@@ -169,6 +169,9 @@ class Tile(Gtk.Overlay):
         self.obj = obj
         self.pic.set_paintable(obj.texture)
         self._set_badge()
+        if self._auto():
+            self.hovering = True
+            self._play()
         if obj.texture is None and not obj.loading:
             obj.loading = True
             pool.submit(self._load, obj)
@@ -207,6 +210,10 @@ class Tile(Gtk.Overlay):
                 self.pic.set_paintable(tex)
                 self._set_badge()
         GLib.idle_add(done)
+
+    def _auto(self):
+        """GIFs are cheap (no decoder), so with "Hover to play" off they just play all the time."""
+        return bool(self.obj and self.obj.item.kind == "gif" and not library.load_config().get("hover_play", True))
 
     def _schedule_play(self):
         self.hovering = True
