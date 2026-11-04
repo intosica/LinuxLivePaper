@@ -607,7 +607,7 @@ class Window(Adw.ApplicationWindow):
         header.pack_start(self.zoom_grid)
         header.pack_start(self.zoom_coll)
         menu = Gio.Menu()
-        menu.append("Library Folder…", "win.prefs")
+        menu.append("Preferences…", "win.prefs")
         menu.append("Open Library Folder", "win.open-folder")
         menu.append("Rescan", "win.rescan")
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))

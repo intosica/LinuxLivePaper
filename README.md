@@ -28,7 +28,7 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
 ## Using it
 - The gallery shows your **LinuxLivePaper folder** (default `~/Videos/LinuxLivePaper`, recursive) as an
   iOS-Photos-style grid: square tiles, edge to edge, oldest at the top and newest at the bottom.
-  Change the folder in ☰ → *Library Folder…*. Tabs at the top: **All · Live · Collections**.
+  Change the folder in ☰ → *Preferences…* (library folder, GPU acceleration, preview size). Tabs at the top: **All · Live · Collections**.
 - Use the **− / +** buttons in the header to make tiles (or, on the Collections tab, collection icons) smaller or bigger. The two
   sizes are independent and remembered between runs; long lists scroll vertically.
   Standalone photos are not shown. Use the import button to copy videos/GIFs into the folder.

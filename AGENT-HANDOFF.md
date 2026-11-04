@@ -50,7 +50,7 @@ There is **no decompiled C/pseudocode anywhere** — every finding so far is sta
 - ✅ Gallery (`linuxlivepaper/app.py`, `library.py`, `thumbs.py`): iOS-Photos-style grid (`MediaGrid`: `Square` tiles
   1 px apart, oldest first like iOS), tabs All/Live/Collections, badges, hover-to-play, right-click menu (Add to
   Collection ▸ / New Collection…, Delete — or "Remove from Collection" inside a collection), viewer (press-and-hold live with sound, no on-screen hint, video with controls, GIF, ←/→/Esc/Space),
-  import button (copies into the library), ☰ menu: Library Folder… (Adw.PreferencesDialog), Open Library Folder, Rescan.
+  import button (copies into the library), ☰ menu: Preferences… (Adw.PreferencesDialog: library folder, Performance group; was labelled "Library Folder…", users could not find the GPU/preview settings), Open Library Folder, Rescan.
   Library path persisted in `~/.config/linuxlivepaper/config.json` (`{"library": "..."}`).
 - ✅ Timeline editor (`editor.py`: `Timeline` DrawingArea + `EditorPage`), opened by **+** or the viewer's *Make Live Image*:
   overview strip, zoomable filmstrip, trim handles, movable selection, COVER marker, playhead, presets 1.5/3/5 s.
