@@ -3,7 +3,6 @@ The editor lives in editor.py, the collage maker in collage_page.py."""
 import os
 import shutil
 import threading
-import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import gi
@@ -119,20 +118,20 @@ class Square(Gtk.Widget):
         return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
 
     size = library.load_config().get("grid_zoom", TILE_DEFAULT)  # shared minimum side, set by the zoom buttons
-    live = weakref.WeakSet()
-
-    def __init__(self):
-        super().__init__()
-        Square.live.add(self)
 
     @classmethod
     def zoom(cls, size):
         cls.size = size
         library.set_pref("grid_zoom", size)
-        for sq in cls.live:
-            sq.queue_resize()
-            if sq.get_parent():
-                sq.get_parent().queue_resize()
+
+        def walk(w):  # GTK caches each widget's size, so every live Square (all pages) must be told to re-measure
+            while w:
+                if isinstance(w, Square):
+                    w.queue_resize()
+                walk(w.get_first_child())
+                w = w.get_next_sibling()
+        for win in Gtk.Window.list_toplevels():
+            walk(win)
 
     def do_measure(self, orientation, for_size):
         if orientation == Gtk.Orientation.HORIZONTAL:
