@@ -457,7 +457,7 @@ class MediaGrid(Gtk.Stack):
 
 
 class CollectionsView(Gtk.Stack):
-    """Collection cards: the custom .png icon or the system folder icon, the name and the item count."""
+    """Collection cards: the custom icon (PNG/JPG/WebP/GIF) or the system folder icon, the name and the item count."""
 
     def __init__(self, win):
         super().__init__(vexpand=True, hexpand=True)
@@ -476,16 +476,11 @@ class CollectionsView(Gtk.Stack):
         self.add_named(Gtk.ScrolledWindow(child=self.flow), "grid")
 
     def set_collections(self, rows):
-        """rows: [(Collection, item count, icon pixbuf or None)]"""
+        """rows: [(Collection, item count)]"""
         self.flow.remove_all()
-        for c, n, pb in rows:
+        for c, n in rows:
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, width_request=150)
-            if pb:
-                pic = Gtk.Picture(paintable=Gdk.Texture.new_for_pixbuf(pb), content_fit=Gtk.ContentFit.CONTAIN,
-                                  height_request=128, can_shrink=True)
-                box.append(pic)
-            else:
-                box.append(icon_widget(None, 128))
+            box.append(icon_widget(c.icon, 128))
             box.append(Gtk.Label(label=c.name, css_classes=["collection-name"], ellipsize=3, max_width_chars=18))
             box.append(Gtk.Label(label=f"{n} item{'s' if n != 1 else ''}", css_classes=["dim-label", "caption"]))
             child = Gtk.FlowBoxChild(child=box, tooltip_text=c.name)
@@ -498,18 +493,8 @@ class CollectionsView(Gtk.Stack):
 
 
 def load_collections():
-    """Worker-thread part of a collections refresh: counts and decoded icons."""
-    from gi.repository import GdkPixbuf
-    rows = []
-    for c in library.collections():
-        pb = None
-        if c.icon:
-            try:
-                pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(c.icon), 128, 128, True)
-            except GLib.Error:
-                pass
-        rows.append((c, len(c.items()), pb))
-    return rows
+    """Worker-thread part of a collections refresh: item counts."""
+    return [(c, len(c.items())) for c in library.collections()]
 
 
 class CollectionPage(Adw.NavigationPage):

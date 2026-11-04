@@ -161,18 +161,44 @@ def folder_icon(size):
 
 
 def icon_widget(icon, size):
-    if icon:
-        try:
-            pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(icon), size, size, True)
-            return Gtk.Picture(paintable=Gdk.Texture.new_for_pixbuf(pb), content_fit=Gtk.ContentFit.CONTAIN,
-                               width_request=size, height_request=size, can_shrink=True)
-        except GLib.Error:
-            pass
-    return folder_icon(size)
+    """Collection icon: PNG/JPG/WebP/GIF, animated ones play while on screen; no/bad file -> the folder icon."""
+    if not icon:
+        return folder_icon(size)
+    pic = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, width_request=size, height_request=size, can_shrink=True)
+    try:
+        anim = GdkPixbuf.PixbufAnimation.new_from_file(str(icon))
+    except GLib.Error:  # GdkPixbuf chokes on some real-world GIFs; ffmpeg can still give the first frame
+        pb = thumbs.grab_frame(str(icon), 0, size * 2)
+        if pb is None:
+            return folder_icon(size)
+        pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb))
+        return pic
+    it = anim.get_iter(None)
+    pic.set_paintable(Gdk.Texture.new_for_pixbuf(it.get_pixbuf()))
+    if not anim.is_static_image():
+        tick = [0]
+
+        def step():
+            it.advance(None)
+            pic.set_paintable(Gdk.Texture.new_for_pixbuf(it.get_pixbuf()))
+            tick[0] = GLib.timeout_add(max(20, it.get_delay_time()), step)
+            return False
+
+        def stop(*_):
+            if tick[0]:
+                GLib.source_remove(tick[0])
+                tick[0] = 0
+
+        def start(*_):
+            stop()
+            tick[0] = GLib.timeout_add(max(20, it.get_delay_time()), step)
+        pic.connect("map", start)
+        pic.connect("unmap", stop)
+    return pic
 
 
 def collection_dialog(parent, on_done, collection=None):
-    """Create or edit a collection: name + optional .png icon (falls back to the system folder icon).
+    """Create or edit a collection: name + optional icon (PNG, JPG, WebP or GIF, animated or not) (falls back to the system folder icon).
     on_done(collection) gets the created/updated library.Collection."""
     state = {"icon": collection.icon if collection else None, "changed": False}
     holder = Gtk.Box(halign=Gtk.Align.CENTER, height_request=112)
@@ -201,11 +227,12 @@ def collection_dialog(parent, on_done, collection=None):
             return
         state["changed"] = True
         show_icon()
-    png = Gtk.FileFilter(name="PNG images")
-    png.add_mime_type("image/png")
-    pngs = Gio.ListStore(item_type=Gtk.FileFilter)
-    pngs.append(png)
-    icon_dlg = Gtk.FileDialog(title="Choose a .png icon", filters=pngs)
+    imgs = Gtk.FileFilter(name="Images (PNG, JPG, WebP, GIF)")
+    for m in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+        imgs.add_mime_type(m)
+    filters = Gio.ListStore(item_type=Gtk.FileFilter)
+    filters.append(imgs)
+    icon_dlg = Gtk.FileDialog(title="Choose an icon (PNG, JPG, WebP or GIF)", filters=filters)
     # the alert dialog is already the root of its own tree, so dlg.get_root() parents the picker to a modal dialog
     # and the file chooser stays behind it; the app window is the parent the portal wants.
     win = parent if isinstance(parent, Gtk.Window) else parent.get_root()

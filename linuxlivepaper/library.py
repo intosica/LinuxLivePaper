@@ -148,7 +148,7 @@ def delete_item(item):
 
 # --- collections: <library>/collection/<Name>/ holding hard links (or copies) of items -----------------
 COLLECTIONS = "collection"
-ICON = ".icon.png"
+ICON_EXT = (".png", ".webp", ".gif", ".jpg", ".jpeg")  # stored as .icon<ext> in the collection folder
 
 
 @dataclass
@@ -158,8 +158,7 @@ class Collection:
 
     @property
     def icon(self):
-        p = self.path / ICON
-        return p if p.exists() else None
+        return next((p for e in ICON_EXT if (p := self.path / f".icon{e}").exists()), None)
 
     def items(self):
         return scan(self.path)
@@ -199,10 +198,10 @@ def create_collection(name, icon=None):
 
 
 def set_collection_icon(c, icon):
+    for e in ICON_EXT:
+        (c.path / f".icon{e}").unlink(missing_ok=True)
     if icon:
-        shutil.copyfile(icon, c.path / ICON)
-    else:
-        (c.path / ICON).unlink(missing_ok=True)
+        shutil.copyfile(icon, c.path / f".icon{Path(icon).suffix.lower()}")
 
 
 def rename_collection(c, new):

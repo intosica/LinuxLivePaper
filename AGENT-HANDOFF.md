@@ -68,7 +68,7 @@ There is **no decompiled C/pseudocode anywhere** — every finding so far is sta
   Editor side panel (Adw.PreferencesPage): Look, Motion, Press effect + "Try it" press-and-hold, Reset effects.
   Cover time is mapped through speed/direction (`effects.out_time`); playhead back via `effects.src_time`.
 - ✅ Collections (`library.Collection`, `app.CollectionsView/CollectionPage`, `widgets.collection_dialog`):
-  cards with the themed `folder` icon or the chosen PNG (stored as `.icon.png` inside the collection folder), name,
+  cards with the themed `folder` icon or the chosen PNG/JPG/WebP/GIF, animated ones play while on screen (stored as `.icon<ext>` inside the collection folder; `library.ICON_EXT`, `widgets.icon_widget` uses GdkPixbuf animations, ffmpeg first frame if GdkPixbuf fails), name,
   item count; click → the collection's grid; right-click → Edit (rename + icon) / Delete (to Trash).
   `add_to_collection` **hard-links** the files (falls back to copy), so deleting from All/Live (trash) leaves the
   collection's copy intact and vice versa. Per-item meta (press style) is copied into the collection's sidecar.
@@ -249,3 +249,4 @@ Ignore the DRI/EGL warnings under Xvfb. Never screenshot the user's real `:0` di
 - 2026-11-03: Viewer immersion pass: removed the "Press and hold to play" hint (`LiveView.hint`/`set_hint`, `.hint` CSS) and made the
   ←/→ arrows edge-hover only (`EDGE_PX`). Logo (`flatpak/io.github.linuxlivepaper.svg`) centred at the top of README. Pushed to
   https://github.com/intosica/LinuxLivePaper.git (user's GitHub is authorised on this PC). Screenshots: user will add later.
+- 2026-11-03: Collection icons accept PNG/JPG/WebP/GIF (animated or not; tested with every file in ~/Documents/GifDeck). Replacing an icon removes the old `.icon.*`.
