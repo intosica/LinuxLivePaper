@@ -27,11 +27,15 @@ def library_dir():
     return d
 
 
-def set_library_dir(path):
+def set_pref(key, value):
     cfg = load_config()
-    cfg["library"] = str(path)
+    cfg[key] = value
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
     CONFIG.write_text(json.dumps(cfg, indent=2))
+
+
+def set_library_dir(path):
+    set_pref("library", str(path))
 
 
 META = ".linuxlivepaper.json"  # per-folder sidecar: {"<stem>": {"transition": "blur", ...}}

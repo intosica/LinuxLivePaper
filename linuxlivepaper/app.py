@@ -3,6 +3,7 @@ The editor lives in editor.py, the collage maker in collage_page.py."""
 import os
 import shutil
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import gi
@@ -17,7 +18,33 @@ from .widgets import collection_dialog, icon_widget  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, play_stream  # noqa: E402
 
 APP_ID = "io.github.linuxlivepaper"
-TILE = 170        # minimum tile size; the grid stretches tiles so the columns fill the width
+TILE_SIZES = [80, 110, 140, 170, 220, 280, 360]  # minimum tile size steps; the grid stretches tiles to fill the width
+ICON_SIZES = [40, 56, 72, 96, 128, 160]          # collection card icon steps
+TILE_DEFAULT, ICON_DEFAULT = 170, 72
+
+
+def step_zoom(sizes, cur, d):
+    """Next size in `sizes` after cur (d=+1 bigger, -1 smaller); cur needn't be one of them."""
+    i = min(range(len(sizes)), key=lambda k: abs(sizes[k] - cur))
+    return sizes[max(0, min(len(sizes) - 1, i + d))]
+
+
+def zoom_box(sizes, get, apply):
+    """Linked [−][+] buttons: apply(new_size) is called on a step; buttons grey out at the ends."""
+    box = Gtk.Box(css_classes=["linked"])
+    btns = []
+    for icon, d, tip in (("list-remove-symbolic", -1, "Smaller"), ("list-add-symbolic", 1, "Bigger")):
+        b = Gtk.Button(icon_name=icon, tooltip_text=tip)
+        b.connect("clicked", lambda _b, d=d: (apply(step_zoom(sizes, get(), d)), sync()))
+        box.append(b)
+        btns.append(b)
+
+    def sync():
+        btns[0].set_sensitive(get() > sizes[0])
+        btns[1].set_sensitive(get() < sizes[-1])
+    sync()
+    box.connect("map", lambda *_: sync())  # the other page may have changed the value
+    return box
 TABS = [("All", None), ("Live", "live"), ("Collections", "collections")]
 CSS = """
 gridview.photos, gridview.photos > child { padding: 0; margin: 0; border-radius: 0; background: none; }
@@ -91,10 +118,26 @@ class Square(Gtk.Widget):
     def do_get_request_mode(self):
         return Gtk.SizeRequestMode.HEIGHT_FOR_WIDTH
 
+    size = library.load_config().get("grid_zoom", TILE_DEFAULT)  # shared minimum side, set by the zoom buttons
+    live = weakref.WeakSet()
+
+    def __init__(self):
+        super().__init__()
+        Square.live.add(self)
+
+    @classmethod
+    def zoom(cls, size):
+        cls.size = size
+        library.set_pref("grid_zoom", size)
+        for sq in cls.live:
+            sq.queue_resize()
+            if sq.get_parent():
+                sq.get_parent().queue_resize()
+
     def do_measure(self, orientation, for_size):
         if orientation == Gtk.Orientation.HORIZONTAL:
-            return TILE, TILE, -1, -1
-        side = for_size if for_size > 0 else TILE
+            return self.size, self.size, -1, -1
+        side = for_size if for_size > 0 else self.size
         return side, side, -1, -1
 
 
@@ -461,9 +504,10 @@ class CollectionsView(Gtk.Stack):
 
     def __init__(self, win):
         super().__init__(vexpand=True, hexpand=True)
-        self.win = win
+        self.win, self.rows = win, []
+        self.icon = library.load_config().get("collections_zoom", ICON_DEFAULT)
         self.flow = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, min_children_per_line=2,
-                                max_children_per_line=10, column_spacing=6, row_spacing=6, valign=Gtk.Align.START,
+                                max_children_per_line=40, column_spacing=6, row_spacing=6, valign=Gtk.Align.START,
                                 margin_start=18, margin_end=18, margin_top=18, margin_bottom=18,
                                 css_classes=["collections"], activate_on_single_click=True)
         self.flow.connect("child-activated", lambda _f, child: win.open_collection(child.collection))
@@ -475,13 +519,19 @@ class CollectionsView(Gtk.Stack):
         self.add_named(self.status, "status")
         self.add_named(Gtk.ScrolledWindow(child=self.flow), "grid")
 
+    def zoom(self, size):
+        self.icon = size
+        library.set_pref("collections_zoom", size)
+        self.set_collections(self.rows)
+
     def set_collections(self, rows):
         """rows: [(Collection, item count)]"""
+        self.rows = rows
         self.flow.remove_all()
         for c, n in rows:
-            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, width_request=150)
-            box.append(icon_widget(c.icon, 128))
-            box.append(Gtk.Label(label=c.name, css_classes=["collection-name"], ellipsize=3, max_width_chars=18))
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, width_request=self.icon + 22)
+            box.append(icon_widget(c.icon, self.icon))
+            box.append(Gtk.Label(label=c.name, css_classes=["collection-name"], ellipsize=3, max_width_chars=max(8, self.icon // 6)))
             box.append(Gtk.Label(label=f"{n} item{'s' if n != 1 else ''}", css_classes=["dim-label", "caption"]))
             child = Gtk.FlowBoxChild(child=box, tooltip_text=c.name)
             child.collection = c
@@ -497,6 +547,10 @@ def load_collections():
     return [(c, len(c.items())) for c in library.collections()]
 
 
+def grid_zoom():
+    return zoom_box(TILE_SIZES, lambda: Square.size, Square.zoom)
+
+
 class CollectionPage(Adw.NavigationPage):
     def __init__(self, win, collection):
         super().__init__(title=collection.name)
@@ -507,6 +561,7 @@ class CollectionPage(Adw.NavigationPage):
         edit = Gtk.Button(icon_name="document-edit-symbolic", tooltip_text="Rename or change the icon")
         edit.connect("clicked", lambda *_: win.edit_collection(self.collection))
         header.pack_end(edit)
+        header.pack_start(grid_zoom())
         tv = Adw.ToolbarView(content=self.grid)
         tv.add_top_bar(header)
         self.set_child(tv)
@@ -548,6 +603,10 @@ class Window(Adw.ApplicationWindow):
         imp = Gtk.Button(icon_name="document-open-symbolic", tooltip_text="Import videos and GIFs into the library")
         imp.connect("clicked", self._import)
         header.pack_start(imp)
+        self.zoom_grid, self.zoom_coll = grid_zoom(), zoom_box(ICON_SIZES, lambda: self.collections_view.icon,
+                                                                self.collections_view.zoom)
+        header.pack_start(self.zoom_grid)
+        header.pack_start(self.zoom_coll)
         menu = Gio.Menu()
         menu.append("Library Folder…", "win.prefs")
         menu.append("Open Library Folder", "win.open-folder")
@@ -622,6 +681,8 @@ class Window(Adw.ApplicationWindow):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
 
     def _set_tab(self, kind):
+        self.zoom_grid.set_visible(kind != "collections")  # each tab has its own saved zoom
+        self.zoom_coll.set_visible(kind == "collections")
         if kind == "collections":
             self.stack.set_visible_child_name("collections")
         else:
