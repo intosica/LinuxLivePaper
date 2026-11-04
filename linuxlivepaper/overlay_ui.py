@@ -133,17 +133,16 @@ class OverlayGroup(Adw.PreferencesGroup):
     """The overlay controls: add, pick, size, opacity, rotation, style, time window, remove."""
 
     def __init__(self, host, title="Overlays"):
-        super().__init__(title=title, description="Text and stickers drawn over the preview. Drag them to move, "
-                                                 "scroll to resize.")
+        super().__init__(title=title, description="Drag to move, scroll to resize.")
         self.host = host
         self._syncing = False
-        buttons = Gtk.Box(spacing=6)
+        buttons = Gtk.Box(spacing=12, valign=Gtk.Align.CENTER)  # beside the title, clear of the list below
         for label, icon, fn in (("Text", "insert-text-symbolic", host.add_text),
                                 ("Sticker", "insert-image-symbolic", host.add_sticker)):
-            b = Gtk.Button(label=label, icon_name=icon, hexpand=True)
+            b = Gtk.Button(child=Adw.ButtonContent(label=label, icon_name=icon))
             b.connect("clicked", lambda _b, f=fn: f())
             buttons.append(b)
-        self.add(buttons)
+        self.set_header_suffix(buttons)
 
         self.combo = Adw.ComboRow(title="Selected")
         self.combo.connect("notify::selected", lambda r, _: self._pick(r.get_selected()))
@@ -176,9 +175,10 @@ class OverlayGroup(Adw.PreferencesGroup):
         self.end_row.connect("notify::value", lambda r, _: self._edge("end", r.get_value()))
         self.add(self.end_row)
 
-        rm = Gtk.Button(label="Remove overlay", halign=Gtk.Align.CENTER, css_classes=["destructive-action", "pill"])
-        rm.connect("clicked", lambda *_: host.remove_overlay())
-        self.add(rm)
+        self.rm = Gtk.Button(label="Remove overlay", halign=Gtk.Align.CENTER, margin_top=18, margin_bottom=6,
+                             css_classes=["destructive-action", "pill"])
+        self.rm.connect("clicked", lambda *_: host.remove_overlay())
+        self.add(self.rm)
 
     def _scale(self, title, low, high, step, key):
         row = Adw.ActionRow(title=title)
@@ -244,6 +244,7 @@ class OverlayGroup(Adw.PreferencesGroup):
             self.combo.set_selected(self.host.ov_sel)
         self._syncing = False
         o = self.host.overlay()
+        self.rm.set_visible(bool(o))
         is_text = bool(o) and o["kind"] == "text"
         for row in (self.size_row, self.opacity_row, self.rot_row, self.outline_row, self.whole_row):
             row.set_visible(bool(o))

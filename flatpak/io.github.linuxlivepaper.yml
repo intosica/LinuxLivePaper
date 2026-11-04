@@ -49,6 +49,7 @@ modules:
       - --enable-libfreetype
       - --enable-libharfbuzz
       - --enable-libfontconfig
+      - --enable-libwebp  # animated WebP export; libwebp + libwebpmux ship in the GNOME runtime
       - --enable-ffnvcodec
       - --enable-nvenc
       - --enable-static

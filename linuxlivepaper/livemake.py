@@ -6,7 +6,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import effects, overlays as ov
+from . import effects, overlays as ov, thumbs
 from .library import library_dir
 
 
@@ -46,7 +46,7 @@ def live_tags():
 
 
 def still(mov, t, jpg):
-    subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", str(mov),
+    subprocess.run([*thumbs.NICE, "ffmpeg", "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", str(mov),
                     "-frames:v", "1", "-q:v", "2", str(jpg)], check=True)
 
 

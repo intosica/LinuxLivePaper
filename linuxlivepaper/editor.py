@@ -12,12 +12,12 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Adw, Gdk, GLib, GObject, Graphene, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango, PangoCairo  # noqa: E402
 
-from . import effects, library, livemake, overlays, thumbs  # noqa: E402
+from . import effects, export, library, livemake, overlays, thumbs  # noqa: E402
 from .overlay_ui import OverlayHost  # noqa: E402
 from .widgets import CollectionRow, HoldButton, preview_quality_dropdown  # noqa: E402
-from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file  # noqa: E402
+from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, release  # noqa: E402
 
 YELLOW = (0.96, 0.76, 0.07)
 SELECT = Gdk.RGBA()
@@ -41,6 +41,7 @@ def fmt(t, fine=True):
 
 
 _FILM_STRIP = ThreadPoolExecutor(max_workers=3)  # one pool for every timeline: a pool per instance piled threads up
+_STRIPS = {}  # src → {t: pixbuf}, shared by every timeline of that clip (the collage rebuilds its timeline a lot)
 
 
 class Timeline(Gtk.DrawingArea):
@@ -56,7 +57,11 @@ class Timeline(Gtk.DrawingArea):
         self.k = (self.s + self.e) / 2
         span = self.D if self.D <= 60 else 30.0
         self.v0, self.v1 = 0.0, span
-        self.frames, self.wanted = {}, set()
+        self.frames = _STRIPS.pop(src, None) or {}
+        _STRIPS[src] = self.frames  # most recent last
+        while len(_STRIPS) > 6:
+            _STRIPS.pop(next(iter(_STRIPS)))
+        self.wanted = set()
         self.pool = _FILM_STRIP
         self.mode, self.mx = None, 0.0
         self.set_draw_func(self._draw)
@@ -203,7 +208,7 @@ class Timeline(Gtk.DrawingArea):
     def _load(self, t):
         if t not in self.wanted:  # scrolled away before we got to it
             return
-        pb = thumbs.grab_frame(self.src, t, ST_H * 2)
+        pb = thumbs.grab_frame(self.src, t, ST_H * 2, key=True)
 
         def done():
             self.wanted.discard(t)
@@ -356,8 +361,11 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         dur, vw, vh = thumbs.probe(src)
         self.D = dur or 1.0
         self.preview_pool = ThreadPoolExecutor(max_workers=1)
-        self.req = 0
+        self.req = self.play_req = 0
         self.stream, self.tick, self.proxies = None, 0, set()
+        # The source, opened (prerolled, paused) up front so a direct Play only has to seek: building a fresh
+        # pipeline on Play (demuxer + GPU decoder start-up) took 1–3 s. Kept after Stop for the next Play.
+        self.warm = None if src.lower().endswith(".gif") else media_file(src, muted=False, loop=True)
         self.opts = dict(effects.DEFAULT)
         self.style = DEFAULT_STYLE
         self.repeat = 1  # times the clip plays back to back in the saved file
@@ -406,10 +414,23 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
             "Drag the yellow handles to trim · drag inside the selection to move it · drag COVER to pick the still · "
             "click to move the playhead · scroll to zoom, Shift+scroll to pan · drag the top bar to jump around"))
 
-        self.save_btn = Gtk.Button(label=self.SAVE_LABEL, css_classes=["suggested-action"])
+        menu = Gio.Menu()
+        menu.append("Save as GIF…", "export.gif")
+        menu.append("Save as WebP…", "export.webp")
+        self.save_btn = Adw.SplitButton(label=self.SAVE_LABEL, menu_model=menu, css_classes=["suggested-action"],
+                                        tooltip_text="Save as a live image · arrow: GIF / WebP for sharing")
         self.save_btn.connect("clicked", self._save)
+        group = Gio.SimpleActionGroup()
+        for fmt in ("gif", "webp"):
+            act = Gio.SimpleAction(name=fmt)
+            act.connect("activate", lambda *_, f=fmt: self._export(f))
+            group.add_action(act)
+        self.insert_action_group("export", group)
+        collage_btn = Gtk.Button(label="Create Collage", tooltip_text="Open a 4-video collage with this clip in every cell")
+        collage_btn.connect("clicked", lambda *_: self._collage())
         header = Adw.HeaderBar()
         header.pack_end(self.save_btn)
+        header.pack_end(collage_btn)
         header.pack_start(preview_quality_dropdown())
 
         top = Gtk.Box(spacing=12, vexpand=True)
@@ -625,33 +646,63 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         s, e, opts = self.tl.s, self.tl.e, dict(self.opts)
         self.spinner.start()
         self.play_btn.set_icon_name("media-playback-pause-symbolic")
-        req = self.req = self.req + 1
+        self.req += 1
+        req = self.play_req = self.play_req + 1
+        # Nothing to bake (no look/effect/speed/direction/overlay): play the source itself — instant, hardware-
+        # decoded by GStreamer, no ffmpeg at all. The tick loops it inside the selection.
+        direct = opts == effects.DEFAULT and not self.overlays and not self.src.lower().endswith(".gif")
 
         def work():
-            try:
-                path = self._preview_path(s, e, opts)
-            except Exception:
-                path = None
+            with thumbs.BAKE_LOCK:
+                if req != self.play_req:  # superseded (stopped or re-baked) while queued: don't render
+                    return
+                try:
+                    path = self._preview_path(s, e, opts)
+                except Exception:
+                    path = None
             GLib.idle_add(start, path)
 
         def start(path):
+            if req != self.play_req:  # stale: a newer play (or a stop) owns the UI now
+                return
             self.spinner.stop()
-            if req != self.req or not path:
+            if not path:
                 return self.stop()
-            self.proxies.add(path)
+            if not direct:
+                self.proxies.add(path)  # cleaned up on close — never the source itself
             self.ov_layer_on = False
             self.layer.set_visible(False)
-            self.stream = media_file(path, muted=False, loop=True)
-            hid = self.stream.connect("invalidate-contents", lambda st: (st.disconnect(hid), self.pic.set_paintable(st)))
-            self.stream.play()
-            self.tick = GLib.timeout_add(40, self._on_tick, s, e - s, opts)
+            st, self.warm = (self.warm, None) if direct and self.warm else (media_file(path, muted=False, loop=True), self.warm)
+            self.stream, self.direct = st, direct
+
+            def first_frame(st):
+                if direct and (st.is_seeking() or st.get_timestamp() / 1e6 < s - 0.5):
+                    return  # still on frame 0, before the seek to the selection landed
+                st.disconnect(hid)
+                self.pic.set_paintable(st)
+            hid = st.connect("invalidate-contents", first_frame)
+            if direct and st.is_prepared():
+                st.seek(int(s * 1e6))  # the warm stream sits wherever the last play stopped
+            elif direct and s > 0:
+                st.connect("notify::prepared", lambda st, _: st.is_prepared() and st.seek(int(s * 1e6)))
+            st.play()
+            self.tick = GLib.timeout_add(40, self._on_tick, s, e - s, opts, direct)
+        if direct:
+            return start(self.src)
         threading.Thread(target=work, daemon=True).start()
 
-    def _on_tick(self, s, length, opts):
+    def _on_tick(self, s, length, opts, direct=False):
         if not self.stream:
             self.tick = 0
             return False
-        self.tl.p = s + effects.src_time(self.stream.get_timestamp() / 1e6, length, opts)
+        st = self.stream
+        if direct:
+            ts = st.get_timestamp() / 1e6
+            if st.is_prepared() and not st.is_seeking() and (ts >= s + length or ts < s - 0.25):
+                st.seek(int(s * 1e6))  # loop the selection
+            self.tl.p = min(max(ts, s), s + length)
+        else:
+            self.tl.p = s + effects.src_time(st.get_timestamp() / 1e6, length, opts)
         self.tl.queue_draw()
         self._update_label()
         return True
@@ -659,13 +710,18 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
     def stop(self):
         self._try_done()
         self.req += 1
+        self.play_req += 1
         self.spinner.stop()
         self.play_btn.set_icon_name("media-playback-start-symbolic")
         if self.tick:
             GLib.source_remove(self.tick)
             self.tick = 0
         if self.stream:
-            self.stream.set_playing(False)
+            if self.direct and not self.warm:
+                self.stream.set_playing(False)
+                self.warm = self.stream
+            else:
+                release(self.stream)
             self.stream = None
             self._show_frame(self.tl.p)
         self.ov_layer_on = True
@@ -673,6 +729,9 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
 
     def _cleanup(self):
         self.stop()
+        if self.warm:
+            self.warm.clear()
+            self.warm = None
         for p in self.proxies:
             try:
                 os.unlink(p)
@@ -725,6 +784,26 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
             return False
         return True
 
+    # --- collage + GIF/WebP export ---------------------------------------------------------------
+    def _collage(self):
+        from .collage_page import CollagePage  # collage_page imports this module
+        self.stop()
+        page = CollagePage(self.on_saved)
+        page.fill_all(self.src, self.tl.s, self.tl.e - self.tl.s, self.opts, self.style)
+        self.get_ancestor(Adw.NavigationView).push(page)
+
+    def _export(self, fmt):
+        """GIF/WebP of the clip exactly as it would be saved (looks, effects, overlays)."""
+        self.stop()
+        a, b, k, opts = self.tl.s, self.tl.e, self.tl.k, dict(self.opts)
+        ovs = [dict(o) for o in self.overlays]
+        export.save_as(self, fmt, self.src, lambda tmp: livemake.make_live(
+            self.src, a, b, k - a, out_dir=tmp, opts=opts, overlay_list=ovs)[1], self._busy)
+
+    def _busy(self, on):
+        self.save_btn.set_sensitive(not on)
+        self.save_btn.set_label("Exporting…" if on else self.SAVE_LABEL)
+
     # --- save -----------------------------------------------------------------------------------
     def _save(self, _b):
         self.stop()
@@ -736,10 +815,10 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
 
         def work():
             try:
-                res, err = livemake.make_live(self.src, s, e, k - s, opts=opts, overlay_list=ovs, repeat=n), None
+                # straight into the collection folder when one is picked: one copy on disk, All reads the subfolders
+                res, err = livemake.make_live(self.src, s, e, k - s, out_dir=col.path if col else None, opts=opts,
+                                              overlay_list=ovs, repeat=n), None
                 library.set_meta(res[0], transition=style)
-                if col:
-                    library.add_to_collection(library.Item("live", str(res[0]), str(res[1]), 0), col)
             except Exception as ex:  # surfaced as a toast
                 res, err = None, str(ex)
             GLib.idle_add(self.on_saved, self, res, err)

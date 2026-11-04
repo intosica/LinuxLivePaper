@@ -115,7 +115,7 @@ def render(src, start, end, out, opts=None, overlays=(), height=None, fast=False
     body = f"{base};" + ";".join(steps) if steps else base
     if steps:
         body += f";[{label}]format=yuv420p[fin]"
-    cmd = ["ffmpeg", "-v", "error", "-y", *trim, "-i", str(src), *ov_inputs, "-filter_complex", body,
+    cmd = ["ffmpeg", "-v", "error", "-y", *trim, *thumbs.hwdec(src, height and not effects.frame_chain(opts) and (W, H)), "-i", str(src), *ov_inputs, "-filter_complex", body,
            "-map", "[fin]" if steps else "[vout]",
            *(["-map", "[aout]", "-c:a", "aac"] if audio else []),
            *thumbs.h264(fast, (W, H)), *extra, str(out)]

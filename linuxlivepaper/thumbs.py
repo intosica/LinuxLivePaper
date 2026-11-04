@@ -4,6 +4,7 @@ import functools
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -21,6 +22,12 @@ WIDTH = 480
 # square the pixels first: DVD/VOB video is often anamorphic (720x480 shown as 16:9), and filters/pixbufs ignore SAR
 SQUARE = "scale=trunc(iw*sar/2)*2:ih,setsar=1"
 LOG = CACHE / "log.txt"
+# Every ffmpeg runs at the lowest CPU priority: a 4K cell render can keep all cores busy for seconds, and at normal
+# priority that starved the desktop (audio pops/lag in other apps). Niced, it only uses CPU nobody else wants.
+NICE = ["nice", "-n", "19"] if shutil.which("nice") else []
+# One preview bake at a time: each edit while playing used to start another full render on top of the unfinished
+# ones. Holders re-check that they are still the latest request after acquiring it and skip if not.
+BAKE_LOCK = threading.Lock()
 
 
 def log(*parts):
@@ -149,8 +156,37 @@ def h264(fast=True, size=None, q=None):
     return ["-c:v", "libx264", "-preset", "ultrafast" if fast else "faster", "-crf", str(q)]
 
 
+HWDEC_CODECS = {"h264", "hevc", "vp9", "av1"}  # NVDEC wins here; MPEG-2 measured slower (and uses -lowres instead)
+
+
+def hwdec(src, cover=None):
+    """Input args that decode src on the GPU (NVDEC) when GPU acceleration is on. cover=(w, h): the frames only need
+    to cover that size, so NVDEC also downscales them on the GPU (cuvid -resize) and the CPU never touches a full-size
+    frame. 4K H.264 → 480x270, 20 s: 9.1 CPU-s with -hwaccel cuda, 1.4 with -resize (48 on the CPU alone)."""
+    if not nvenc():  # same switch + NVIDIA check as encoding
+        return []
+    codec, cw, ch = _video_info(str(src), os.stat(src).st_mtime_ns)
+    if codec not in HWDEC_CODECS:
+        return []
+    if cover and cw and ch:
+        dw = probe(str(src))[1] or cw
+        f = max(cover[0] / dw, cover[1] / ch)
+        if f < 0.95:
+            return ["-c:v", f"{codec}_cuvid", "-resize", f"{max(2, round(cw * f / 2) * 2)}x{max(2, round(ch * f / 2) * 2)}"]
+    return ["-hwaccel", "cuda"]
+
+
 def _software(cmd):
-    """cmd with an NVENC encoder swapped back to libx264 (busy GPU, too many sessions, odd size)."""
+    """cmd with GPU decode dropped and an NVENC encoder swapped back to libx264 (busy GPU, too many sessions, odd
+    size)."""
+    if "-hwaccel" in cmd:
+        i = cmd.index("-hwaccel")
+        cmd = cmd[:i] + cmd[i + 2:]
+    if "-resize" in cmd:  # ["-c:v", "<codec>_cuvid", "-resize", "WxH"] in front of -i
+        i = cmd.index("-resize")
+        cmd = cmd[:i - 2] + cmd[i + 2:]
+    if "h264_nvenc" not in cmd:
+        return cmd
     i = cmd.index("h264_nvenc")
     q = cmd[cmd.index("-cq") + 1]
     return cmd[:i - 1] + ["-c:v", "libx264", "-preset", "faster", "-crf", q] + cmd[i + 9:]  # keeps -pix_fmt
@@ -159,10 +195,10 @@ def _software(cmd):
 def run(cmd, timeout=600):
     """Like subprocess.run(check=True), but the failure message is ffmpeg's own last line (shown in the UI).
     A failed GPU encode is retried once on the CPU."""
-    p = subprocess.run(cmd, capture_output=True, timeout=timeout)
-    if p.returncode and "h264_nvenc" in cmd:
-        log("nvenc failed, retrying with x264:", p.stderr.decode("utf-8", "replace").strip()[-300:])
-        p = subprocess.run(_software(cmd), capture_output=True, timeout=timeout)
+    p = subprocess.run(NICE + cmd, capture_output=True, timeout=timeout)
+    if p.returncode and ("h264_nvenc" in cmd or "-hwaccel" in cmd or "-resize" in cmd):
+        log("GPU ffmpeg failed, retrying on the CPU:", p.stderr.decode("utf-8", "replace").strip()[-300:])
+        p = subprocess.run(NICE + _software(cmd), capture_output=True, timeout=timeout)
     if p.returncode:
         err = p.stderr.decode("utf-8", "replace").strip().splitlines()
         raise RuntimeError(err[-1] if err else f"ffmpeg exited {p.returncode}")
@@ -193,21 +229,23 @@ def video_duration(src):
     return probe(src)[0]
 
 
-def grab_frame(src, t, height=None, chain=""):
+def grab_frame(src, t, height=None, chain="", key=False):
     """Frame at t seconds as a GdkPixbuf (or None), optionally through an ffmpeg filter chain.
 
+    key: nearest keyframe at/before t instead of the exact frame (filmstrips) — skips decoding up to t, ~6× cheaper.
     Seeking to the very last frame of a file yields nothing, so fall back a little when the exact time is empty."""
     at = max(0.0, t)
     for back in (0.0, 0.2, 0.6):
-        pb = _frame_at(src, max(0.0, at - back), height, chain)
+        pb = _frame_at(src, max(0.0, at - back), height, chain, key)
         if pb is not None:
             return pb
-    return _frame_at(src, 0.0, height, chain) if at else None
+    return _frame_at(src, 0.0, height, chain, key) if at else None
 
 
-def _frame_at(src, t, height=None, chain=""):
+def _frame_at(src, t, height=None, chain="", key=False):
     vf = ["-vf", ",".join(c.strip(",") for c in (SQUARE, chain, f"scale=-2:{height}" if height else "") if c.strip(","))]
-    png = subprocess.run(["ffmpeg", "-v", "error", "-ss", f"{t:.3f}", "-i", src, "-frames:v", "1", *vf,
+    seek = ["-skip_frame", "nokey", "-noaccurate_seek"] if key else ["-threads", "2"]  # 2 threads: less CPU, as fast
+    png = subprocess.run([*NICE, "ffmpeg", "-v", "error", *seek, "-ss", f"{t:.3f}", "-i", src, "-frames:v", "1", *vf,
                           "-f", "image2pipe", "-c:v", "png", "-"], capture_output=True, timeout=60).stdout
     if not png:
         return None
@@ -223,13 +261,13 @@ def _frame_at(src, t, height=None, chain=""):
 def make_thumb(item):
     """Cached JPEG thumbnail path for a gallery Item, or None."""
     src = item.path
-    out = CACHE / "thumbs" / (_key(src) + ".jpg")
+    out = CACHE / "thumbs" / (_key(src, "mid") + ".jpg")  # "mid": frame at 50%, not the old ~1 s
     if out.exists():
         return str(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
         if item.kind != "live":  # video or GIF (GdkPixbuf's GIF loader chokes on many real-world GIFs)
-            pb = grab_frame(src, min(1.0, video_duration(src) / 2), None)
+            pb = grab_frame(src, video_duration(src) / 2, None)
             pb = pb.scale_simple(WIDTH, max(1, pb.get_height() * WIDTH // pb.get_width()),
                                  GdkPixbuf.InterpType.BILINEAR)
         else:
@@ -297,6 +335,9 @@ if __name__ == "__main__":
         assert _software(nv) == ["ffmpeg", "-i", "x", "-c:v", "libx264", "-preset", "faster", "-crf", "19", "-pix_fmt",
                                 "yuv420p", "out.mp4"]
         assert h264(size=(96, 160))[1] == "libx264"
+        assert _software(["ffmpeg", "-ss", "1", "-c:v", "h264_cuvid", "-resize", "480x270", "-i", "x", "o.mkv"]) == \
+            ["ffmpeg", "-ss", "1", "-i", "x", "o.mkv"]
+        assert _software(["ffmpeg", "-hwaccel", "cuda", "-i", "x", "o.mkv"]) == ["ffmpeg", "-i", "x", "o.mkv"]
         vob = os.path.join(d, "dvd.vob")  # anamorphic 16:9 DVD: 720x480 storage, 32:27 pixels
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=720x480:d=1", "-f", "lavfi",
                         "-i", "sine=d=1", "-target", "ntsc-dvd", "-aspect", "16:9", vob], check=True)

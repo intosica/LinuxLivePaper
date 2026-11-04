@@ -1,10 +1,11 @@
 """Media streams + the live-image canvas with the press-to-play "immersive" transition."""
 import math
+import os
 
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Graphene", "1.0")
-from gi.repository import Graphene, Gtk  # noqa: E402
+from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gtk  # noqa: E402
 
 # Press transition knobs (tune by feel).
 T_IN, T_OUT = 0.55, 0.40   # seconds to go still→video and back
@@ -37,6 +38,57 @@ def media_file(path, muted=True, loop=False):
             s.set_muted(want)
     m.connect("notify::prepared", prepared)
     return m
+
+
+GIF_MAX_BYTES = 40_000_000  # GdkPixbuf keeps every decoded frame in RAM: bigger GIFs stay a still
+
+
+class GifPlay:
+    """Plays a GIF into a Gtk.Picture with GdkPixbuf alone — no ffmpeg proxy, no GStreamer pipeline, no GPU decoder.
+    Same set_playing/clear surface as a media stream, so release() drops it like one."""
+
+    def __init__(self, anim, picture):
+        self.picture, self.it, self.id = picture, anim.get_iter(None), 0
+        self._show()
+
+    @staticmethod
+    def load(path):
+        """GdkPixbuf.PixbufAnimation or None (too big / unreadable). Safe off the main thread."""
+        try:
+            if os.path.getsize(path) > GIF_MAX_BYTES:
+                return None
+            return GdkPixbuf.PixbufAnimation.new_from_file(path)
+        except (OSError, GLib.Error):
+            return None
+
+    def _show(self):
+        self.picture.set_paintable(Gdk.Texture.new_for_pixbuf(self.it.get_pixbuf()))
+        d = self.it.get_delay_time()
+        if d >= 0:  # -1 = a still image
+            self.id = GLib.timeout_add(max(20, d), self._next)
+
+    def _next(self):
+        self.id = 0
+        self.it.advance(None)
+        self._show()
+        return False
+
+    def set_playing(self, on):
+        if not on and self.id:
+            GLib.source_remove(self.id)
+            self.id = 0
+
+    def clear(self):
+        self.set_playing(False)
+
+
+def release(m):
+    """Really free a stream. set_playing(False) only pauses: the GStreamer pipeline (and its NVDEC decoder, VRAM and
+    GPU channel) lives until the object dies, and Python closures keep it alive. Leaking these exhausted the NVIDIA
+    driver's channels and froze the desktop."""
+    if m is not None:
+        m.set_playing(False)
+        m.clear()
 
 
 def play_stream(path, picture, muted=True, loop=True):
@@ -99,7 +151,7 @@ class LiveCanvas(Gtk.Widget):
 
     def _drop_stream(self):
         if self.stream:
-            self.stream.set_playing(False)
+            release(self.stream)
             self.stream = None
 
     def _animate_to(self, target):

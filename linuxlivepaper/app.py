@@ -1,8 +1,10 @@
 """LinuxLivePaper GTK4/libadwaita app: iOS-Photos-style gallery (All · Live · Collections) + viewer.
 The editor lives in editor.py, the collage maker in collage_page.py."""
+import math
 import os
 import shutil
 import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
 import gi
@@ -10,11 +12,11 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
-from . import library, thumbs  # noqa: E402
+from . import effects, export, library, thumbs  # noqa: E402
 from .collage_page import CollagePage  # noqa: E402
 from .editor import EditorPage  # noqa: E402
 from .widgets import collection_dialog, icon_widget, pick_icon  # noqa: E402
-from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, play_stream  # noqa: E402
+from .playback import DEFAULT_STYLE, STYLES, GifPlay, LiveCanvas, media_file, play_stream, release  # noqa: E402
 
 APP_ID = "io.github.linuxlivepaper"
 TILE_SIZES = [80, 110, 140, 170, 220, 280, 360]  # minimum tile size steps; the grid stretches tiles to fill the width
@@ -208,13 +210,18 @@ class Tile(Gtk.Overlay):
 
     def _schedule_play(self):
         self.hovering = True
-        if self.obj and not self._hover_id:
+        if self.obj and not self._hover_id and library.load_config().get("hover_play", True):
             self._hover_id = GLib.timeout_add(250, self._play)
 
     def _play(self):
         self._hover_id = 0
         obj = self.obj
-        if obj:
+        if obj and obj.item.kind == "gif":  # GdkPixbuf, no ffmpeg/GStreamer: the old proxy path is what crashed
+            def loaded(anim):
+                if anim and self.hovering and self.obj is obj and self.stream is None:
+                    self.stream = GifPlay(anim, self.pic)
+            pool.submit(lambda: GLib.idle_add(loaded, GifPlay.load(obj.item.motion)))
+        elif obj:
             playable(obj.item, lambda p: self.hovering and self.obj is obj and self.stream is None
                      and setattr(self, "stream", play_stream(p, self.pic)))
         return False
@@ -225,7 +232,7 @@ class Tile(Gtk.Overlay):
             GLib.source_remove(self._hover_id)
             self._hover_id = 0
         if self.stream:
-            self.stream.set_playing(False)
+            release(self.stream)
             self.stream = None
             self.pic.set_paintable(self.obj.texture if self.obj else None)
 
@@ -234,9 +241,10 @@ class LiveView(Gtk.Overlay):
     """Shows the still; press and hold (or hold Space) to play the motion with sound, like iOS,
     with the immersive blur transition from playback.LiveCanvas. on_live(bool) fires when playing starts/ends."""
 
-    def __init__(self, item, on_live=None):
+    def __init__(self, item, on_live=None, on_held=None):
         super().__init__()
         self.item, self.on_live = item, on_live or (lambda _live: None)
+        self.on_held = on_held or (lambda _held: None)  # True on press, False on release (cursor hides only while held)
         self.canvas = LiveCanvas(Gdk.Texture.new_from_filename(item.path), item.motion,
                                  on_idle=self._idle,
                                  style=library.get_meta(item.path).get("transition", DEFAULT_STYLE))
@@ -251,10 +259,12 @@ class LiveView(Gtk.Overlay):
         self.on_live(False)
 
     def play(self):
+        self.on_held(True)
         self.on_live(True)
         self.canvas.press()
 
     def release(self):
+        self.on_held(False)
         self.canvas.release()
 
     def stop(self):
@@ -262,18 +272,29 @@ class LiveView(Gtk.Overlay):
 
 
 EDGE_PX = 140  # the pointer must be this close to the left/right edge for that arrow to appear
-CHROME_IDLE_MS = 5000  # header / cursor / arrows hide after the mouse rests this long
+CHROME_IDLE_MS = 5000  # cursor / arrows hide after the mouse rests this long
+UNHIDE_PX = 40  # after playing, the pointer must travel this far (total) before the cursor comes back
+TOP_PX = 70  # fullscreen: the header only slides in while the pointer is this close to the top edge
+
+
+def BLANK_CURSOR(_c=[]):
+    if not _c:
+        tex = Gdk.MemoryTexture.new(1, 1, Gdk.MemoryFormat.R8G8B8A8, GLib.Bytes.new(bytes(4)), 4)
+        _c.append(Gdk.Cursor.new_from_texture(tex, 0, 0))
+    return _c[0]
 
 
 class Viewer(Adw.NavigationPage):
     """Full-bleed viewer. No on-screen hints; the ←/→ arrows only appear while the pointer is near that side
     edge (EDGE_PX) and never while a live image plays; in fullscreen (F, F11, double-click, or the header
-    button) the header bar and cursor hide after a moment of stillness, like a photo app."""
+    button) the header bar only appears while the pointer is at the top (TOP_PX) and the cursor hides only while
+    the left button is held to play."""
 
     def __init__(self, win, objs, index):
         super().__init__(title="")
         self.win, self.objs, self.index, self.stream, self.view = win, objs, index, None, None
-        self.live, self._idle_id, self._last_xy, self._edge = False, 0, None, 0
+        self.live, self._idle_id, self._last_xy, self._edge, self._top, self.held = False, 0, None, 0, False, False
+        self.hide_cursor, self._travel = False, 0.0
         self.header = Adw.HeaderBar()
         self.make_btn = Gtk.Button(label="Make Live Image", css_classes=["suggested-action"])
         self.make_btn.connect("clicked", lambda *_: win.open_editor(self.objs[self.index].item.motion))
@@ -285,6 +306,12 @@ class Viewer(Adw.NavigationPage):
         self.style_dd.set_tooltip_text("Press effect for this live image")
         self.style_dd.connect("notify::selected", self._style_changed)
         self.header.pack_end(self.style_dd)
+        self.menu_open = False  # the style popover is open: keep the header up while the pointer is in it
+        pop = self.style_dd.get_last_child()
+        while pop and not isinstance(pop, Gtk.Popover):
+            pop = pop.get_prev_sibling()
+        if pop:
+            pop.connect("notify::visible", lambda p, _: (setattr(self, "menu_open", p.get_visible()), self._header()))
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=180)
         self.frame = Gtk.Overlay(css_classes=["viewer"], hexpand=True, vexpand=True, child=self.stack)
         self.arrows = []
@@ -309,12 +336,13 @@ class Viewer(Adw.NavigationPage):
         self.add_controller(keys)
         motion = Gtk.EventControllerMotion()
         motion.connect("motion", self._moved)
+        motion.connect("leave", lambda *_: self._set_top(False))
         self.add_controller(motion)
         dbl = Gtk.GestureClick()
         dbl.connect("pressed", lambda _g, n, *_: n == 2 and win.activate_action("win.fullscreen"))
         self.frame.add_controller(dbl)
         self._fs_id = win.connect("notify::fullscreened", lambda *_: self._fullscreen_changed())
-        self.connect("hidden", lambda *_: self._stop())
+        self.connect("hidden", lambda *_: (self._stop(), setattr(self, "hide_cursor", False), self._cursor()))
         self.connect("destroy", lambda *_: win.disconnect(self._fs_id))
         self._fullscreen_changed()
         self.show()
@@ -325,18 +353,49 @@ class Viewer(Adw.NavigationPage):
         self.fs_btn.set_icon_name("view-restore-symbolic" if fs else "view-fullscreen-symbolic")
         self.fs_btn.set_tooltip_text("Leave fullscreen (F)" if fs else "Fullscreen (F)")
         self.tv.set_extend_content_to_top_edge(fs)  # the picture keeps its size when the header slides away
+        if not fs:
+            self.hide_cursor = False
         self.show_chrome()
 
     def show_chrome(self, show=True):
         fs = self.win.is_fullscreen()
         self._arrows(show)
-        self.tv.set_reveal_top_bars(show or not fs)
-        self.frame.set_cursor_from_name(None if show or not fs else "none")
+        self._header()
+        self._cursor()
         if self._idle_id:
             GLib.source_remove(self._idle_id)
             self._idle_id = 0
         if show:
             self._idle_id = GLib.timeout_add(CHROME_IDLE_MS, self._idle)
+
+    def _cursor(self):
+        """Fullscreen: the pointer hides when the left button (or Space) is held to play and returns once the
+        pointer has travelled UNHIDE_PX after release. A transparent cursor image, set on the frame and the
+        window: works on X11 and Wayland, and survives children that set their own cursor."""
+        hide = self.hide_cursor and self.win.is_fullscreen()
+        cur = BLANK_CURSOR() if hide else None
+        self.frame.set_cursor(cur)
+        self.win.set_cursor(cur)
+        surface = self.win.get_surface()
+        if surface:
+            surface.set_cursor(cur)  # GTK 4.22/X11 doesn't re-evaluate widget cursors while a button is down
+
+    def _on_held(self, held):
+        self.held = held
+        self._travel = 0.0
+        if held:
+            self.hide_cursor = True
+            GLib.timeout_add(60, lambda: (self._cursor(), False)[1])  # re-assert once the grab has settled
+        self._cursor()
+
+    def _header(self):
+        """Windowed: always there (it holds back/close). Fullscreen: only while the pointer is up top."""
+        self.tv.set_reveal_top_bars(not self.win.is_fullscreen() or ((self._top or self.menu_open) and not self.live))
+
+    def _set_top(self, top):
+        if top != self._top:
+            self._top = top
+            self._header()
 
     def _arrows(self, show=True):
         ok = show and not self.live and len(self.objs) > 1
@@ -358,8 +417,17 @@ class Viewer(Adw.NavigationPage):
         return False
 
     def _moved(self, _c, x, y):
+        self._set_top(y < TOP_PX)
         if self._last_xy and abs(x - self._last_xy[0]) + abs(y - self._last_xy[1]) < 3:
             return  # GTK sends synthetic motion when widgets change under a still pointer
+        if self.hide_cursor and self._last_xy:
+            if self.held:
+                self._cursor()  # GTK applies cursor changes lazily; re-assert while the button is down
+            else:
+                self._travel += math.hypot(x - self._last_xy[0], y - self._last_xy[1])
+                if self._travel >= UNHIDE_PX:
+                    self.hide_cursor = False
+                    self._cursor()
         self._last_xy = (x, y)
         if not self.live:
             self.show_chrome()
@@ -404,12 +472,12 @@ class Viewer(Adw.NavigationPage):
 
     def _stop(self):
         if self.stream:
-            self.stream.set_playing(False)
+            release(self.stream)
             self.stream = None
         if isinstance(self.view, LiveView):
             self.view.stop()
         elif isinstance(self.view, Gtk.Video) and self.view.get_media_stream():
-            self.view.get_media_stream().set_playing(False)
+            release(self.view.get_media_stream())
 
     def show(self):
         self._stop()
@@ -419,7 +487,7 @@ class Viewer(Adw.NavigationPage):
         self.make_btn.set_visible(item.kind != "live")
         self.style_dd.set_visible(item.kind == "live")
         if item.kind == "live":
-            view = LiveView(item, self._on_live)
+            view = LiveView(item, self._on_live, self._on_held)
         elif item.kind == "video":
             view = Gtk.Video(media_stream=media_file(item.path, muted=False, loop=True), autohide=True)
             view.get_media_stream().play()
@@ -427,10 +495,10 @@ class Viewer(Adw.NavigationPage):
             view = Gtk.Picture.new_for_filename(item.path)  # first frame until the proxy is ready
             view.set_content_fit(Gtk.ContentFit.CONTAIN)
 
-            def ready(path, v=view):
-                if self.view is v:
-                    self.stream = play_stream(path, v)
-            playable(item, ready)
+            def ready(anim, v=view):
+                if anim and self.view is v:
+                    self.stream = GifPlay(anim, v)
+            pool.submit(lambda: GLib.idle_add(ready, GifPlay.load(item.motion)))
         if item.kind == "live":
             self._syncing = True
             self.style_dd.set_selected(self.style_ids.index(view.canvas.style)
@@ -619,7 +687,12 @@ class Window(Adw.ApplicationWindow):
                          ("new-collection", self.new_collection),
                          ("open-folder", lambda: Gtk.FileLauncher.new(
                              Gio.File.new_for_path(str(library.library_dir()))).launch(self, None, None)),
-                         ("delete", self._delete_ctx), ("add-to-new", self._add_to_new),
+                         ("open-edit", lambda: self.open_editor(self.ctx_item.motion)),
+                         ("open-collage1", lambda: self.open_collage(1)),
+                         ("open-collage4", lambda: self.open_collage(4)),
+                         ("export-gif", lambda: self._export_ctx("gif")),
+                         ("export-webp", lambda: self._export_ctx("webp")),
+                         ("delete", self._delete_ctx), ("remove-from", self._remove_from), ("add-to-new", self._add_to_new),
                          ("edit-collection", lambda: self.edit_collection(self.ctx_collection)),
                          ("change-icon", lambda: self.change_icon(self.ctx_collection)),
                          ("delete-collection", self._delete_collection)):
@@ -660,7 +733,8 @@ class Window(Adw.ApplicationWindow):
         """Fullscreen hides the header and the cursor, like the viewer; moving the mouse brings them back."""
         fs = self.is_fullscreen()
         self.tv.set_reveal_top_bars(show or not fs)
-        self.set_cursor_from_name(None if show or not fs else "none")
+        on_gallery = self.nav.get_visible_page().get_tag() == "gallery"  # the viewer decides its own cursor
+        self.set_cursor_from_name(None if show or not fs or not on_gallery else "none")
         if self._chrome_id:
             GLib.source_remove(self._chrome_id)
             self._chrome_id = 0
@@ -718,14 +792,24 @@ class Window(Adw.ApplicationWindow):
         self.ctx_item, self.ctx_collection = item, collection
         add = Gio.Menu()
         for c in library.collections():
-            if collection is None or c.name != collection.name:
+            if c.path.resolve() != Path(item.path).parent.resolve():
                 mi = Gio.MenuItem.new(c.name, None)
                 mi.set_action_and_target_value("win.add-to", GLib.Variant.new_string(c.name))
                 add.append_item(mi)
         add.append("New Collection…", "win.add-to-new")
         menu = Gio.Menu()
+        edit = Gio.Menu()
+        edit.append("Edit as Live Image…", "win.open-edit")
+        edit.append("Live Collage — 1 slot", "win.open-collage1")
+        edit.append("Live Collage — 4 slots", "win.open-collage4")
+        menu.append_section(None, edit)
         menu.append_submenu("Add to Collection", add)
-        menu.append("Remove from Collection" if collection else "Delete", "win.delete")
+        if Path(item.path).parent.parent.resolve() == library.collections_dir().resolve():
+            menu.append("Remove from Collection", "win.remove-from")
+        if item.kind == "live":  # same entries + options dialog as the editor's Save ▾ menu
+            menu.append("Save as GIF…", "win.export-gif")
+            menu.append("Save as WebP…", "win.export-webp")
+        menu.append("Delete", "win.delete")
         self._popup(widget, x, y, menu)
 
     def collection_menu(self, widget, x, y, collection):
@@ -736,12 +820,23 @@ class Window(Adw.ApplicationWindow):
         menu.append("Delete Collection", "win.delete-collection")
         self._popup(widget, x, y, menu)
 
+    def _export_ctx(self, fmt):
+        item = self.ctx_item  # the live image's video already has every look/overlay baked in: just encode it
+        export.save_as(self, fmt, item.path, lambda _tmp: item.motion)
+
     def _delete_ctx(self):
-        """Delete from All/Live trashes the library files; inside a collection it removes only that collection's
-        copy. They're separate files (hard links), so neither touches the other."""
-        item, col = self.ctx_item, self.ctx_collection
+        item = self.ctx_item
         library.delete_item(item)
-        self.toast(f"Removed {item.name} from {col.name}" if col else f"Moved {item.name} to the Trash")
+        self.toast(f"Moved {item.name} to the Trash")
+        self.rescan()
+
+    def _remove_from(self):
+        item = self.ctx_item
+        try:
+            library.remove_from_collection(item)
+        except OSError as ex:
+            return self.toast(f"Couldn't move: {ex}")
+        self.toast(f"Moved {item.name} back to the library")
         self.rescan()
 
     def _add_to(self, collection):
@@ -783,7 +878,7 @@ class Window(Adw.ApplicationWindow):
     def _delete_collection(self):
         c = self.ctx_collection
         dlg = Adw.AlertDialog(heading=f"Delete {c.name}?", body="The collection folder goes to the Trash. "
-                              "Your library items in All and Live are not affected.")
+                              "Its live images and videos move back to your library.")
         dlg.add_response("cancel", "Cancel")
         dlg.add_response("delete", "Delete")
         dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
@@ -799,6 +894,15 @@ class Window(Adw.ApplicationWindow):
     # --- creating & importing -------------------------------------------------------------------
     def open_editor(self, path):
         self.nav.push(EditorPage(path, self._saved))
+
+    def open_collage(self, slots):
+        """Collage maker with the right-clicked clip in 1 slot (the rest empty) or in all 4 of a 2×2 grid."""
+        page = CollagePage(self._saved)
+        if slots == 1:
+            page.set_clip(0, self.ctx_item.motion)
+        else:
+            page.fill_all(self.ctx_item.motion, 0.0, None, dict(effects.DEFAULT), page.style)
+        self.nav.push(page)
 
     def _saved(self, page, res, err):
         if err:
@@ -861,6 +965,12 @@ class Window(Adw.ApplicationWindow):
         row.add_suffix(change)
         group.add(row)
         page.add(group)
+        gallery = Adw.PreferencesGroup(title="Gallery")
+        hover = Adw.SwitchRow(title="Hover to play", subtitle="Videos, live images and GIFs play (muted) while the "
+                              "pointer is over them", active=library.load_config().get("hover_play", True))
+        hover.connect("notify::active", lambda w, _p: library.set_pref("hover_play", w.get_active()))
+        gallery.add(hover)
+        page.add(gallery)
         perf = Adw.PreferencesGroup(title="Performance", description="Applies to previews and to saved files.")
         gpu = Adw.SwitchRow(title="GPU acceleration", active=thumbs.gpu_enabled(),
                             subtitle="Checking the graphics card…")

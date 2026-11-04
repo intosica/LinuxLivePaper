@@ -1,5 +1,6 @@
 """Bake-in effects for the creator: looks (per-frame color), effects (stylised motion), speed and direction.
 Everything is one ffmpeg filter_complex, so the editor preview proxy and the saved MOV are rendered identically."""
+import functools
 import hashlib
 import os
 import subprocess
@@ -90,8 +91,13 @@ def graph(opts, has_audio, size):
 
 
 def has_audio(src):
+    return _has_audio(str(src), os.stat(src).st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=256)
+def _has_audio(src, mtime):  # an ffprobe per call adds up when a collage re-renders every cell
     return bool(subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
-                                "-of", "csv=p=0", str(src)], capture_output=True, text=True).stdout.strip())
+                                "-of", "csv=p=0", src], capture_output=True, text=True).stdout.strip())
 
 
 def render(src, start, end, out, opts=None, height=None, fast=False, extra=(), loop=False):
@@ -101,7 +107,7 @@ def render(src, start, end, out, opts=None, height=None, fast=False, extra=(), l
     _, w, h = thumbs.probe(str(src))
     trim = (["-stream_loop", "-1"] if loop else []) + ["-ss", f"{start:.3f}"] + \
         (["-t", f"{end - start:.3f}"] if end is not None else [])
-    cmd = ["ffmpeg", "-v", "error", "-y", *trim, "-i", str(src), "-filter_complex", graph(opts, audio, out_size(w, h, height)),
+    cmd = ["ffmpeg", "-v", "error", "-y", *trim, *thumbs.hwdec(src, height and not frame_chain(opts) and out_size(w, h, height)), "-i", str(src), "-filter_complex", graph(opts, audio, out_size(w, h, height)),
            "-map", "[vout]", *(["-map", "[aout]", "-c:a", "aac"] if audio else []),
            *thumbs.h264(fast, out_size(w, h, height)), *extra, str(out)]
     thumbs.run(cmd)

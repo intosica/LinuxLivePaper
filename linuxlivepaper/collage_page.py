@@ -15,13 +15,14 @@ gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk, Pango  # noqa: E402
 
-from . import collage, effects, library, livemake, overlays, thumbs  # noqa: E402
+from . import collage, effects, export, library, livemake, overlays, thumbs  # noqa: E402
 from .editor import Timeline  # noqa: E402
 from .overlay_ui import OverlayHost  # noqa: E402
-from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file  # noqa: E402
+from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, release  # noqa: E402
 from .widgets import CollectionRow, FileBrowser, HoldButton, preview_quality_dropdown  # noqa: E402
 
 PROXY_H = 360
+SYNC_TOL = 0.2  # seconds a live cell may be off the shared collage clock before it is seeked back
 # Stills are grabbed uncropped (look + effect applied to the whole frame) and cropped at draw time, so dragging and
 # scroll-zooming a cell are pure GPU redraws. Effects whose result depends on the crop get an exact cropped grab.
 CROP_EFFECTS = {"mirror"}
@@ -161,12 +162,12 @@ class CollageCanvas(Gtk.Widget):
         self.page.sync_zoom()
         return True
 
-    def _draw_cell(self, snap, i, r, p, s):
+    def _draw_cell(self, snap, i, r, p, s, cropped):
         """Cover-fit the still into r. Uncropped stills follow the cell's live zoom/pan (dragging = redraw only)."""
         pa = p.get_intrinsic_aspect_ratio() or 1
         x, y, w, h = r.get_x(), r.get_y(), r.get_width(), r.get_height()
         cell = self.page.c["cells"][i]
-        if self.page.cropped[i] or not cell:
+        if cropped or not cell:
             cw, ch = (w, w / pa) if pa < w / h else (h * pa, h)
             dx = dy = 0.0
             if self.page.drag_move and self.page.drag_move[0] == i:  # cropped still: slide it until the regrab
@@ -187,21 +188,13 @@ class CollageCanvas(Gtk.Widget):
         ox, oy, s = self.frame()
         _, W, H = collage.ASPECTS[c["aspect"]]
         snap.append_color(rgba(c["bg"]), rect(ox, oy, W * s, H * s))
-        vid = self.page.video
-        if vid and vid.get_intrinsic_width() > 0:  # the baked render already holds every cell
-            pa = vid.get_intrinsic_aspect_ratio() or W / H
-            cw, ch = (W * s, W * s / pa) if pa < W / H else (H * s * pa, H * s)
-            snap.save()
-            snap.translate(Graphene.Point().init(ox + (W * s - cw) / 2, oy + (H * s - ch) / 2))
-            vid.snapshot(snap, cw, ch)
-            snap.restore()
-            return
         for i, (x, y, w, h) in enumerate(collage.rects(c, W, H)):
             r = rect(ox + x * s, oy + y * s, w * s, h * s)
-            p = self.page.paint[i]
+            live = self.page.live_paint(i)
+            p, crop = live or (self.page.paint[i], self.page.cropped[i])
             snap.push_clip(r)
             if p and p.get_intrinsic_width() > 0:
-                self._draw_cell(snap, i, r, p, s)
+                self._draw_cell(snap, i, r, p, s, crop)
             else:
                 snap.append_color(rgba("#3a3a3e" if c["bg"] == "black" else "#d0d0d4"), r)
                 lay = self.create_pango_layout("+ Add video" if not c["cells"][i] else "…")
@@ -234,16 +227,20 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self._later_id, self._later = 0, set()
         self.sel = 0
         self.style = DEFAULT_STYLE
-        self.stream, self.video, self.playing, self.gen, self.tl = None, None, False, 0, None
+        self.playing, self.gen, self.tl = False, 0, None
         self.drag_cell, self.drag_move, self._rebake_id = None, None, 0
         self._panel_stale = False
         self.zoom_scale, self.framing_lbl, self._zoom_sync = None, None, False
-        self.tick = 0
+        self.tick, self._resync = 0, set()
+        self.live = [None] * 9  # per cell while playing: {"spec", "stream", "shown", "win", "old"}
+        self.clock0 = None  # shared collage clock while playing (monotonic µs at collage time 0)
+        self.bake_tok, self.pending = [0] * 9, set()
         self.at_start = False  # after a pause every cell shows the first frame of its window, in sync
         self.canvas_live = None
         self.canvas_widget, self.trying, self._try_gen = None, False, 0
 
-        pool.submit(lambda: [thumbs.prune(thumbs.CACHE / d, 1.5e9) for d in ("collage", "previews")])
+        pool.submit(lambda: [thumbs.prune(thumbs.CACHE / d, 1.5e9) for d in ("collage", "previews")]
+                    + [thumbs.nvenc_available()])  # warm the encoder probe so the first Play doesn't pay for it
         self.canvas = CollageCanvas(self)
         self.spinner = Gtk.Spinner(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER, width_request=32,
                                    height_request=32)
@@ -266,8 +263,18 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             "Click a cell to select it (or fill it) · drag the yellow window on the timeline to choose which part of "
             "the selected clip plays · every cell has its own volume, speed, direction, filter and effect"))
 
-        self.save_btn = Gtk.Button(label=self.SAVE_LABEL, css_classes=["suggested-action"])
+        menu = Gio.Menu()  # same split button + export flow as the single-clip editor
+        menu.append("Save as GIF…", "export.gif")
+        menu.append("Save as WebP…", "export.webp")
+        self.save_btn = Adw.SplitButton(label=self.SAVE_LABEL, menu_model=menu, css_classes=["suggested-action"],
+                                        tooltip_text="Save as a live image · arrow: GIF / WebP for sharing")
         self.save_btn.connect("clicked", self._save)
+        group = Gio.SimpleActionGroup()
+        for fmt in ("gif", "webp"):
+            act = Gio.SimpleAction(name=fmt)
+            act.connect("activate", lambda *_, f=fmt: self._export(f))
+            group.add_action(act)
+        self.insert_action_group("export", group)
         header = Adw.HeaderBar()
         header.pack_end(self.save_btn)
         header.pack_start(preview_quality_dropdown())
@@ -486,6 +493,17 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self.c["repeat"] = n  # only the saved file / Try it repeat; Play loops anyway
         self._length_changed()
 
+    def fill_all(self, src, start, length, opts, style):
+        """Grid of 4 with the same clip (trimmed to start/length, same look) in every cell."""
+        self._set_layout("4")
+        for i in range(len(self.c["cells"])):
+            self.c["cells"][i] = {**collage.new_cell(src), "start": start, "len": length, "opts": dict(opts)}
+        self.style, self.sel = style, 0
+        self.paint, self.want = [None] * 4, [None] * 4
+        self._rebuild_panel()
+        self._rebuild_timeline()
+        self.refresh(all_cells=True)
+
     def _set_layout(self, layout):
         if layout != self.c["layout"]:
             self.stop()
@@ -598,8 +616,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
     def _set_volume(self, v):
         cell = self.c["cells"][self.sel]
         cell["volume"] = round(v, 2)
-        if self.playing:  # one stream holds the whole mix, so the level only lands on the next bake
-            self._rebake()
+        self._apply_volume(self.sel)
 
     def _set_opt(self, key, value):
         cell = self.c["cells"][self.sel]
@@ -793,8 +810,8 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         idx = list(range(len(self.c["cells"])) if all_cells or cells is None else cells)
         self._length_changed()
         if self.playing:
-            if not quick:  # quick is a drag in progress: re-baking on every motion would stutter
-                self._rebake()
+            self.canvas.queue_draw()  # zoom/pan of a direct cell shows on the live frame right away
+            self._resync_later(idx)
             return
         W, H = collage.size(self.c, PROXY_H)
         cover = min(self.c["cover"], collage.duration(self.c) - 0.04)
@@ -875,86 +892,179 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self.stop()
         self.playing = True
         self.gen += 1
-        gen = self.gen
-        c = self._collage_copy()
-        self.spinner.start()
         self.play_btn.set_icon_name("media-playback-pause-symbolic")
-        self.clip_lbl.set_label("Rendering preview…")
+        self.clock0 = None  # shared collage clock (µs), started by the first cell that shows a frame
+        for i in range(len(self.c["cells"])):
+            self._sync_cell(i)
+        self.tick = GLib.timeout_add(40, self._on_tick)
+        self._label()
+
+    # Live preview: every cell is its own GStreamer stream (hardware-decoded where the GPU can), drawn into the
+    # canvas — nothing is composited by ffmpeg while you edit. A plain cell plays its source directly, so volume,
+    # zoom/pan and trim changes land on the next frame. Cells with a look/effect/speed/direction (or a GIF, which
+    # GTK can't play) render just that cell once (cached) and loop it; editing one cell never touches the others.
+    # One shared clock (like the render): collage time T loops every collage.duration; each cell should show
+    # T % its pass, so short cells restart together with the longest one. _on_tick seeks a cell back onto the clock
+    # when it is more than SYNC_TOL off (its own loop end, a late start, a re-sync after an edit).
+    # ponytail: correction by seeking, so cells can be up to SYNC_TOL apart; Save renders exactly.
+    def _live_spec(self, i):
+        cell = self.c["cells"][i]
+        if not cell:
+            return None
+        o = {**effects.DEFAULT, **cell["opts"]}
+        if o == effects.DEFAULT and not cell["src"].lower().endswith(".gif"):
+            return ("direct", cell["src"])
+        W, H = collage.size(self.c, thumbs.preview_height())
+        _, _, w, h = collage.rects(self.c, W, H)[i]
+        bake = {k: v for k, v in cell.items() if k not in ("dur", "ar")}
+        bake["volume"] = 1.0  # the level is applied live on the stream
+        return ("bake", repr(sorted(bake.items())), w, h)
+
+    def _sync_cell(self, i):
+        """Make cell i's live stream match the cell; the old stream keeps playing until a new one is ready."""
+        spec, cur = self._live_spec(i), self.live[i]
+        if cur and cur["spec"] == spec:
+            cell = self.c["cells"][i]
+            if spec[0] == "direct" and cur["win"] != (cell["start"], collage.window(cell)):
+                cur["win"] = (cell["start"], collage.window(cell))
+                cur["stream"].seek(int(cell["start"] * 1e6))
+            self._apply_volume(i)
+            return
+        if not spec:
+            return self._drop_live(i)
+        gen = self.gen
+        if spec[0] == "direct":
+            return self._start_live(i, spec, spec[1])
+        self.bake_tok[i] += 1
+        tok, cell = self.bake_tok[i], dict(self.c["cells"][i], volume=1.0)
+        self.pending.add(i)
+        self.spinner.start()
 
         def work():
-            try:
-                path, err = self._try_path(c), None
-            except Exception as ex:
-                thumbs.log("collage play failed:", ex)
-                path, err = None, str(ex)
-            GLib.idle_add(start, path, err)
+            with thumbs.BAKE_LOCK:
+                if gen != self.gen or tok != self.bake_tok[i]:  # superseded while queued
+                    return
+                try:
+                    path, err = collage._cell_file(cell, spec[2], spec[3], True, thumbs.CACHE / "collage" / "cells")[0], None
+                except Exception as ex:
+                    thumbs.log("collage cell bake failed:", ex)
+                    path, err = None, str(ex)
+            GLib.idle_add(land, path, err)
 
-        def start(path, err):
-            if gen != self.gen:
+        def land(path, err):
+            if gen != self.gen or tok != self.bake_tok[i]:
                 return
-            self.spinner.stop()
-            if not path:
-                self.playing = False
-                self.play_btn.set_icon_name("media-playback-start-symbolic")
+            self.pending.discard(i)
+            if not self.pending:
+                self.spinner.stop()
+            if path:
+                self._start_live(i, spec, path)
+            else:
                 self.clip_lbl.set_label(f"Preview failed — {err}")
-                return
-            self._label()
-            self._play(path)
-            self.tick = GLib.timeout_add(40, self._on_tick)
         threading.Thread(target=work, daemon=True).start()
 
-    def _play(self, path):
-        """One stream for the whole collage: the same GStreamer path a single clip preview uses."""
-        m = media_file(path, muted=False, loop=True)
+    def _start_live(self, i, spec, path):
+        cell = self.c["cells"][i]
+        m = media_file(path, muted=cell["volume"] <= 0, loop=True)
+        entry = {"spec": spec, "stream": m, "shown": False, "win": (cell["start"], collage.window(cell))}
 
-        def frame(stream):
-            self.video = stream
-        m.connect("invalidate-contents", lambda s: (frame(s), self.canvas.queue_draw()))
+        def prepared(s, _):
+            if s.is_prepared() and spec[0] == "direct" and cell["start"] > 0:
+                s.seek(int(entry["win"][0] * 1e6))
+
+        def frame(_s):
+            if self.live[i] is not entry:
+                return
+            if spec[0] == "direct" and (m.is_seeking() or m.get_timestamp() / 1e6 < entry["win"][0] - 0.5):
+                return  # frame 0 before the seek to the window landed: keep showing the still
+            if not entry["shown"]:
+                entry["shown"] = True
+                if self.clock0 is None:
+                    self.clock0 = GLib.get_monotonic_time() - int(self._stream_pos(entry) * 1e6)
+                old = entry.pop("old", None)
+                if old:
+                    release(old["stream"])
+            self.canvas.queue_draw()
+        m.connect("notify::prepared", prepared)
+        m.connect("invalidate-contents", frame)
+        m.set_volume(max(0.0, min(1.0, cell["volume"])))
+        cur = self.live[i]  # keep showing whatever is on screen until the new stream's first frame
+        if cur and cur["shown"]:
+            entry["old"] = cur
+            if cur.get("old"):  # never chain: at most one stale stream (and its decoder) behind the new one
+                release(cur.pop("old")["stream"])
+        elif cur:
+            entry["old"] = cur.pop("old", None)
+            release(cur["stream"])
+        self.live[i] = entry
         m.play()
-        self.stream = m
 
-    def _rebake(self):
-        """An edit while playing: re-render the baked collage (debounced) and swap it in at the same position."""
+    def _drop_live(self, i):
+        e, self.live[i] = self.live[i], None
+        if e:
+            release(e["stream"])
+            if e.get("old"):
+                release(e["old"]["stream"])
+        self.canvas.queue_draw()
+
+    def live_paint(self, i):
+        """(paintable, cropped) to draw for cell i while playing, or None to fall back to the still."""
+        e = self.live[i] if self.playing else None
+        if e and not e["shown"]:
+            e = e.get("old")
+        if not e or e["stream"].get_intrinsic_width() <= 0:
+            return None
+        return e["stream"], e["spec"][0] == "bake"
+
+    def _apply_volume(self, i):
+        e, cell = self.live[i], self.c["cells"][i]
+        if e and cell:
+            e["stream"].set_muted(cell["volume"] <= 0)
+            e["stream"].set_volume(max(0.0, min(1.0, cell["volume"])))
+
+    def _resync_later(self, cells):
+        """Debounced re-sync for edits while playing (each bake is a render; a drag must not start dozens)."""
+        self._resync.update(cells)
         if self._rebake_id:
             GLib.source_remove(self._rebake_id)
-        self._rebake_id = GLib.timeout_add(500, self._do_rebake)
+        self._rebake_id = GLib.timeout_add(300, self._do_resync)
 
-    def _do_rebake(self):
+    def _do_resync(self):
         self._rebake_id = 0
-        if not self.playing:
-            return False
-        gen, c = self.gen, self._collage_copy()
-
-        def work():
-            try:
-                path = self._try_path(c)
-            except Exception as ex:
-                thumbs.log("collage re-bake failed:", ex)
-                return
-            GLib.idle_add(swap, path)
-
-        def swap(path):
-            if gen != self.gen or not self.playing:
-                return
-            old = self.stream
-            ts = old.get_timestamp() if old else 0
-            self._play(path)
-            if self.stream.is_seekable() and ts:
-                self.stream.seek(ts)
-            if old:
-                old.set_playing(False)
-        threading.Thread(target=work, daemon=True).start()
+        cells, self._resync = list(self._resync), set()
+        if self.playing:
+            for i in cells:
+                if i < len(self.live):
+                    self._sync_cell(i)
         return False
 
+    def _stream_pos(self, e):
+        """Collage-pass seconds cell i's stream is at (a direct stream plays the source, offset by the window)."""
+        ts = e["stream"].get_timestamp() / 1e6
+        return (ts - e["win"][0]) % max(e["win"][1], 0.05) if e["spec"][0] == "direct" else ts
+
     def _on_tick(self):
-        """Move the playhead along the selected cell's window while the collage plays."""
-        if not self.playing or not self.stream:
+        """Keep every cell on the shared collage clock and move the playhead of the selected one."""
+        if not self.playing:
             self.tick = 0
             return False
-        cell = self.c["cells"][self.sel]
-        if cell and self.tl:
-            t = self.stream.get_timestamp() / 1e6 % max(collage.duration(self.c), 0.1)
-            self.tl.p = collage.cell_time(cell, t)
+        now = GLib.get_monotonic_time()
+        if self.clock0 is not None:
+            T = (now - self.clock0) / 1e6 % max(collage.duration(self.c), 0.05)
+            for i, (e, cell) in enumerate(zip(self.live, self.c["cells"])):
+                st = e and e["stream"]
+                if not (st and cell and e["shown"] and st.is_prepared()) or st.is_seeking() or now < e.get("hold", 0):
+                    continue
+                want = T % max(collage.cell_length(cell), 0.05)
+                pos = st.get_timestamp() / 1e6
+                target = collage.cell_time(cell, want) if e["spec"][0] == "direct" else want
+                if abs(pos - target) > SYNC_TOL:
+                    st.seek(int(target * 1e6))
+                    e["hold"] = now + 500_000  # let the seek land before judging it again
+        e, cell = self.live[self.sel] if self.sel < len(self.live) else None, self.c["cells"][self.sel]
+        if e and cell and self.tl:
+            ts = e["stream"].get_timestamp() / 1e6
+            self.tl.p = ts if e["spec"][0] == "direct" else collage.cell_time(cell, ts)
             self.tl.queue_draw()
         return True
 
@@ -968,10 +1078,9 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         if self.tick:
             GLib.source_remove(self.tick)
             self.tick = 0
-        if self.stream:
-            self.stream.set_playing(False)
-            self.stream = None
-        self.video = None
+        for i in range(len(self.live)):
+            self._drop_live(i)
+        self.pending.clear()
         self.canvas.queue_draw()
         if was:  # pause = back to the start of the yellow window, for every cell
             self.at_start = True
@@ -981,6 +1090,20 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             self.refresh(all_cells=True)
 
     # --- save -----------------------------------------------------------------------------------
+    def _export(self, fmt):
+        """GIF/WebP of one pass of the collage as Save would render it (a GIF/WebP loops by itself)."""
+        if not any(self.c["cells"]):
+            return self.get_root().toast("Add at least one video to the collage")
+        self.stop()
+        c = {**self.c, "cells": [dict(x) if x else None for x in self.c["cells"]]}
+        ovs = [dict(o) for o in self.overlays]
+        export.save_as(self, fmt, "Collage", lambda tmp: collage.render(c, str(Path(tmp, "collage.mp4")), overlays=ovs,
+                                                                        repeat=1), self._busy)
+
+    def _busy(self, on):
+        self.save_btn.set_sensitive(not on)
+        self.save_btn.set_label("Exporting…" if on else self.SAVE_LABEL)
+
     def _save(self, _b):
         if not any(self.c["cells"]):
             self.on_saved(self, None, "Add at least one video to the collage")
@@ -994,12 +1117,10 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
 
         def work():
             try:
-                jpg, mov = livemake.out_paths()
+                jpg, mov = livemake.out_paths(col.path if col else None)
                 collage.render(c, mov, extra=livemake.live_tags(), overlays=[dict(o) for o in self.overlays])
                 livemake.still(mov, min(c["cover"], collage.duration(c) - 0.05), jpg)
                 library.set_meta(jpg, transition=style)
-                if col:
-                    library.add_to_collection(library.Item("live", str(jpg), str(mov), 0), col)
                 res, err = (jpg, mov), None
             except Exception as ex:
                 thumbs.log("collage save failed:", ex)

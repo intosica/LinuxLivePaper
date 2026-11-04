@@ -102,6 +102,20 @@ def match(c, longest=True):
         x["start"] = round(max(0.0, min(x["start"], float(x.get("dur") or n) - n)), 3)
 
 
+HEAD = 4.0  # seconds of the collage a preview renders first, while the rest renders behind it
+
+
+def head(c, secs=HEAD):
+    """Copy of c cut to its first `secs` seconds, so a preview can start long before the whole collage is rendered;
+    None when that wouldn't save much or can't be cut (reverse/bounce need their whole window)."""
+    cells = [x for x in c["cells"] if x]
+    if duration(c) < secs * 1.5 or any(x["opts"].get("direction", "forward") != "forward" for x in cells):
+        return None
+    cut = [None if not x else dict(x, len=round(secs * x["opts"].get("speed", 1.0), 3))
+           if cell_length(x) > secs else x for x in c["cells"]]
+    return {**c, "cells": cut}
+
+
 def duration(c):
     """One pass of the collage = its longest cell; shorter cells loop to fill it."""
     return max((cell_length(x) for x in c["cells"] if x), default=1.0)
@@ -165,7 +179,7 @@ def _cell_command(cell, w, h, out, fast):
     zw, zh = fit_size(cell, w, h)
     low = ["-lowres", str(n)] if fast and (n := thumbs.lowres(cell["src"], zw, zh)) else []
     return ["ffmpeg", "-v", "error", "-y", "-stream_loop", "-1", "-ss", f"{cell['start']:.3f}",
-            "-t", f"{window(cell):.3f}", *low, "-i", cell["src"], "-filter_complex", ";".join(graph), "-map", "[v]", *amap,
+            "-t", f"{window(cell):.3f}", *(low or thumbs.hwdec(cell["src"], (zw, zh))), "-i", cell["src"], "-filter_complex", ";".join(graph), "-map", "[v]", *amap,
             *thumbs.h264(True, (w, h), 20 if fast else 12), "-r", str(FPS), str(out)]
 
 
@@ -174,7 +188,7 @@ def _cell_file(cell, w, h, fast, d):
     key = hashlib.sha1(repr(([[k, v] for k, v in sorted(cell.items()) if k not in ("dur", "ar")],
                              os.stat(cell["src"]).st_mtime_ns, w, h, fast)).encode()).hexdigest()
     out = thumbs.cached(Path(d, key + ".mkv"), lambda tmp: thumbs.run(_cell_command(cell, w, h, tmp, fast)))
-    return str(out), effects.has_audio(out)
+    return str(out), cell["volume"] > 0 and effects.has_audio(cell["src"])  # same test _cell_command used
 
 
 def command(c, cells, out, height=None, fast=False, extra=(), overlays=()):
@@ -261,6 +275,12 @@ if __name__ == "__main__":
                                                           cache=Path(d, "cells")))], capture_output=True, text=True).stdout)
         assert abs(float(j["format"]["duration"]) - 6.0) < 0.3, j["format"]
         assert len(list(Path(d, "cells").glob("*.mkv"))) == 3  # the unchanged GIF cell came from the cache
+        assert head(c, 1.0) is None  # the bouncing cell can't be cut
+        c["cells"][1]["opts"]["direction"] = "forward"
+        h = head(c, 1.0)  # the 2x cell lasts 2 s: its head keeps 2 source seconds = 1 s of output
+        assert h and abs(duration(h) - 1.0) < 0.02 and abs(h["cells"][0]["len"] - 2.0) < 0.01, h["cells"]
+        assert head(c, 1.9) is None and c["cells"][0]["len"] is None
+        c["cells"][1]["opts"]["direction"] = "bounce"
         c["repeat"] = 1
         set_layout(c, "2h")
         assert len(c["cells"]) == 2 and c["cells"][1]["src"] == str(b)

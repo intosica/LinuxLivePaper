@@ -1,4 +1,4 @@
-"""Library folder config + scan. The gallery shows only the LinuxLivePaper library folder.
+"""Library folder config + scan. The gallery shows the LinuxLivePaper library folder, collections included.
 Items: *live* (still + video sharing a stem in one folder, Apple's IMG_1.JPG + IMG_1.MOV convention),
 plain *video*, and *gif*. Standalone photos are ignored on purpose (not a photo gallery)."""
 import json
@@ -102,14 +102,21 @@ def scan_dir(folder):
 
 def scan(root=None):
     """Recursive scan, oldest first (the gallery shows newest at the bottom, like iOS Photos).
-    The library's collection/ folder is skipped: collections are browsed on their own."""
+    Includes the collection/ subfolders, so All is simply everything on disk. Legacy hard-linked duplicates
+    (same file in the root and in a collection) show once, as the collection's copy."""
     root = str(root or library_dir())
-    items = []
+    best = {}
     for dirpath, dirnames, _ in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and not (dirpath == root and d == COLLECTIONS)]
-        items += scan_dir(dirpath)
-    items.sort(key=lambda i: i.mtime)
-    return items
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for it in scan_dir(dirpath):
+            try:
+                st = os.stat(it.motion)
+                key = (st.st_dev, st.st_ino)
+            except OSError:
+                key = it.motion
+            if key not in best or len(Path(it.path).parts) > len(Path(best[key].path).parts):
+                best[key] = it
+    return sorted(best.values(), key=lambda i: i.mtime)
 
 
 def motion_for(path):
@@ -138,7 +145,7 @@ def _trash(path):
 
 
 def delete_item(item):
-    """Trash an item's files. Collection copies are separate links, so they stay."""
+    """Trash an item's files."""
     for f in item_files(item):
         _trash(f)
     meta = Path(item.path).parent / META
@@ -150,7 +157,7 @@ def delete_item(item):
         pass
 
 
-# --- collections: <library>/collection/<Name>/ holding hard links (or copies) of items -----------------
+# --- collections: <library>/collection/<Name>/ holding the items that belong to them (each item lives in one place) -----------------
 COLLECTIONS = "collection"
 ICON_EXT = (".png", ".webp", ".gif", ".jpg", ".jpeg")  # stored as .icon<ext> in the collection folder
 
@@ -220,33 +227,47 @@ def rename_collection(c, new):
 
 
 def delete_collection(c):
-    """Trash the collection folder. Library items are untouched (the folder holds separate links)."""
+    """Move the collection's items back to the library root, then trash the (now icon-only) folder."""
+    for it in c.items():
+        remove_from_collection(it)
     _trash(c.path)
 
 
-def add_to_collection(item, c):
-    """Hard-link (copy if the filesystem can't) the item's files into the collection, so deleting either one
-    never removes the other. Returns False if it is already there."""
-    c.path.mkdir(parents=True, exist_ok=True)
+def _move_item(item, folder):
+    """Move an item's files (and sidecar meta) into folder. Returns False if it is already there."""
+    folder.mkdir(parents=True, exist_ok=True)
     src = [Path(f) for f in item_files(item)]
+    if src[0].parent.resolve() == folder.resolve():
+        return False
     stem = src[0].stem
-    if (c.path / src[0].name).exists():
-        if all(os.path.samefile(f, c.path / f.name) for f in src if (c.path / f.name).exists()):
-            return False
-        n = 2  # different item with the same name
-        while any((c.path / f"{stem} {n}{f.suffix}").exists() for f in src):
+    if any((folder / f.name).exists() for f in src):  # a different item with the same name
+        n = 2
+        while any((folder / f"{stem} {n}{f.suffix}").exists() for f in src):
             n += 1
         stem = f"{stem} {n}"
-    for f in src:
-        dest = c.path / f"{stem}{f.suffix}"
-        try:
-            os.link(f, dest)
-        except OSError:
-            shutil.copy2(f, dest)
     meta = get_meta(src[0])
+    for f in src:
+        shutil.move(f, folder / f"{stem}{f.suffix}")
     if meta:
-        set_meta(c.path / f"{stem}{src[0].suffix}", **meta)
+        set_meta(folder / f"{stem}{src[0].suffix}", **meta)
+    old = src[0].parent / META
+    try:
+        data = json.loads(old.read_text())
+        if data.pop(src[0].stem, None) is not None:
+            old.write_text(json.dumps(data, indent=1))
+    except (OSError, ValueError):
+        pass
     return True
+
+
+def add_to_collection(item, c):
+    """Move the item into the collection (one copy on disk). Returns False if it is already there."""
+    return _move_item(item, c.path)
+
+
+def remove_from_collection(item):
+    """Move the item back to the library root."""
+    return _move_item(item, library_dir())
 
 
 if __name__ == "__main__":
@@ -276,12 +297,19 @@ if __name__ == "__main__":
         set_meta(live.path, transition="fade")
         c = create_collection("  Trips/2026 ")
         assert c.name == "Trips 2026" and [x.name for x in collections()] == ["Trips 2026"]
-        assert add_to_collection(live, c) and not add_to_collection(live, c)
-        assert len(scan(d)) == 1, "collection items must not show up in All"
+        assert add_to_collection(live, c) and not add_to_collection(c.items()[0], c)
+        assert not Path(d, "IMG_2.jpg").exists() and not Path(d, "IMG_2.mov").exists(), "moved, not copied"
+        assert len(scan(d)) == 1, "All reads the collection subfolders"
         [copy] = c.items()
         assert copy.kind == "live" and get_meta(copy.path) == {"transition": "fade"}
-        delete_item(live)  # deleting from All keeps the collection copy
-        assert scan(d) == [] and Path(copy.motion).read_text() == "motion"
+        os.link(copy.path, Path(d, "IMG_2.jpg"))  # legacy hard-linked duplicate shows once
+        os.link(copy.motion, Path(d, "IMG_2.mov"))
+        assert [i.path for i in scan(d)] == [copy.path]
+        Path(d, "IMG_2.jpg").unlink(), Path(d, "IMG_2.mov").unlink()
+        assert remove_from_collection(copy) and c.items() == [] and get_meta(Path(d, "IMG_2.jpg")) == {"transition": "fade"}
+        live = scan(d)[0]
+        add_to_collection(live, c)
+        [copy] = c.items()
         c = rename_collection(c, "Trips")
         assert [x.name for x in collections()] == ["Trips"] and len(c.items()) == 1
         delete_item(c.items()[0])
