@@ -164,7 +164,11 @@ def icon_widget(icon, size):
     """Collection icon: PNG/JPG/WebP/GIF, animated ones play while on screen; no/bad file -> the folder icon."""
     if not icon:
         return folder_icon(size)
-    pic = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, width_request=size, height_request=size, can_shrink=True)
+    pic = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True)
+    # The picture is an overlay on an empty size_request box: a Picture's natural size is the image's own pixel size,
+    # which would otherwise override `size` (collection zoom did nothing for real, big icon files).
+    holder = Gtk.Overlay(child=Gtk.Box(width_request=size, height_request=size), halign=Gtk.Align.CENTER)
+    holder.add_overlay(pic)
     try:
         anim = GdkPixbuf.PixbufAnimation.new_from_file(str(icon))
     except GLib.Error:  # GdkPixbuf chokes on some real-world GIFs; ffmpeg can still give the first frame
@@ -172,7 +176,7 @@ def icon_widget(icon, size):
         if pb is None:
             return folder_icon(size)
         pic.set_paintable(Gdk.Texture.new_for_pixbuf(pb))
-        return pic
+        return holder
     it = anim.get_iter(None)
     pic.set_paintable(Gdk.Texture.new_for_pixbuf(it.get_pixbuf()))
     if not anim.is_static_image():
@@ -194,7 +198,7 @@ def icon_widget(icon, size):
             tick[0] = GLib.timeout_add(max(20, it.get_delay_time()), step)
         pic.connect("map", start)
         pic.connect("unmap", stop)
-    return pic
+    return holder
 
 
 def collection_dialog(parent, on_done, collection=None):
