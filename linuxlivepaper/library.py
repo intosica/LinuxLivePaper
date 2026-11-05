@@ -1,6 +1,6 @@
 """Library folder config + scan. The gallery shows the LinuxLivePaper library folder, collections included.
 Items: *live* (still + video sharing a stem in one folder, Apple's IMG_1.JPG + IMG_1.MOV convention),
-plain *video*, and *gif*. Standalone photos are ignored on purpose (not a photo gallery)."""
+plain *image*, plain *video*, and *gif*."""
 import json
 import os
 import shutil
@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".avif"}
-VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".vob", ".mpg", ".mpeg", ".ts", ".m2ts", ".mts"}  # DVD/MPEG-PS/TS too
+VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".vob", ".mpg", ".mpeg", ".ts", ".m2ts", ".mts",
+             ".wmv", ".asf"}  # DVD/MPEG-PS/TS and ASF/WMV too
 GIF_EXT = {".gif"}
 DEFAULT_LIBRARY = Path.home() / "Videos" / "LinuxLivePaper"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "linuxlivepaper" / "config.json"
@@ -64,7 +65,7 @@ def set_meta(path, **kw):
 
 @dataclass
 class Item:
-    kind: str            # "live" | "video" | "gif"
+    kind: str            # "live" | "image" | "video" | "gif"
     path: str            # still for live, the file itself otherwise
     motion: str          # the video (or the GIF itself)
     mtime: float
@@ -92,9 +93,10 @@ def scan_dir(folder):
     for files in groups.values():
         stills = [f for f in files if f[0] in IMAGE_EXT]
         videos = [f for f in files if f[0] in VIDEO_EXT]
-        if stills and videos:  # pair the first of each; a leftover video stays standalone
-            s, v = stills[0], videos.pop(0)
+        if stills and videos:  # pair the first of each; the leftovers stay standalone
+            s, v = stills.pop(0), videos.pop(0)
             items.append(Item("live", s[1], v[1], max(s[2], v[2])))
+        items += [Item("image", p, p, m) for _, p, m in stills]
         items += [Item("video", p, p, m) for _, p, m in videos]
         items += [Item("gif", p, p, m) for ext, p, m in files if ext in GIF_EXT]
     return items
@@ -286,24 +288,25 @@ if __name__ == "__main__":
         Path(d, "sub").mkdir()
         Path(d, "sub", "x.webm").touch()
         items = scan(d)
-        assert sorted(i.kind for i in items) == ["gif", "live", "video", "video"], items
+        assert sorted(i.kind for i in items) == ["gif", "image", "live", "video", "video"], items
+        assert next(i for i in items if i.kind == "image").motion.endswith("a.png"), "a lone still is an image"
         live = next(i for i in items if i.kind == "live")
         assert live.path.endswith("IMG_1.JPG") and live.motion.endswith("IMG_1.MOV")
         set_meta(live.path, transition="zoom")
         set_meta(Path(d, "IMG_1.MOV"), x=1)
         assert get_meta(live.motion) == {"transition": "zoom", "x": 1} and get_meta(Path(d, "b.mp4")) == {}
-        assert len(scan(d)) == 4  # sidecar is hidden
+        assert len(scan(d)) == 5  # sidecar is hidden
         assert motion_for(live.path) == live.motion and motion_for(Path(d, "a.png")) is None
         assert motion_for(Path(d, "c.gif")).endswith("c.gif") and motion_for(Path(d, "notes.txt")) is None
         assert [i.mtime for i in scan(d)] == sorted(i.mtime for i in scan(d))  # oldest first
-        assert len(scan(d)) == 4, "subfolders are read by default"
+        assert len(scan(d)) == 5, "subfolders are read by default"
         Path(d, "sub", "deep").mkdir()
         Path(d, "sub", "deep", "y.mp4").touch()
-        assert len(scan(d)) == 5
+        assert len(scan(d)) == 6
         real = load_config
         load_config = lambda: {"scan_subfolders": False}  # noqa: E731
         try:
-            assert sorted(i.name for i in scan(d)) == ["IMG_1", "b", "c"], "subfolders off: the root only"
+            assert sorted(i.name for i in scan(d)) == ["IMG_1", "a", "b", "c"], "subfolders off: the root only"
         finally:
             load_config = real
     with tempfile.TemporaryDirectory() as d:  # collections

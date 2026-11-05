@@ -28,18 +28,24 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
 ## Using it
 - The gallery shows your **LinuxLivePaper folder** (default `~/Videos/LinuxLivePaper`, recursive) as an
   iOS-Photos-style grid: square tiles, edge to edge, oldest at the top and newest at the bottom.
-  Change the folder in ☰ → *Preferences…* (library folder, GPU acceleration, preview size). Tabs at the top: **All · Live · Collections**.
+  Change the folder in ☰ → *Preferences…* (library folder, GPU acceleration, preview size). Tabs at the top: **All · Live · Images · Videos · Collections**.
 - Use the **− / +** buttons in the header to make tiles (or, on the Collections tab, collection icons) smaller or bigger. The two
   sizes are independent and remembered between runs; long lists scroll vertically.
-  Standalone photos are not shown. Use the import button to copy videos/GIFs into the folder.
+  The gallery shows live images, plain images (JPG/PNG/WebP…), plain videos (MP4/MOV/MKV/WMV/VOB/TS…), and GIFs;
+  JPEG+MOV pairs are shown as one live image. Use the import button to copy videos/GIFs into the folder.
+  *Preferences → Gallery* can hide plain images or plain videos completely — their tab disappears too.
 - **Right-click** any tile → *Add to Collection* (existing or new), *Remove from Collection* when it already sits in one
-  (it goes back to the library folder), or *Delete* (to the Trash). An item lives in exactly one place: adding moves it.
+  (it goes back to the library folder), *Delete* (to the Trash), *Open in Application…* (pick any program from the
+  desktop's own dialog), or *Show in Files* (opens your file manager with the file highlighted).
+  An item lives in exactly one place: adding moves it.
 - **Collections** are folders in `<library>/collection/<Name>/`. Each card shows the system folder icon, or a `.png`
   you pick. Create one from **+** → *Collection…*; right-click a card (or the ✎ button inside it) to rename,
   change the icon or delete it — *Rename Collection…* in the right-click menu is a one-field prompt. Click a card to see its items.
-- Live images look like plain stills (no badge). Hover over a live, video or GIF tile to play it (muted). Click a tile to open it.
+- Live images look like plain stills (no badge). Hover over a live, video or GIF tile to play it (muted). Click a tile to open it:
+  a live image plays on press-and-hold, a plain video opens in the simple GNOME player (its own controls, no loop),
+  an image opens full size, a GIF plays in a loop.
 - **Selecting several**: the checkmark button in the header turns clicks into selection; otherwise hold Ctrl (Shift/Alt in
-  *Preferences → Multi-select*) and click or drag. Dragging paints the videos the pointer passes over, or selects
+  *Preferences → Multi-select*) and click or drag. Dragging paints the tiles the pointer passes over, or selects
   everything inside a dragged box (*Drag style*); each style can get its own key there too. Right-click the selection for
   *Live Collage with N selected* / *Add N selected to Collection* / *Remove N selected from Collection* / *Delete*.
 - *Preferences → Read subfolders* includes videos in subfolders of the library folder (the `collection/` folder is always read).

@@ -266,7 +266,7 @@ def make_thumb(item):
         return str(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
-        if item.kind != "live":  # video or GIF (GdkPixbuf's GIF loader chokes on many real-world GIFs)
+        if item.kind not in ("live", "image"):  # video or GIF (GdkPixbuf's GIF loader chokes on many real-world GIFs)
             pb = grab_frame(src, video_duration(src) / 2, None)
             pb = pb.scale_simple(WIDTH, max(1, pb.get_height() * WIDTH // pb.get_width()),
                                  GdkPixbuf.InterpType.BILINEAR)

@@ -105,7 +105,66 @@ def in_collection(item):
     return Path(item.path).parent.parent.resolve() == library.collections_dir().resolve()
 
 
-TABS = [("All", None), ("Live", "live"), ("Collections", "collections")]
+PORTAL = "org.freedesktop.portal.Desktop"
+PORTAL_PATH = "/org/freedesktop/portal/desktop"
+
+
+def show_in_files(win, path):
+    """Open the file manager with the file selected; just open its folder when nothing answers ShowItems."""
+    path = Path(path)
+    uri = Gio.File.new_for_path(str(path)).get_uri()
+    try:  # needs --talk-name=org.freedesktop.FileManager1 in the flatpak manifest
+        Gio.bus_get_sync(Gio.BusType.SESSION, None).call_sync(
+            "org.freedesktop.FileManager1", "/org/freedesktop/FileManager1", "org.freedesktop.FileManager1",
+            "ShowItems", GLib.Variant("(ass)", ([uri], "")), None, Gio.DBusCallFlags.NONE, 1500, None)
+        return
+    except GLib.Error:
+        pass
+    Gtk.FileLauncher.new(Gio.File.new_for_path(str(path.parent))).launch(win, None, lambda l, res: _launched(l, res, win))
+
+
+def _launched(launcher, res, win):
+    try:
+        launcher.launch_finish(res)
+    except GLib.Error:
+        win.toast("Couldn't open the file manager")
+
+
+def open_with(win, path):
+    """Let the desktop open the file in an application the user picks. Inside the flatpak only the portal can
+    reach host apps, so ask it (ask=true shows the desktop's own chooser); AppChooserDialog otherwise."""
+    path = Path(path)
+    uri = Gio.File.new_for_path(str(path)).get_uri()
+    try:
+        Gio.bus_get_sync(Gio.BusType.SESSION, None).call_sync(
+            PORTAL, PORTAL_PATH, "org.freedesktop.portal.OpenURI", "OpenURI",
+            GLib.Variant("(ssa{sv})", ("", uri, {"ask": GLib.Variant("b", True)})),
+            GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE, 1500, None)
+        return
+    except GLib.Error:
+        pass
+    if hasattr(Gtk, "AppChooserDialog"):
+        dialog = Gtk.AppChooserDialog.new(win, Gtk.DialogFlags.MODAL, Gio.File.new_for_path(str(path)))
+        dialog.set_heading(f"Open {path.name} with")
+
+        def picked(d, response):
+            app = d.get_widget().get_app_info() if response == Gtk.ResponseType.OK else None
+            d.close()
+            if app:
+                try:
+                    app.launch([Gio.File.new_for_path(str(path))], None)
+                except GLib.Error as err:
+                    print("open with failed:", err)
+
+        dialog.connect("response", picked)
+        dialog.present()
+        return
+    Gio.AppInfo.launch_default_for_uri(uri, None)
+
+
+TABS = [("All", None), ("Live", "live"), ("Images", "image"), ("Videos", "video"),
+        ("Collections", "collections")]
+TAB_PREFS = {"image": "show_images", "video": "show_videos"}  # a tab the user switched off stays hidden
 CSS = """
 gridview.photos, gridview.photos > child { padding: 0; margin: 0; border-radius: 0; background: none; }
 .tile { background: alpha(@view_fg_color, 0.06); }
@@ -305,7 +364,7 @@ class Tile(Gtk.Overlay):
                 if anim and self.hovering and self.obj is obj and self.stream is None:
                     self.stream = GifPlay(anim, self.pic)
             pool.submit(lambda: GLib.idle_add(loaded, GifPlay.load(obj.item.motion)))
-        elif obj:
+        elif obj and obj.item.kind != "image":  # a still has nothing to play
             playable(obj.item, lambda p: self.hovering and self.obj is obj and self.stream is None
                      and setattr(self, "stream", play_stream(p, self.pic)))
         return False
@@ -568,13 +627,19 @@ class Viewer(Adw.NavigationPage):
         self.live = False
         item = self.objs[self.index].item
         self.set_title(item.name)
-        self.make_btn.set_visible(item.kind != "live")
+        self.make_btn.set_visible(item.kind in ("video", "gif"))  # a still has nothing to edit into a live image
         self.style_dd.set_visible(item.kind == "live")
         if item.kind == "live":
             view = LiveView(item, self._on_live, self._on_held)
         elif item.kind == "video":
-            view = Gtk.Video(media_stream=media_file(item.path, muted=False, loop=True), autohide=True)
+            # plain video: Gtk.Video's own controls, no loop
+            # GtkVideo has no autohide property (that one is GtkMediaControls'); passing it raised TypeError, so
+            # every plain video failed to open in the viewer.
+            view = Gtk.Video(media_stream=media_file(item.path, muted=False, loop=False))
             view.get_media_stream().play()
+        elif item.kind == "image":
+            view = Gtk.Picture.new_for_filename(item.path)
+            view.set_content_fit(Gtk.ContentFit.CONTAIN)
         else:  # gif: loop the MP4 proxy
             view = Gtk.Picture.new_for_filename(item.path)  # first frame until the proxy is ready
             view.set_content_fit(Gtk.ContentFit.CONTAIN)
@@ -640,9 +705,15 @@ class MediaGrid(Gtk.Stack):
 
     def load_show_prefs(self):
         cfg = library.load_config()
-        self.show_collected = {None: cfg.get("all_shows_collected", True), "live": cfg.get("live_shows_collected", True)}
+        collected = cfg.get("all_shows_collected", True)
+        # the All tab, Images and Videos all obey "show collection items in All"; Live has its own switch
+        self.show_collected = {None: collected, "live": cfg.get("live_shows_collected", True),
+                               "image": collected, "video": collected}
+        self.show_kinds = {"image": cfg.get("show_images", True), "video": cfg.get("show_videos", True)}
 
     def _keep(self, o):
+        if not self.show_kinds.get(o.item.kind, True):  # Preferences → Gallery hid this kind
+            return False
         if self.collection is None and o.in_collection and not self.show_collected.get(self.kind, True):
             return False
         return self.kind is None or o.item.kind == self.kind
@@ -856,11 +927,13 @@ class Window(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         switch = Gtk.Box(css_classes=["linked"])
         first = None
+        self.tab_buttons = {}
         for label, kind in TABS:
             b = Gtk.ToggleButton(label=label, group=first)
             first = first or b
             b.connect("toggled", lambda btn, k=kind: btn.get_active() and self._set_tab(k))
             switch.append(b)
+            self.tab_buttons[kind] = b
         header.set_title_widget(switch)
         create_menu = Gio.Menu()
         create_menu.append("Live Image from Video or GIF…", "win.new-live")
@@ -892,6 +965,8 @@ class Window(Adw.ApplicationWindow):
                          ("new-collection", self.new_collection),
                          ("open-folder", lambda: Gtk.FileLauncher.new(
                              Gio.File.new_for_path(str(library.library_dir()))).launch(self, None, None)),
+                         ("open-with", lambda: open_with(self, self.ctx_item.motion)),
+                         ("show-in-files", lambda: show_in_files(self, self.ctx_item.motion)),
                          ("open-edit", lambda: self.open_editor(self.ctx_item.motion)),
                          ("open-collage1", lambda: self.open_collage(1)),
                          ("open-collage4", lambda: self.open_collage(4)),
@@ -949,6 +1024,7 @@ class Window(Adw.ApplicationWindow):
         self.nav.connect("notify::visible-page", lambda *_: self.selection_changed())
         self.toasts = Adw.ToastOverlay(child=self.nav)  # around every page, so toasts show from any page
         self.set_content(self.toasts)
+        self.apply_view_prefs()
         first.set_active(True)
         self.apply_select_pref()
         self.selection_changed()
@@ -994,6 +1070,19 @@ class Window(Adw.ApplicationWindow):
             self.stack.set_visible_child_name("library")
         self.selection_changed()
 
+    def apply_view_prefs(self):
+        """Preferences → Gallery: show/hide plain images and videos everywhere, their tabs included."""
+        grids = [self.library_grid] + [p.grid for p in self.nav.get_navigation_stack() if isinstance(p, CollectionPage)]
+        for grid in grids:
+            grid.load_show_prefs()
+            grid.filter.changed(Gtk.FilterChange.DIFFERENT)
+            grid._update()
+        for kind, key in TAB_PREFS.items():
+            on = library.load_config().get(key, True)
+            self.tab_buttons[kind].set_visible(on)
+            if not on and self.tab_buttons[kind].get_active():
+                self.tab_buttons[None].set_active(True)
+
     def rescan(self):
         """Reload everything that's on screen: the library, the collections and an open collection page."""
         self.library_grid.status.set_description(f"Your library is {library.library_dir()}.\n"
@@ -1031,11 +1120,16 @@ class Window(Adw.ApplicationWindow):
                 add.append_item(mi)
         add.append("New Collection…", "win.add-to-new")
         menu = Gio.Menu()
-        edit = Gio.Menu()
-        edit.append("Edit as Live Image…", "win.open-edit")
-        edit.append("Live Collage — 1 slot", "win.open-collage1")
-        edit.append("Live Collage — 4 slots", "win.open-collage4")
-        menu.append_section(None, edit)
+        if item.kind != "image":  # a still has nothing to edit into a live image
+            edit = Gio.Menu()
+            edit.append("Edit as Live Image…", "win.open-edit")
+            edit.append("Live Collage — 1 slot", "win.open-collage1")
+            edit.append("Live Collage — 4 slots", "win.open-collage4")
+            menu.append_section(None, edit)
+        open_with_menu = Gio.Menu()
+        open_with_menu.append("Open in Application…", "win.open-with")
+        open_with_menu.append("Show in Files", "win.show-in-files")
+        menu.append_section(None, open_with_menu)
         menu.append_submenu("Add to Collection", add)
         if in_collection(item):
             menu.append("Remove from Collection", "win.remove-from")
@@ -1201,6 +1295,11 @@ class Window(Adw.ApplicationWindow):
         collection_dialog(self, lambda c: (self.toast(f"Created {c.name}"), self.rescan()))
 
     def open_collection(self, collection):
+        # A slow page pushes for a while; a second activation (double click) must not push it twice, or Back has
+        # to be pressed twice to leave. The page is on the stack as soon as push() is called.
+        if any(isinstance(p, CollectionPage) and p.collection.path == collection.path
+               for p in self.nav.get_navigation_stack()):
+            return
         self.nav.push(CollectionPage(self, collection))
 
     def change_icon(self, collection):
@@ -1365,11 +1464,14 @@ class Window(Adw.ApplicationWindow):
 
             def toggled(w, _p, key=key):
                 library.set_pref(key, w.get_active())
-                g = self.library_grid
-                g.load_show_prefs()
-                g.filter.changed(Gtk.FilterChange.DIFFERENT)
-                g._update()
+                self.apply_view_prefs()
             row.connect("notify::active", toggled)
+            gallery.add(row)
+        for key, what in (("show_images", "images"), ("show_videos", "videos")):
+            row = Adw.SwitchRow(title=f"Show {what}", active=library.load_config().get(key, True),
+                                subtitle=f"Plain {what} in the gallery; its tab is hidden too when this is off")
+            row.connect("notify::active", lambda w, _p, key=key: (library.set_pref(key, w.get_active()),
+                                                                  self.apply_view_prefs()))
             gallery.add(row)
         page.add(gallery)
         multi = Adw.PreferencesGroup(title="Multi-select", description="Pick several videos to make a collage "

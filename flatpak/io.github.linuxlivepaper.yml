@@ -10,6 +10,8 @@ finish-args:
   - --socket=fallback-x11
   - --socket=pulseaudio
   - --device=dri
+  # "Show in Files" highlights the file in the user's file manager (ShowItems on the session bus)
+  - --talk-name=org.freedesktop.FileManager1
   # the library is one user-chosen folder anywhere (default ~/Videos/LinuxLivePaper), sources can be on external drives
   - --filesystem=home
   - --filesystem=/media
