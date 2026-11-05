@@ -6,29 +6,41 @@ import time
 import uuid
 from pathlib import Path
 
-from . import effects, overlays as ov, thumbs
+from . import effects, interp, overlays as ov, thumbs
 from .library import library_dir
 
 
 def make_live(src, start=0.0, end=None, key_time=None, out_dir=None, name=None, opts=None, overlay_list=(),
-              repeat=1):
+              repeat=1, interpolate=None):
     """Render [start, end] of src (video or GIF) through effects `opts` → <name>.mov (played `repeat` times back
     to back), and grab the frame at key_time (source seconds after start, mapped through speed/reverse) → <name>.jpg.
+    interpolate: interp settings (RIFE/FLAVR frames added to the one pass before repeating), None/off = none.
     Defaults to the library folder."""
     jpg, mov = out_paths(out_dir, name)
     opts = {**effects.DEFAULT, **(opts or {})}
     render = ov.render if overlay_list else effects.render
     kw = {"overlays": overlay_list} if overlay_list else {}
-    if repeat > 1:
-        with tempfile.TemporaryDirectory() as d:
-            once = render(src, start, end, Path(d, "once.mov"), opts, **kw)
-            effects.thumbs.repeat(once, mov, repeat, live_tags())
-    else:
-        render(src, start, end, mov, opts, extra=live_tags(), **kw)
+    with tempfile.TemporaryDirectory() as d:
+        finish(lambda out, extra: render(src, start, end, out, opts, extra=extra, **kw), mov, d, repeat, interpolate)
     length = (end if end is not None else effects.thumbs.video_duration(str(src))) - start
     key = effects.out_time(key_time or 0.0, length, opts)
-    still(mov, min(max(0.0, key), effects.out_length(length, opts) - 0.05), jpg)
+    f = interp.stretch(interpolate)
+    still(mov, min(max(0.0, key * f), effects.out_length(length, opts) * f - 0.05), jpg)
     return jpg, mov
+
+
+def finish(render, mov, d, repeat=1, interpolate=None, tags=None):
+    """render(out, extra) one pass, interpolate it, repeat it → mov tagged as a live MOV. d: scratch dir."""
+    tags = live_tags() if tags is None else tags
+    on = interp.enabled(interpolate)
+    once = mov if repeat <= 1 else Path(d, "once" + Path(mov).suffix)
+    raw = Path(d, "raw" + Path(mov).suffix) if on else once
+    render(raw, tags if raw == mov else ())
+    if on:
+        interp.apply(raw, once, interpolate, tags if once == mov else ())
+    if repeat > 1:
+        effects.thumbs.repeat(once, mov, repeat, tags)
+    return mov
 
 
 def out_paths(out_dir=None, name=None):
@@ -73,4 +85,13 @@ if __name__ == "__main__":
         jpg, mov = make_live(src, 0.5, 2.5, 1.0, out, "x", repeat=3)
         assert 5.8 < effects.thumbs.video_duration(str(mov)) < 6.3 and "content.identifier" in subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format_tags", str(mov)], capture_output=True, text=True).stdout
+        from . import interp  # 2x smoother then repeated twice (only when PyTorch + a RIFE model are set up)
+        sm = {**interp.DEFAULTS, "engine": "rife", "factor": 2}
+        if interp.python(sm) and interp.installed(sm):
+            jpg, mov = make_live(src, 0.5, 2.5, 1.0, out, "i", repeat=2, interpolate=sm)
+            assert 3.8 < effects.thumbs.video_duration(str(mov)) < 4.3 and jpg.stat().st_size
+            assert "content.identifier" in subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags",
+                                                           str(mov)], capture_output=True, text=True).stdout
+            jpg, mov = make_live(src, 0.5, 2.5, 1.0, out, "s", interpolate={**sm, "mode": "slow"})
+            assert 3.8 < effects.thumbs.video_duration(str(mov)) < 4.3
     print("livemake ok")

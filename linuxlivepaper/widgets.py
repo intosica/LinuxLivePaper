@@ -5,10 +5,11 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Graphene, Gsk, Gtk  # noqa: E402
 
 import os  # noqa: E402
+import threading  # noqa: E402
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import library, thumbs  # noqa: E402
+from . import interp, library, thumbs  # noqa: E402
 
 NEW = "New Collection…"
 
@@ -250,6 +251,105 @@ class CollectionRow(Adw.ComboRow):
     def collection(self):
         i = self.get_selected()
         return library.get_collection(self.names[i - 1]) if 1 <= i <= len(self.names) else None
+
+
+class InterpGroup(Adw.PreferencesGroup):
+    """'Frame interpolation' settings shared by the editor and collage panels (saved in the config, used on Save)."""
+
+    def __init__(self):
+        super().__init__(title="Frame interpolation", description="AI in-between frames (RIFE or FLAVR) added when "
+                         "saving: smoother motion or slow motion. Needs PyTorch; a GPU makes it fast.")
+        self.s, self._filling = interp.settings(), True
+        self.engine = self._combo("Engine", None, interp.ENGINES, "engine")
+        self.model = self._combo("RIFE model", "4.25 is upstream's recommended default",
+                                 {k: k for k in interp.RIFE}, "rife")
+        self.factor = Adw.ComboRow(title="Frames", subtitle="Each frame becomes this many")
+        self.factor.connect("notify::selected", self._factor_picked)
+        self.add(self.factor)
+        self.mode = self._combo("Use them for", None, interp.MODES, "mode")
+        self.scale = self._combo("Detail", "Half runs the network on smaller frames", interp.SCALES, "scale")
+        self.py = Adw.EntryRow(title="PyTorch Python (empty = find it)", text=self.s["python"],
+                               show_apply_button=True)
+        self.py.connect("apply", lambda r: self._set("python", r.get_text().strip()))
+        self.add(self.py)
+        self.status = Adw.ActionRow(title="Model")
+        self.dl = Gtk.Button(label="Download", valign=Gtk.Align.CENTER)
+        self.dl.connect("clicked", self._download)
+        self.status.add_suffix(self.dl)
+        self.add(self.status)
+        self._sync()
+
+    def _combo(self, title, subtitle, choices, key):
+        ids = list(choices)
+        row = Adw.ComboRow(title=title, subtitle=subtitle, model=Gtk.StringList.new(list(choices.values())),
+                           selected=ids.index(self.s[key]) if self.s[key] in ids else 0)
+        row.connect("notify::selected", lambda r, _: self._set(key, ids[r.get_selected()]))
+        self.add(row)
+        return row
+
+    def _factor_picked(self, r, _):
+        f = getattr(self, "_factors", [])
+        if not self._filling and r.get_selected() < len(f):
+            self._set("factor", f[r.get_selected()])
+
+    def _set(self, key, value):
+        self.s[key] = value
+        interp.save(**{key: value})
+        self._sync()
+
+    def _sync(self):
+        s, on = self.s, self.s["engine"] != "off"
+        for row in (self.factor, self.mode, self.scale, self.py, self.status):
+            row.set_visible(on)
+        self.model.set_visible(s["engine"] == "rife")
+        if not on:
+            return
+        self._factors = interp.FACTORS[s["engine"]]
+        if s["factor"] not in self._factors:
+            s["factor"] = 2
+            interp.save(factor=2)
+        if getattr(self, "_factor_engine", None) != s["engine"]:  # rebuilt only when the choices change
+            self._factor_engine, self._filling = s["engine"], True
+            self.factor.set_model(Gtk.StringList.new([f"{f}×" + (" (own model)" if s["engine"] == "flavr" else "")
+                                                      for f in self._factors]))
+            self.factor.set_selected(self._factors.index(s["factor"]))
+            self._filling = False
+        name = f"RIFE {s['rife']}" if s["engine"] == "rife" else f"FLAVR {s['factor']}×"
+        ok = interp.installed(s)
+        self.status.set_title(name)
+        self.status.set_subtitle("Downloaded" if ok else "Not downloaded yet" +
+                                 (" (~505 MB)" if s["engine"] == "flavr" else " (~23 MB)"))
+        self.dl.set_visible(not ok)
+        self.dl.set_sensitive(True)
+        snap = dict(s)
+
+        def check():  # importing torch takes seconds: never on the UI thread
+            py = interp.python(snap)
+            GLib.idle_add(lambda: snap == self.s and self.py.set_title(
+                f"PyTorch Python: {py}" if py else "PyTorch Python: none found — enter its path") and False)
+        threading.Thread(target=check, daemon=True).start()
+
+    def _download(self, _b):
+        s = dict(self.s)
+        self.dl.set_sensitive(False)
+
+        def progress(f):
+            GLib.idle_add(lambda: self.status.set_subtitle(f"Downloading… {f:.0%}") and False)
+
+        def work():
+            try:
+                interp.install(s, progress)
+                err = None
+            except Exception as ex:
+                thumbs.log("interp download failed:", ex)
+                err = str(ex)
+            GLib.idle_add(lambda: (self._sync(), err and self.status.set_subtitle(f"Download failed: {err}"))
+                          and False)
+        threading.Thread(target=work, daemon=True).start()
+
+    def settings(self):
+        """Snapshot for one save (None when off)."""
+        return dict(self.s) if interp.enabled(self.s) else None
 
 
 def preview_quality_dropdown():

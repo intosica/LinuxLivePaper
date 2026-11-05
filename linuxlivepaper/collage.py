@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import effects, thumbs
+from .livemake import finish
 from . import overlays as ovmod
 
 # id → (label, cells as (x, y, w, h) fractions of the canvas)
@@ -220,9 +221,10 @@ def command(c, cells, out, height=None, fast=False, extra=(), overlays=()):
             "-r", str(FPS), "-t", f"{D:.3f}", *extra, str(out)]
 
 
-def render(c, out, height=None, fast=False, extra=(), overlays=(), cache=None, repeat=None):
+def render(c, out, height=None, fast=False, extra=(), overlays=(), cache=None, repeat=None, interpolate=None):
     """Render the collage to `out`: one pass of the longest cell, played `repeat` (default c["repeat"]) times.
-    cache: directory to keep cell passes in, so editing one cell only re-renders that cell."""
+    cache: directory to keep cell passes in, so editing one cell only re-renders that cell.
+    interpolate: interp settings applied to the one pass before repeating (saved files only, never previews)."""
     if not any(c["cells"]):
         raise ValueError("Add at least one video to the collage")
     repeat = max(1, int(repeat or c.get("repeat") or 1))
@@ -233,11 +235,9 @@ def render(c, out, height=None, fast=False, extra=(), overlays=(), cache=None, r
         todo = [(i, x, *rects(c, W, H)[i][2:]) for i, x in enumerate(c["cells"]) if x]
         with ThreadPoolExecutor(max_workers=max(1, min(4, os.cpu_count() or 2))) as ex:
             files = list(ex.map(lambda t: (t[0], *_cell_file(t[1], t[2], t[3], fast, d)), todo))
-        once = out if repeat == 1 else Path(tmp, "once" + Path(out).suffix)
         # a hung ffmpeg must never wedge the preview thread pool
-        thumbs.run(command(c, files, once, height, fast, extra if repeat == 1 else (), overlays))
-        if repeat > 1:
-            thumbs.repeat(once, out, repeat, extra)
+        finish(lambda o, ex: thumbs.run(command(c, files, o, height, fast, ex, overlays)), out, tmp, repeat,
+               interpolate, list(extra))
     return out
 
 
@@ -294,6 +294,12 @@ if __name__ == "__main__":
         j = json.loads(subprocess.run([*probe, str(render(c, Path(d, "o.mp4"), height=240, fast=True, overlays=ovs))],
                                       capture_output=True, text=True).stdout)
         assert [(s["width"], s["height"]) for s in j["streams"] if s["codec_type"] == "video"] == [(240, 240)], j
+        from . import interp  # AI slow motion (only when a PyTorch Python + RIFE model are set up here)
+        sl = {**interp.DEFAULTS, "engine": "rife", "factor": 2, "mode": "slow"}
+        if interp.python(sl) and interp.installed(sl):
+            j = json.loads(subprocess.run([*probe, str(render(c, Path(d, "i.mp4"), height=240, repeat=2,
+                                                              interpolate=sl))], capture_output=True, text=True).stdout)
+            assert abs(float(j["format"]["duration"]) - 4 * duration(c)) < 0.3, j["format"]
         # zoom/pan: the crop always fills the cell, whatever the pan is
         zw, zh = fit_size({"zoom": 2.0}, 360, 640, 16 / 9)
         assert zw >= 720 and zh >= 640, (zw, zh)

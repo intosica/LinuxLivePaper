@@ -16,7 +16,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango, Pa
 
 from . import effects, export, library, livemake, overlays, thumbs  # noqa: E402
 from .overlay_ui import OverlayHost  # noqa: E402
-from .widgets import CollectionRow, HoldButton, preview_quality_dropdown  # noqa: E402
+from .widgets import CollectionRow, HoldButton, InterpGroup, preview_quality_dropdown  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, release  # noqa: E402
 
 YELLOW = (0.96, 0.76, 0.07)
@@ -491,6 +491,8 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         press.add(try_row)
         page.add(press)
         page.add(self.overlay_group)
+        self.interp_group = InterpGroup()
+        page.add(self.interp_group)
         save = Adw.PreferencesGroup(title="Save")
         self.collection_row = CollectionRow()
         save.add(self.collection_row)
@@ -812,12 +814,13 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         s, e, k, opts, style, n = self.tl.s, self.tl.e, self.tl.k, dict(self.opts), self.style, self.repeat
         ovs = [dict(o) for o in self.overlays]
         col = self.collection_row.collection()
+        smooth = self.interp_group.settings()
 
         def work():
             try:
                 # straight into the collection folder when one is picked: one copy on disk, All reads the subfolders
                 res, err = livemake.make_live(self.src, s, e, k - s, out_dir=col.path if col else None, opts=opts,
-                                              overlay_list=ovs, repeat=n), None
+                                              overlay_list=ovs, repeat=n, interpolate=smooth), None
                 library.set_meta(res[0], transition=style)
             except Exception as ex:  # surfaced as a toast
                 res, err = None, str(ex)

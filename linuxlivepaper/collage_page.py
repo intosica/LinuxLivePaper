@@ -15,11 +15,11 @@ gi.require_version("Adw", "1")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk, Pango  # noqa: E402
 
-from . import collage, effects, export, library, livemake, overlays, thumbs  # noqa: E402
+from . import collage, effects, export, interp, library, livemake, overlays, thumbs  # noqa: E402
 from .editor import Timeline  # noqa: E402
 from .overlay_ui import OverlayHost  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, release  # noqa: E402
-from .widgets import CollectionRow, FileBrowser, HoldButton, preview_quality_dropdown  # noqa: E402
+from .widgets import CollectionRow, FileBrowser, HoldButton, InterpGroup, preview_quality_dropdown  # noqa: E402
 
 PROXY_H = 360
 SYNC_TOL = 0.2  # seconds a live cell may be off the shared collage clock before it is seeked back
@@ -454,6 +454,8 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         live.add(try_row)
         live.add(keep)
         page.add(live)
+        page.interp_group = InterpGroup()
+        page.add(page.interp_group)
         page.collection_row = keep
         self.panel_box.set_child(page)
         self.panel_page = page
@@ -1114,12 +1116,15 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         c = {**self.c, "cells": [dict(x) if x else None for x in self.c["cells"]]}
         style = self.style
         col = self.panel_page.collection_row.collection()
+        smooth = self.panel_page.interp_group.settings()
 
         def work():
             try:
                 jpg, mov = livemake.out_paths(col.path if col else None)
-                collage.render(c, mov, extra=livemake.live_tags(), overlays=[dict(o) for o in self.overlays])
-                livemake.still(mov, min(c["cover"], collage.duration(c) - 0.05), jpg)
+                collage.render(c, mov, extra=livemake.live_tags(), overlays=[dict(o) for o in self.overlays],
+                               interpolate=smooth)
+                f = interp.stretch(smooth)  # slow motion stretches the timeline, the cover moment with it
+                livemake.still(mov, min(c["cover"] * f, collage.duration(c) * f - 0.05), jpg)
                 library.set_meta(jpg, transition=style)
                 res, err = (jpg, mov), None
             except Exception as ex:

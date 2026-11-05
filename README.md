@@ -76,6 +76,19 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
   *Try it* previews the saved result (with repeats), and overlays work the same as in the editor (over the whole canvas;
   clicking an empty spot selects the cell under it). Changes re-render while playing (cell passes are cached, so only
   the changed cell is re-encoded).
+- **Frame interpolation** (editor and collage panels, *Frame interpolation* group): when saving, add AI in-between
+  frames with [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) (models 4.26, 4.25 — upstream's
+  recommended default — and 4.25.lite; 2×/3×/4×/8×) or [FLAVR](https://github.com/tarun005/FLAVR) (its 2×, 4× and
+  8× pretrained models, one model per factor). *Use them for*: **Smoother** (frame rate × factor, same length) or
+  **Slow motion** (same frame rate, clip × factor longer, audio slowed with pitch kept; the cover moment follows).
+  *Detail → Half* runs the network on smaller frames (faster, for 4K). Collages are composed first and the finished
+  pass is interpolated once (not every cell), then repeated. Previews, *Try it* and GIF/WebP exports are not
+  interpolated. **Needs a Python with PyTorch + torchvision** (CUDA GPU strongly recommended): the app finds one in
+  the usual places (`python3`, `~/miniconda3`, `~/anaconda3`, `~/miniforge3`, `~/mambaforge`,
+  `~/.local/share/linuxlivepaper/interp/venv`) or you type its path in the group. *Download* fetches the selected
+  model (RIFE ~23 MB, FLAVR ~505 MB each) and the upstream network code into `~/.local/share/linuxlivepaper/interp/`.
+  On the GPU, decoding (NVDEC), YUV↔RGB conversion, the network and encoding (NVENC) all run there; the CPU only moves
+  bytes. Not available inside the Flatpak sandbox (no PyTorch there) — run from source for it.
 
 A *live image* is a still and a video that share a name in the same folder (`x.jpg` + `x.mov`).
 That means Live Photos copied over from an iPhone show up as LIVE too.
