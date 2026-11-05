@@ -101,13 +101,21 @@ def scan_dir(folder):
 
 
 def scan(root=None):
-    """Recursive scan, oldest first (the gallery shows newest at the bottom, like iOS Photos).
-    Includes the collection/ subfolders, so All is simply everything on disk. Legacy hard-linked duplicates
-    (same file in the root and in a collection) show once, as the collection's copy."""
+    """Scan, oldest first (the gallery shows newest at the bottom, like iOS Photos). Subfolders are read when the
+    user wants them (`scan_subfolders` preference); the collection/ folders are always read, so All can show the
+    collected items too (Preferences decides whether it does, and the tab kind filters them). Legacy hard-linked
+    duplicates (same file in the root and in a collection) show once, as the collection's copy."""
     root = str(root or library_dir())
+    subfolders = load_config().get("scan_subfolders", True)
     best = {}
     for dirpath, dirnames, _ in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        rel = Path(dirpath).relative_to(root).parts
+        if not subfolders:  # root + collection/<Name>, nothing else
+            if not rel:
+                dirnames[:] = [d for d in dirnames if d == COLLECTIONS]
+            elif rel[0] != COLLECTIONS or len(rel) > 1:
+                dirnames[:] = []
         for it in scan_dir(dirpath):
             try:
                 st = os.stat(it.motion)
@@ -288,6 +296,16 @@ if __name__ == "__main__":
         assert motion_for(live.path) == live.motion and motion_for(Path(d, "a.png")) is None
         assert motion_for(Path(d, "c.gif")).endswith("c.gif") and motion_for(Path(d, "notes.txt")) is None
         assert [i.mtime for i in scan(d)] == sorted(i.mtime for i in scan(d))  # oldest first
+        assert len(scan(d)) == 4, "subfolders are read by default"
+        Path(d, "sub", "deep").mkdir()
+        Path(d, "sub", "deep", "y.mp4").touch()
+        assert len(scan(d)) == 5
+        real = load_config
+        load_config = lambda: {"scan_subfolders": False}  # noqa: E731
+        try:
+            assert sorted(i.name for i in scan(d)) == ["IMG_1", "b", "c"], "subfolders off: the root only"
+        finally:
+            load_config = real
     with tempfile.TemporaryDirectory() as d:  # collections
         library_dir = lambda: Path(d)  # noqa: E731
         _trash = lambda p: shutil.rmtree(p) if Path(p).is_dir() else Path(p).unlink()  # keep the real Trash clean
@@ -300,6 +318,8 @@ if __name__ == "__main__":
         assert add_to_collection(live, c) and not add_to_collection(c.items()[0], c)
         assert not Path(d, "IMG_2.jpg").exists() and not Path(d, "IMG_2.mov").exists(), "moved, not copied"
         assert len(scan(d)) == 1, "All reads the collection subfolders"
+        load_config = lambda: {"scan_subfolders": False}  # noqa: E731
+        assert len(scan(d)) == 1, "collections are read even with subfolders off"
         [copy] = c.items()
         assert copy.kind == "live" and get_meta(copy.path) == {"transition": "fade"}
         os.link(copy.path, Path(d, "IMG_2.jpg"))  # legacy hard-linked duplicate shows once

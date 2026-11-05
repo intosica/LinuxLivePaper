@@ -36,8 +36,13 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
   never removes the collection copy; inside a collection, *Remove from Collection* removes only that copy.
 - **Collections** are folders in `<library>/collection/<Name>/`. Each card shows the system folder icon, or a `.png`
   you pick. Create one from **+** → *Collection…*; right-click a card (or the ✎ button inside it) to rename,
-  change the icon or delete it. Click a card to see its items.
+  change the icon or delete it — *Rename Collection…* in the right-click menu is a one-field prompt. Click a card to see its items.
 - Live images look like plain stills (no badge). Hover over a live, video or GIF tile to play it (muted). Click a tile to open it.
+- **Selecting several**: the checkmark button in the header turns clicks into selection; otherwise hold Ctrl (Shift/Alt in
+  *Preferences → Multi-select*) and click or drag. Dragging paints the videos the pointer passes over, or selects
+  everything inside a dragged box (*Drag style*); each style can get its own key there too. Right-click the selection for
+  *Live Collage with N selected* / *Add N selected to Collection* / *Delete*.
+- *Preferences → Read subfolders* includes videos in subfolders of the library folder (the `collection/` folder is always read).
 - In the viewer, **press and hold** a live image to play it with sound (Space also plays it). Use ←/→ to move
   between items and Esc to go back. The dropdown in the header picks the press effect
   (Immersive blur, Zoom, Fade, Instant) for that live image.

@@ -7,6 +7,10 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Graphene", "1.0")
 from gi.repository import Gdk, GdkPixbuf, GLib, Graphene, Gtk  # noqa: E402
 
+from . import glleak  # noqa: E402
+
+glleak.install()  # every stream played anywhere in the app goes through GTK's sink, so once per process is enough
+
 # Press transition knobs (tune by feel).
 T_IN, T_OUT = 0.55, 0.40   # seconds to go still→video and back
 BLUR_PX = 22.0             # peak gaussian blur radius

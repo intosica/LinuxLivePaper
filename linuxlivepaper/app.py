@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk  # noqa: E402
 
 from . import effects, export, library, thumbs  # noqa: E402
 from .collage_page import CollagePage  # noqa: E402
@@ -51,11 +51,40 @@ SELECTED = {}  # path → Item: the multi-selection (shared by every grid)
 TILES = weakref.WeakSet()
 SELECT_KEYS = {"ctrl": ("Ctrl", Gdk.ModifierType.CONTROL_MASK), "shift": ("Shift", Gdk.ModifierType.SHIFT_MASK),
                "alt": ("Alt", Gdk.ModifierType.ALT_MASK)}
+SELECT_SHAPES = {"linear": "Linear — paint what the pointer passes over",
+                 "rect": "Rectangle — everything inside the dragged box"}
 COLLAGE_LAYOUT = {1: "2h", 2: "2h", 3: "1+2", 4: "4", 5: "6", 6: "6", 7: "9", 8: "9", 9: "9"}  # clips → layout
 
 
-def select_key_mask():
-    return SELECT_KEYS.get(library.load_config().get("select_key", "ctrl"), SELECT_KEYS["ctrl"])[1]
+def select_key_names():
+    """(linear key, rectangle key). Same key unless the user gave each style its own; they are kept different."""
+    cfg = library.load_config()
+    single = cfg.get("select_key", "ctrl")
+    single = single if single in SELECT_KEYS else "ctrl"
+    if not cfg.get("select_split", False):
+        return single, single
+    lin = cfg.get("select_key_linear", single)
+    lin = lin if lin in SELECT_KEYS else single
+    rect = cfg.get("select_key_rect", single)
+    if rect not in SELECT_KEYS or rect == lin:  # never one key for both styles
+        rect = next(k for k in SELECT_KEYS if k != lin)
+    return lin, rect
+
+
+def select_masks():
+    lin, rect = select_key_names()
+    return SELECT_KEYS[lin][1], SELECT_KEYS[rect][1]
+
+
+def select_shape(state=0):
+    """Which drag style a press means: the held key decides when the two styles have different keys, else the pref."""
+    lin, rect = select_masks()
+    if state & rect and not state & lin:
+        return "rect"
+    if state & lin and not state & rect:
+        return "linear"
+    shape = library.load_config().get("select_shape", "linear")
+    return shape if shape in SELECT_SHAPES else "linear"
 
 
 def toggle_selected(item):
@@ -84,6 +113,7 @@ flowbox.collections > flowboxchild { padding: 6px; border-radius: 12px; }
 .hold { background: alpha(currentColor, 0.12); border-radius: 999px; padding: 5px 14px; }
 .hold:hover { background: alpha(currentColor, 0.22); }
 .hold.holding { background: #3584e4; color: white; }
+.rubberband { background: alpha(@accent_bg_color, 0.22); border: 1px solid @accent_bg_color; border-radius: 2px; }
 """
 pool = ThreadPoolExecutor(max_workers=max(2, (os.cpu_count() or 4) // 2))
 
@@ -582,11 +612,18 @@ class MediaGrid(Gtk.Stack):
         self.status = Adw.StatusPage(icon_name="camera-photo-symbolic", title=empty_title, description=empty_desc)
         self.add_named(self.status, "status")
         scroll = Gtk.ScrolledWindow(child=self.grid)
-        self.add_named(scroll, "grid")
+        # Rubber band for the rectangle drag style: an overlay child positioned with margins, in viewport coords
+        # (the same space the drag gesture reports), so it needs no scroll maths of its own.
+        self.band = Gtk.Box(halign=Gtk.Align.START, valign=Gtk.Align.START, can_target=False,
+                            css_classes=["rubberband"], visible=False)
+        self.canvas = Gtk.Overlay(child=scroll)
+        self.canvas.add_overlay(self.band)
+        self.add_named(self.canvas, "grid")
         # iOS-style: press and drag across tiles to select (or, starting on a selected one, deselect) them all
         drag = Gtk.GestureDrag(button=Gdk.BUTTON_PRIMARY, propagation_phase=Gtk.PropagationPhase.CAPTURE)
         drag.connect("drag-begin", self._drag_begin, scroll)
         drag.connect("drag-update", self._drag_update, scroll)
+        drag.connect("drag-end", self._drag_end)
         scroll.add_controller(drag)
         self._drag = None
 
@@ -621,7 +658,7 @@ class MediaGrid(Gtk.Stack):
 
     def _activate(self, _grid, pos):
         tile = self._tile_at(pos)
-        held = tile and tile.mods & select_key_mask()
+        held = tile and tile.mods & (select_masks()[0] | select_masks()[1])
         if held or self.win.select_mode:
             toggle_selected(self.model.get_item(pos).item)
             self.win.selection_changed()
@@ -637,15 +674,25 @@ class MediaGrid(Gtk.Stack):
 
     def _drag_begin(self, g, x, y, scroll):
         self._drag = None
-        if not (self.win.select_mode or g.get_current_event_state() & select_key_mask()):
+        state = g.get_current_event_state()
+        if not (self.win.select_mode or state & (select_masks()[0] | select_masks()[1])):
             return
         t = self._tile_under(scroll, x, y)
         if t:
-            self._drag = {"start": t, "last": t, "paint": t.obj.item.path not in SELECTED, "moved": False}
+            self._drag = {"start": t, "last": t, "from": (x, y), "shape": select_shape(state),
+                          "paint": t.obj.item.path not in SELECTED, "moved": False, "orig": {}, "hit": set()}
 
     def _drag_update(self, g, dx, dy, scroll):
         d = self._drag
         if not d:
+            return
+        if d["shape"] == "rect":
+            if not d["moved"] and dx * dx + dy * dy < 16:  # a click, not a drag yet
+                return
+            d["moved"] = True
+            g.set_state(Gtk.EventSequenceState.CLAIMED)
+            x, y = d["from"]
+            self._box(d, x, y, x + dx, y + dy, scroll)
             return
         ok, sx, sy = g.get_start_point()
         t = self._tile_under(scroll, sx + dx, sy + dy)
@@ -658,6 +705,35 @@ class MediaGrid(Gtk.Stack):
         d["last"] = t
         self._paint(t, d["paint"])
         self.win.selection_changed()
+
+    def _box(self, d, x0, y0, x1, y1, scroll):
+        """Rectangle style: select (or deselect) every tile the dragged box touches."""
+        self.band.set_margin_start(max(0, int(min(x0, x1))))
+        self.band.set_margin_top(max(0, int(min(y0, y1))))
+        self.band.set_size_request(max(1, int(abs(x1 - x0))), max(1, int(abs(y1 - y0))))
+        self.band.set_visible(True)
+        x0, x1 = min(x0, x1), max(x0, x1)
+        y0, y1 = min(y0, y1), max(y0, y1)
+        inside = set()
+        for t in list(TILES):
+            if not t.obj or not t.is_ancestor(self.grid):  # only this grid's tiles
+                continue
+            ok, p = t.compute_point(scroll, Graphene.Point())
+            if ok and p.x < x1 and p.x + t.get_width() > x0 and p.y < y1 and p.y + t.get_height() > y0:
+                inside.add(t)
+        for t in d["hit"] - inside:  # left the box: back to how it was before this drag
+            if t.obj:  # an unbind (grid relayout) leaves a dead tile behind
+                self._paint(t, d["orig"].pop(t.obj.item.path, False))
+        for t in inside:
+            path = t.obj.item.path
+            d["orig"].setdefault(path, path in SELECTED)
+            self._paint(t, d["paint"])
+        d["hit"] = inside
+        self.win.selection_changed()
+
+    def _drag_end(self, *_a):
+        self.band.set_visible(False)
+        self._drag = None
 
     @staticmethod
     def _paint(tile, on):
@@ -812,6 +888,7 @@ class Window(Adw.ApplicationWindow):
                          ("sel-add-new", lambda: collection_dialog(self, self._sel_add_to)),
                          ("delete", self._delete_ctx), ("remove-from", self._remove_from), ("add-to-new", self._add_to_new),
                          ("edit-collection", lambda: self.edit_collection(self.ctx_collection)),
+                         ("rename-collection", lambda: self.rename_collection(self.ctx_collection)),
                          ("change-icon", lambda: self.change_icon(self.ctx_collection)),
                          ("delete-collection", self._delete_collection)):
             act = Gio.SimpleAction(name=name)
@@ -971,6 +1048,7 @@ class Window(Adw.ApplicationWindow):
     def collection_menu(self, widget, x, y, collection):
         self.ctx_collection = collection
         menu = Gio.Menu()
+        menu.append("Rename Collection…", "win.rename-collection")
         menu.append("Change Icon…", "win.change-icon")
         menu.append("Edit Collection…", "win.edit-collection")
         menu.append("Delete Collection", "win.delete-collection")
@@ -1083,13 +1161,46 @@ class Window(Adw.ApplicationWindow):
         pick_icon(self, picked)
 
     def edit_collection(self, collection):
-        def done(c):
-            for page in self.nav.get_navigation_stack():
-                if isinstance(page, CollectionPage) and page.collection.path == collection.path:
-                    page.collection = c
-                    page.set_title(c.name)
-            self.rescan()
-        collection_dialog(self, done, collection)
+        collection_dialog(self, lambda c: self._collection_changed(collection, c), collection)
+
+    def _collection_changed(self, old, new=None):
+        """After a rename/edit: an open collection page follows, and everything on screen reloads."""
+        new = new or old
+        for page in self.nav.get_navigation_stack():
+            if isinstance(page, CollectionPage) and page.collection.path == old.path:
+                page.collection = new
+                page.set_title(new.name)
+        self.rescan()
+
+    def rename_collection(self, collection):
+        entry = Gtk.Entry(text=collection.name, activates_default=True, placeholder_text="Name")
+        err = Gtk.Label(css_classes=["error", "caption"], visible=False, wrap=True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        box.append(entry)
+        box.append(err)
+        dlg = Adw.AlertDialog(heading=f"Rename {collection.name}", extra_child=box,
+                              default_response="ok", close_response="cancel")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("ok", "Rename")
+        dlg.set_response_appearance("ok", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_response_enabled("ok", bool(entry.get_text().strip()))
+        entry.connect("changed", lambda e: dlg.set_response_enabled("ok", bool(e.get_text().strip())))
+
+        def respond(d, resp):
+            if resp != "ok":
+                return
+            try:
+                c = library.rename_collection(collection, entry.get_text())
+            except (ValueError, OSError) as ex:  # duplicate name, or the folder is busy
+                err.set_label(str(ex))
+                err.set_visible(True)
+                d.present(self)
+                return
+            self._collection_changed(collection, c)
+        dlg.connect("response", respond)
+        dlg.present(self)
+        entry.grab_focus()
+        entry.select_region(0, -1)
 
     def _delete_collection(self):
         c = self.ctx_collection
@@ -1180,6 +1291,15 @@ class Window(Adw.ApplicationWindow):
         row.add_suffix(reset)
         row.add_suffix(change)
         group.add(row)
+        subf = Adw.SwitchRow(title="Read subfolders", active=library.load_config().get("scan_subfolders", True),
+                             subtitle="Videos and live images inside subfolders of the library folder show up too; "
+                             "the collection/ folder is always read (Preferences › Gallery decides where it shows)")
+
+        def subf_toggled(w, _p):
+            library.set_pref("scan_subfolders", w.get_active())
+            self.rescan()
+        subf.connect("notify::active", subf_toggled)
+        group.add(subf)
         page.add(group)
         gallery = Adw.PreferencesGroup(title="Gallery")
         hover = Adw.SwitchRow(title="Hover to play", subtitle="Videos, live images and GIFs play (muted) while the "
@@ -1210,13 +1330,76 @@ class Window(Adw.ApplicationWindow):
             self.apply_select_pref()
         btn.connect("notify::active", btn_toggled)
         multi.add(btn)
+        shapes = list(SELECT_SHAPES)
+        cfg = library.load_config()
+        shape = Adw.ComboRow(title="Drag style", subtitle="How dragging across the grid picks videos",
+                             model=Gtk.StringList.new(list(SELECT_SHAPES.values())))
+        shape.set_selected(shapes.index(cfg.get("select_shape", "linear")) if cfg.get("select_shape") in shapes else 0)
+        shape.connect("notify::selected", lambda w, _p: library.set_pref("select_shape", shapes[w.get_selected()]))
+        multi.add(shape)
         keys = list(SELECT_KEYS)
-        key = Adw.ComboRow(title="Hold to select", subtitle="Hold this key and click videos to add them to the selection",
-                           model=Gtk.StringList.new([v[0] for v in SELECT_KEYS.values()]))
-        key.set_selected(keys.index(library.load_config().get("select_key", "ctrl")) if
-                         library.load_config().get("select_key", "ctrl") in keys else 0)
-        key.connect("notify::selected", lambda w, _p: library.set_pref("select_key", keys[w.get_selected()]))
-        multi.add(key)
+        labels = Gtk.StringList.new([v[0] for v in SELECT_KEYS.values()])
+        busy = {"on": False}
+
+        def combo(title, subtitle):
+            r = Adw.ComboRow(title=title, subtitle=subtitle, model=labels)
+            multi.add(r)
+            return r
+
+        split = Adw.SwitchRow(title="A different key for each style", active=cfg.get("select_split", False),
+                              subtitle="Off: both styles use one key and Drag style decides")
+        multi.add(split)
+        one = combo("Hold to select", "Hold this key and click or drag to add videos to the selection")
+        lin = combo("Linear select key", "Hold this key to paint the videos the pointer passes over")
+        rect = combo("Rectangle select key", "Hold this key and drag a box around the videos to select")
+
+        def pick_key(which, name):
+            if busy["on"]:
+                return
+            old_lin, old_rect = select_key_names()
+            if which == "single":
+                library.set_pref("select_key", name)
+            elif which == "linear":
+                library.set_pref("select_key_linear", name)
+                if name == old_rect:  # one key each: the rectangle style takes the key linear just left
+                    library.set_pref("select_key_rect", old_lin)
+            else:
+                library.set_pref("select_key_rect", name)
+                if name == old_lin:
+                    library.set_pref("select_key_linear", old_rect)
+            sync()
+
+        def sync():
+            cur = library.load_config().get("select_key", "ctrl")
+            a, b = select_key_names()
+            busy["on"] = True
+            one.set_selected(keys.index(cur) if cur in keys else 0)
+            lin.set_selected(keys.index(a))
+            rect.set_selected(keys.index(b))
+            busy["on"] = False
+            show()
+
+        def show():
+            split = library.load_config().get("select_split", False)
+            one.set_visible(not split)
+            lin.set_visible(split)
+            rect.set_visible(split)
+
+        one.connect("notify::selected", lambda w, _p: pick_key("single", keys[w.get_selected()]))
+        lin.connect("notify::selected", lambda w, _p: pick_key("linear", keys[w.get_selected()]))
+        rect.connect("notify::selected", lambda w, _p: pick_key("rect", keys[w.get_selected()]))
+
+        def split_toggled(w, _p):
+            on = w.get_active()
+            library.set_pref("select_split", on)
+            if on:  # start from the key that was in use
+                cur = library.load_config().get("select_key", "ctrl")
+                cur = cur if cur in SELECT_KEYS else "ctrl"
+                library.set_pref("select_key_linear", cur)
+                library.set_pref("select_key_rect", next(k for k in SELECT_KEYS if k != cur))
+            sync()
+        split.connect("notify::active", split_toggled)
+        sync()
         page.add(multi)
         perf = Adw.PreferencesGroup(title="Performance", description="Applies to previews and to saved files.")
         gpu = Adw.SwitchRow(title="GPU acceleration", active=thumbs.gpu_enabled(),
@@ -1267,3 +1450,35 @@ class App(Adw.Application):
 
 def main():
     return App().run(None)
+
+
+def _selftest():
+    """Multi-select key rules against a throwaway config: python3 -m linuxlivepaper.app --selftest"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        real, library.CONFIG = library.CONFIG, Path(d, "config.json")
+        try:
+            assert select_masks() == (Gdk.ModifierType.CONTROL_MASK,) * 2, "ctrl by default, one key for both styles"
+            library.set_pref("select_key", "alt")
+            assert select_key_names() == ("alt", "alt") and select_shape() == "linear"
+            library.set_pref("select_split", True)
+            assert select_key_names() == ("alt", "ctrl"), "both styles never share a key"
+            library.set_pref("select_key_rect", "alt")  # same as the linear key: a free key is picked instead
+            assert select_key_names() == ("alt", "ctrl")
+            library.set_pref("select_key_rect", "shift")
+            assert select_key_names() == ("alt", "shift")
+            assert select_shape(Gdk.ModifierType.SHIFT_MASK) == "rect"
+            assert select_shape(Gdk.ModifierType.ALT_MASK) == "linear"
+            library.set_pref("select_shape", "rect")
+            assert select_shape() == "rect"
+        finally:
+            library.CONFIG = real
+    print("select prefs ok")
+
+
+if __name__ == "__main__":
+    import sys
+    if "--selftest" in sys.argv:
+        _selftest()
+    else:
+        sys.exit(main())
