@@ -258,18 +258,34 @@ def _frame_at(src, t, height=None, chain="", key=False):
         return None
 
 
-def make_thumb(item):
+def thumb_info(item):
+    """(cached thumbnail path or None, duration in s for videos else None). The duration is cached next to the
+    thumbnail, so a gallery tile costs at most one ffprobe per file, ever (it used to re-probe on every launch)."""
+    out = CACHE / "thumbs" / (_key(item.path, "mid") + ".jpg")  # "mid": frame at 50%, not the old ~1 s
+    dur = None
+    if item.kind == "video":
+        side = out.with_suffix(".dur")
+        try:
+            dur = float(side.read_text())
+        except (OSError, ValueError):
+            dur = video_duration(item.path)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            side.write_text(str(dur))
+    return make_thumb(item, out, dur), dur
+
+
+def make_thumb(item, out=None, dur=None):
     """Cached JPEG thumbnail path for a gallery Item, or None."""
     src = item.path
-    out = CACHE / "thumbs" / (_key(src, "mid") + ".jpg")  # "mid": frame at 50%, not the old ~1 s
+    out = out or CACHE / "thumbs" / (_key(src, "mid") + ".jpg")
     if out.exists():
         return str(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
         if item.kind not in ("live", "image"):  # video or GIF (GdkPixbuf's GIF loader chokes on many real-world GIFs)
-            pb = grab_frame(src, video_duration(src) / 2, None)
-            pb = pb.scale_simple(WIDTH, max(1, pb.get_height() * WIDTH // pb.get_width()),
-                                 GdkPixbuf.InterpType.BILINEAR)
+            # videos: nearest keyframe (no decoding up to the middle of a long GOP); scaled inside ffmpeg
+            pb = grab_frame(src, (dur if dur is not None else video_duration(src)) / 2, None, f"scale={WIDTH}:-2",
+                            key=item.kind == "video")
         else:
             pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, WIDTH, -1, True)
             pb = pb.apply_embedded_orientation() or pb
@@ -329,6 +345,13 @@ if __name__ == "__main__":
         p = mp4_proxy(gif)
         assert probe(p)[1:] == (160, 90), probe(p)
         assert mp4_proxy(gif) == p  # cached
+        CACHE = Path(d)  # thumbnails: duration probed once, then read from the cache next to the JPEG
+        from types import SimpleNamespace as NS
+        path, dur = thumb_info(NS(kind="video", path=p))
+        assert path and 0.9 < dur < 1.1 and GdkPixbuf.Pixbuf.new_from_file(path).get_width() == WIDTH
+        Path(path).with_suffix(".dur").write_text("7.5")
+        assert thumb_info(NS(kind="video", path=p)) == (path, 7.5)
+        assert thumb_info(NS(kind="gif", path=gif))[1] is None
         assert 2.9 < probe(repeat(p, os.path.join(d, "r.mp4"), 3))[0] < 3.2
         big = os.path.join(d, "big.mp4")  # GPU (or CPU fallback) encode, and the x264 swap keeps the quality
         run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:d=1", *h264(False), big])

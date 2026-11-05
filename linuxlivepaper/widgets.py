@@ -2,7 +2,7 @@
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Graphene, Gsk, Gtk  # noqa: E402
 
 import os  # noqa: E402
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
@@ -89,6 +89,103 @@ class FileBrowser(Gtk.Box):
         path = thumbs.make_thumb(item)
         if path and gen == self.gen:
             GLib.idle_add(lambda: gen == self.gen and pic.set_filename(path) and False)
+
+
+ZOOM_MAX, ZOOM_STEP = 20.0, 1.25  # ×20 of the fitted size; one wheel notch / button press = ×1.25
+
+
+def zoom_about(z, c, nz, p, size, base):
+    """One axis of a cursor-anchored zoom. c: image coordinate (0..1) shown at the widget centre at zoom z; returns
+    the new centre at zoom nz so the image point under pointer p (widget px) stays under it. size/base: widget and
+    fitted image length in px."""
+    u = (p - (size / 2 - c * base * z)) / (base * z)  # image point under the pointer
+    return u + (size / 2 - p) / (base * nz)
+
+
+def clamp_center(z, c, size, base):
+    """Keep the zoomed image covering the widget along one axis (centred while it is smaller than the widget)."""
+    half = size / (2 * base * z)
+    return 0.5 if half >= 0.5 else min(max(c, half), 1 - half)
+
+
+class ZoomPicture(Gtk.Widget):
+    """A picture that zooms: the scroll wheel zooms about the pointer, dragging pans while zoomed, zoom_by/reset for
+    buttons and keys. The child Gtk.Picture (self.pic; GifPlay animates it) is allocated at its fitted size and moved
+    with a transform, so the full-resolution texture is sampled at every zoom level."""
+
+    def __init__(self, path, on_zoom=None):
+        super().__init__(overflow=Gtk.Overflow.HIDDEN, hexpand=True, vexpand=True)
+        self.pic = Gtk.Picture.new_for_filename(path)
+        self.pic.set_content_fit(Gtk.ContentFit.FILL)  # we allocate it at the image's own aspect ratio
+        self.pic.set_parent(self)
+        self.z, self.c, self.ptr, self.on_zoom = 1.0, [0.5, 0.5], None, on_zoom or (lambda _z: None)
+        scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.connect("scroll", lambda _c, _dx, dy: self.zoom_by(ZOOM_STEP ** -dy, self.ptr) or True)
+        self.add_controller(scroll)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", lambda _c, x, y: setattr(self, "ptr", (x, y)))
+        motion.connect("leave", lambda *_: setattr(self, "ptr", None))
+        self.add_controller(motion)
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", lambda *_: setattr(self, "_from", list(self.c)))
+        drag.connect("drag-update", self._pan)
+        self.add_controller(drag)
+
+    def do_dispose(self):
+        if self.pic.get_parent() is self:
+            self.pic.unparent()
+        Gtk.Widget.do_dispose(self)
+
+    def do_measure(self, _orientation, _for_size):
+        return 0, 0, -1, -1  # fills whatever the viewer gives it
+
+    def _base(self):
+        w, h = self.get_width(), self.get_height()
+        p = self.pic.get_paintable()
+        iw, ih = (p.get_intrinsic_width(), p.get_intrinsic_height()) if p else (0, 0)
+        if iw <= 0 or ih <= 0 or w <= 0 or h <= 0:
+            return w, h, max(w, 1), max(h, 1)
+        s = min(w / iw, h / ih)
+        return w, h, iw * s, ih * s
+
+    def _clamp(self):
+        w, h, bw, bh = self._base()
+        self.c = [clamp_center(self.z, self.c[0], w, bw), clamp_center(self.z, self.c[1], h, bh)]
+        return w, h, bw, bh
+
+    def do_size_allocate(self, _w, _h, _baseline):
+        w, h, bw, bh = self._clamp()
+        t = Gsk.Transform.new().translate(Graphene.Point().init(w / 2 - self.c[0] * bw * self.z,
+                                                                h / 2 - self.c[1] * bh * self.z)).scale(self.z, self.z)
+        self.pic.allocate(max(1, round(bw)), max(1, round(bh)), -1, t)
+
+    def zoom_by(self, factor, at=None):
+        """Zoom by factor about `at` (widget px; default the centre), between fit (1) and ZOOM_MAX."""
+        nz = min(max(self.z * factor, 1.0), ZOOM_MAX)
+        if nz == self.z:
+            return
+        w, h, bw, bh = self._base()
+        px, py = at or (w / 2, h / 2)
+        self.c = [zoom_about(self.z, self.c[0], nz, px, w, bw), zoom_about(self.z, self.c[1], nz, py, h, bh)]
+        self.z = nz
+        self._changed()
+
+    def reset(self):
+        self.z, self.c = 1.0, [0.5, 0.5]
+        self._changed()
+
+    def _changed(self):
+        self._clamp()
+        self.set_cursor_from_name("grab" if self.z > 1 else None)
+        self.queue_allocate()
+        self.on_zoom(self.z)
+
+    def _pan(self, _g, dx, dy):
+        if self.z > 1:
+            _w, _h, bw, bh = self._base()
+            self.c = [self._from[0] - dx / (bw * self.z), self._from[1] - dy / (bh * self.z)]
+            self._clamp()
+            self.queue_allocate()
 
 
 class HoldButton(Gtk.Box):
@@ -303,3 +400,17 @@ def collection_dialog(parent, on_done, collection=None):
     dlg.present(parent)
     entry.grab_focus()
     return dlg
+
+
+if __name__ == "__main__":
+    # cursor-anchored zoom: the image point under the pointer stays put; zooming back out re-centres
+    size, base = 1000, 500  # widget 1000 px, fitted image 500 px (letterboxed)
+    def screen(z, c, u):  # widget px of image point u
+        return size / 2 - c * base * z + u * base * z
+    c = zoom_about(1, 0.5, 4, 600, size, base)
+    u = (600 - screen(1, 0.5, 0)) / base
+    assert abs(screen(4, c, u) - 600) < 1e-9
+    assert clamp_center(1, 0.9, size, base) == 0.5  # smaller than the widget: centred
+    assert clamp_center(4, 0.0, size, base) == 0.25 and clamp_center(4, 1.0, size, base) == 0.75
+    assert abs(zoom_about(2, 0.3, 2, 123, size, base) - 0.3) < 1e-9  # no zoom change, no movement
+    print("widgets ok")

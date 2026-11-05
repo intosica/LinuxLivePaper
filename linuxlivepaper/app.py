@@ -16,7 +16,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk  # noqa: E
 from . import effects, export, library, thumbs  # noqa: E402
 from .collage_page import CollagePage  # noqa: E402
 from .editor import EditorPage  # noqa: E402
-from .widgets import collection_dialog, icon_widget, pick_icon  # noqa: E402
+from .widgets import ZOOM_MAX, ZOOM_STEP, ZoomPicture, collection_dialog, icon_widget, pick_icon  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, GifPlay, LiveCanvas, media_file, play_stream, release  # noqa: E402
 
 APP_ID = "io.github.linuxlivepaper"
@@ -177,6 +177,7 @@ flowbox.collections > flowboxchild { padding: 6px; border-radius: 12px; }
 .collection-name { font-weight: 700; }
 .viewer { background: black; }
 .nav-arrow { min-width: 44px; min-height: 44px; }
+.zoom-bar { border-radius: 999px; padding: 4px; }
 .browse-handle { min-width: 20px; min-height: 120px; padding: 0 2px; border-radius: 999px; }
 .file-browser flowboxchild { padding: 0; border-radius: 10px; }
 .file-browser flowboxchild picture { border-radius: 10px 10px 0 0; }
@@ -232,7 +233,92 @@ class ItemObj(GObject.Object):
         self.texture = None
         self.duration = None
         self.loading = False
+        self.failed = False  # no thumbnail could be made: don't retry on every rebind
+        self.tile = None  # the Tile currently showing this item (thumbnails skip items nobody shows any more)
         self.in_collection = Path(item.path).parent.parent.name == library.COLLECTIONS
+
+
+# Gallery thumbnails get their own LIFO queue instead of the shared pool. Scrolling through 13k items binds (and
+# used to queue) thousands of tiles; FIFO made what's on screen wait behind every tile already scrolled past, which
+# looked like tiles staying grey forever. Now the newest request goes first and anything no longer bound is dropped.
+_thumb_q, _thumb_cv = [], threading.Condition()
+TEXTURE_CAP = 600  # decoded thumbnails kept in RAM (~0.4–0.9 MB each); the oldest off-screen ones reload from disk
+LOADED = {}  # ItemObj -> None in least-recently-shown order (dicts keep insertion order)
+
+
+def want_thumb(obj):
+    with _thumb_cv:
+        _thumb_q.append(obj)
+        _thumb_cv.notify()
+    on_screen_soon()
+
+
+_prio_id = 0
+
+
+def on_screen_soon():
+    global _prio_id
+    if not _prio_id:
+        _prio_id = GLib.timeout_add(80, _on_screen_first)
+
+
+def _on_screen_first():
+    """The grid keeps ~10 screens of tiles bound; re-queue the ones actually on screen last (= taken first), top-left
+    first, so they don't wait behind the off-screen ones bound around them."""
+    global _prio_id
+    _prio_id = 0
+    tiles = [t for t in TILES if t.obj and t.obj.texture is None and not t.obj.loading and t.get_mapped()]
+    pos = {t: t.compute_point(t.get_root(), Graphene.Point())[1] for t in tiles}
+    tiles.sort(key=lambda t: (-pos[t].y, -pos[t].x))
+    with _thumb_cv:
+        _thumb_q.extend(t.obj for t in tiles)
+        _thumb_cv.notify_all()
+    return False
+
+
+def _thumb_worker():
+    while True:
+        with _thumb_cv:
+            while not _thumb_q:
+                _thumb_cv.wait()
+            obj = _thumb_q.pop()
+            if obj.tile is None or obj.texture is not None or obj.loading or obj.failed:
+                continue
+            obj.loading = True
+        tex, dur = None, obj.duration
+        try:
+            path, dur = thumbs.thumb_info(obj.item)
+            tex = path and Gdk.Texture.new_from_filename(path)
+        except Exception:  # a broken/vanished file must not kill the worker
+            pass
+        GLib.idle_add(_thumb_done, obj, tex or None, dur)
+
+
+def _thumb_done(obj, tex, dur):
+    obj.texture, obj.duration, obj.loading, obj.failed = tex, dur, False, tex is None
+    if tex:
+        LOADED[obj] = None
+        _evict()
+    tile = obj.tile
+    if tile and tile.obj is obj and tile.stream is None:
+        tile.pic.set_paintable(tex)
+        tile._set_badge()
+    return False
+
+
+def _evict():
+    extra = len(LOADED) - TEXTURE_CAP
+    for o in list(LOADED) if extra > 0 else ():
+        if extra <= 0:
+            break
+        if o.tile is None:  # never take a texture away from a tile that shows it
+            o.texture = None
+            del LOADED[o]
+            extra -= 1
+
+
+for _ in range(max(2, (os.cpu_count() or 4) // 2)):
+    threading.Thread(target=_thumb_worker, daemon=True).start()
 
 
 class Square(Gtk.Widget):
@@ -292,6 +378,7 @@ class Tile(Gtk.Overlay):
         press = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY, propagation_phase=Gtk.PropagationPhase.CAPTURE)
         press.connect("pressed", lambda g, *_: setattr(self, "mods", g.get_current_event_state()))
         self.add_controller(press)
+        self.connect("map", lambda *_: self.obj and self.obj.texture is None and on_screen_soon())  # scrolled into view
         TILES.add(self)
 
     def sync_check(self):
@@ -302,18 +389,22 @@ class Tile(Gtk.Overlay):
     def bind(self, obj):
         self.stop()
         self.obj = obj
+        obj.tile = self
         self.pic.set_paintable(obj.texture)
         self._set_badge()
         self.sync_check()
         if self._auto():
             self.hovering = True
             self._play()
-        if obj.texture is None and not obj.loading:
-            obj.loading = True
-            pool.submit(self._load, obj)
+        if obj.texture is not None:
+            LOADED[obj] = LOADED.pop(obj, None)  # most recently shown: evicted last
+        elif not obj.loading and not obj.failed:
+            want_thumb(obj)
 
     def unbind(self):
         self.stop()
+        if self.obj and self.obj.tile is self:
+            self.obj.tile = None
         self.obj = None
 
     def _set_badge(self):
@@ -329,23 +420,6 @@ class Tile(Gtk.Overlay):
             self.badge.set_valign(Gtk.Align.END)
         if self.badge:
             self.add_overlay(self.badge)
-
-    def _load(self, obj):
-        path = thumbs.make_thumb(obj.item)
-        tex = None
-        if path:
-            try:
-                tex = Gdk.Texture.new_from_filename(path)
-            except GLib.Error:
-                pass
-        dur = thumbs.video_duration(obj.item.path) if obj.item.kind == "video" else None
-
-        def done():
-            obj.texture, obj.duration, obj.loading = tex, dur, False
-            if self.obj is obj and self.stream is None:
-                self.pic.set_paintable(tex)
-                self._set_badge()
-        GLib.idle_add(done)
 
     def _auto(self):
         """GIFs are cheap (no decoder), so with "Hover to play" off they just play all the time."""
@@ -466,6 +540,22 @@ class Viewer(Adw.NavigationPage):
                              reveal_child=True, halign=align, valign=Gtk.Align.CENTER, margin_start=12, margin_end=12)
             self.arrows.append(r)
             self.frame.add_overlay(r)
+        # zoom for stills and GIFs (the wheel zooms about the pointer; +/−/0 keys too)
+        bar = Gtk.Box(css_classes=["osd", "toolbar", "zoom-bar"])
+        self.zoom_btns = []
+        for icon, tip, fn in (("zoom-out-symbolic", "Zoom out (−)", lambda: self.zoom(1 / ZOOM_STEP)),
+                              ("zoom-fit-best-symbolic", "Fit (0)", lambda: self.zoom(None)),
+                              ("zoom-in-symbolic", "Zoom in (+)", lambda: self.zoom(ZOOM_STEP))):
+            b = Gtk.Button(icon_name=icon, tooltip_text=tip, css_classes=["flat", "circular"])
+            b.connect("clicked", lambda _b, f=fn: f())
+            bar.append(b)
+            self.zoom_btns.append(b)
+        self.zoom_label = Gtk.Label(label="100%", width_chars=5)
+        bar.insert_child_after(self.zoom_label, self.zoom_btns[1])
+        self.zoom_bar = Gtk.Revealer(child=bar, transition_type=Gtk.RevealerTransitionType.CROSSFADE,
+                                     transition_duration=250, halign=Gtk.Align.CENTER, valign=Gtk.Align.END,
+                                     margin_bottom=16)
+        self.frame.add_overlay(self.zoom_bar)
         edge = Gtk.EventControllerMotion()
         edge.connect("motion", self._edge_moved)
         edge.connect("leave", lambda *_: self._set_edge(0))
@@ -541,6 +631,7 @@ class Viewer(Adw.NavigationPage):
             self._header()
 
     def _arrows(self, show=True):
+        self.zoom_bar.set_reveal_child(show and isinstance(self.view, ZoomPicture))
         ok = show and not self.live and len(self.objs) > 1
         for r, side in zip(self.arrows, (-1, 1)):
             r.set_reveal_child(ok and self._edge == side)
@@ -593,6 +684,12 @@ class Viewer(Adw.NavigationPage):
         elif keyval == Gdk.KEY_space and isinstance(self.view, LiveView):
             if not self.view.canvas.is_live():  # ignore key auto-repeat
                 self.view.play()
+        elif keyval in (Gdk.KEY_plus, Gdk.KEY_equal, Gdk.KEY_KP_Add):
+            self.zoom(ZOOM_STEP)
+        elif keyval in (Gdk.KEY_minus, Gdk.KEY_KP_Subtract):
+            self.zoom(1 / ZOOM_STEP)
+        elif keyval in (Gdk.KEY_0, Gdk.KEY_KP_0):
+            self.zoom(None)
         else:
             return False
         return True
@@ -608,6 +705,18 @@ class Viewer(Adw.NavigationPage):
     def _key_up(self, _c, keyval, *_):
         if keyval == Gdk.KEY_space and isinstance(self.view, LiveView):
             self.view.release()
+
+    def zoom(self, factor):
+        """Buttons/keys zoom about the centre; None = back to fit."""
+        if isinstance(self.view, ZoomPicture):
+            self.view.reset() if factor is None else self.view.zoom_by(factor)
+            self.show_chrome()
+
+    def _zoomed(self, z):
+        self.zoom_label.set_label(f"{round(z * 100)}%")
+        self.zoom_btns[0].set_sensitive(z > 1)
+        self.zoom_btns[1].set_sensitive(z > 1)
+        self.zoom_btns[2].set_sensitive(z < ZOOM_MAX)
 
     def go(self, step):
         self.index = (self.index + step) % len(self.objs)
@@ -638,15 +747,13 @@ class Viewer(Adw.NavigationPage):
             view = Gtk.Video(media_stream=media_file(item.path, muted=False, loop=False))
             view.get_media_stream().play()
         elif item.kind == "image":
-            view = Gtk.Picture.new_for_filename(item.path)
-            view.set_content_fit(Gtk.ContentFit.CONTAIN)
-        else:  # gif: loop the MP4 proxy
-            view = Gtk.Picture.new_for_filename(item.path)  # first frame until the proxy is ready
-            view.set_content_fit(Gtk.ContentFit.CONTAIN)
+            view = ZoomPicture(item.path, self._zoomed)
+        else:  # gif: animated with GdkPixbuf (GifPlay)
+            view = ZoomPicture(item.path, self._zoomed)  # first frame until the animation has loaded
 
             def ready(anim, v=view):
                 if anim and self.view is v:
-                    self.stream = GifPlay(anim, v)
+                    self.stream = GifPlay(anim, v.pic)
             pool.submit(lambda: GLib.idle_add(ready, GifPlay.load(item.motion)))
         if item.kind == "live":
             self._syncing = True
@@ -662,6 +769,7 @@ class Viewer(Adw.NavigationPage):
             GLib.timeout_add(self.stack.get_transition_duration() + 60,
                              lambda: (old.get_parent() is self.stack and self.stack.remove(old), False)[1])
         self.view = view
+        self._zoomed(1.0)
         self.show_chrome()
         self.grab_focus()
 
