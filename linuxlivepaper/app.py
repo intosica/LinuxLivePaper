@@ -94,6 +94,11 @@ def toggle_selected(item):
         t.sync_check()
 
 
+def in_collection(item):
+    """True when the item's files sit in a collection folder (collection/<Name>/)."""
+    return Path(item.path).parent.parent.resolve() == library.collections_dir().resolve()
+
+
 TABS = [("All", None), ("Live", "live"), ("Collections", "collections")]
 CSS = """
 gridview.photos, gridview.photos > child { padding: 0; margin: 0; border-radius: 0; background: none; }
@@ -887,6 +892,7 @@ class Window(Adw.ApplicationWindow):
                          ("sel-collage", self._sel_collage), ("sel-delete", self._sel_delete),
                          ("sel-clear", self.clear_selection),
                          ("sel-add-new", lambda: collection_dialog(self, self._sel_add_to)),
+                         ("sel-remove", self._sel_remove),
                          ("delete", self._delete_ctx), ("remove-from", self._remove_from), ("add-to-new", self._add_to_new),
                          ("edit-collection", lambda: self.edit_collection(self.ctx_collection)),
                          ("rename-collection", lambda: self.rename_collection(self.ctx_collection)),
@@ -1023,7 +1029,7 @@ class Window(Adw.ApplicationWindow):
         edit.append("Live Collage — 4 slots", "win.open-collage4")
         menu.append_section(None, edit)
         menu.append_submenu("Add to Collection", add)
-        if Path(item.path).parent.parent.resolve() == library.collections_dir().resolve():
+        if in_collection(item):
             menu.append("Remove from Collection", "win.remove-from")
         if item.kind == "live":  # same entries + options dialog as the editor's Save ▾ menu
             menu.append("Save as GIF…", "win.export-gif")
@@ -1036,6 +1042,9 @@ class Window(Adw.ApplicationWindow):
         menu = Gio.Menu()
         menu.append(f"Live Collage with {n} selected", "win.sel-collage")
         menu.append_submenu(f"Add {n} selected to Collection", self._collections_menu("win.sel-add-to", "win.sel-add-new"))
+        inside = sum(1 for it in SELECTED.values() if in_collection(it))
+        if inside:
+            menu.append(f"Remove {inside} selected from Collection", "win.sel-remove")
         menu.append(f"Delete {n} selected", "win.sel-delete")
         menu.append("Clear Selection", "win.sel-clear")
         return menu
@@ -1156,6 +1165,17 @@ class Window(Adw.ApplicationWindow):
         else:
             self.toast(f"Added {added} of {len(items)} to {collection.name}")
         self.clear_selection()
+        self.rescan()
+
+    def _sel_remove(self):
+        items = [it for it in SELECTED.values() if in_collection(it)]
+        for it in items:
+            try:
+                library.remove_from_collection(it)
+            except OSError as ex:
+                return self.toast(f"Couldn't move: {ex}")
+        self.clear_selection()
+        self.toast(f"Moved {len(items)} back to the library")
         self.rescan()
 
     def _sel_delete(self):
