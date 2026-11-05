@@ -655,6 +655,7 @@ class MediaGrid(Gtk.Stack):
 
     def _update(self):
         self.set_visible_child_name("grid" if self.model.get_n_items() else "status")
+        self.win.selection_changed()  # a rescan/filter change may have taken selected items off the view
 
     def _activate(self, _grid, pos):
         tile = self._tile_at(pos)
@@ -929,6 +930,9 @@ class Window(Adw.ApplicationWindow):
         self.tv.add_bottom_bar(self.sel_bar)
         self.nav = Adw.NavigationView()
         self.nav.add(Adw.NavigationPage(child=self.tv, title="Gallery", tag="gallery"))
+        # the selection belongs to the view you are looking at: dropping it when the page changes keeps the count
+        # (and Delete / Add to Collection) from acting on items that page doesn't even show
+        self.nav.connect("notify::visible-page", lambda *_: self.selection_changed())
         self.toasts = Adw.ToastOverlay(child=self.nav)  # around every page, so toasts show from any page
         self.set_content(self.toasts)
         first.set_active(True)
@@ -974,6 +978,7 @@ class Window(Adw.ApplicationWindow):
         else:
             self.library_grid.set_kind(kind)
             self.stack.set_visible_child_name("library")
+        self.selection_changed()
 
     def rescan(self):
         """Reload everything that's on screen: the library, the collections and an open collection page."""
@@ -1083,7 +1088,26 @@ class Window(Adw.ApplicationWindow):
         self.rescan()
 
     # --- multi-selection ------------------------------------------------------------------------
+    def active_grid(self):
+        """The MediaGrid the user can select in right now (None on a page that shows no grid)."""
+        page = self.nav.get_visible_page()
+        if isinstance(page, CollectionPage):
+            return page.grid
+        if page is not None and page.get_tag() == "gallery" and self.stack.get_visible_child_name() == "library":
+            return self.library_grid
+        return None
+
     def selection_changed(self):
+        grid = self.active_grid()
+        shown = grid.model.get_n_items() if grid is not None else 0
+        if shown:  # a page that is still loading its items (or shows none) must not wipe the selection
+            keep = {grid.model.get_item(i).item.path for i in range(shown)}
+            stale = [p for p in SELECTED if p not in keep]
+            for p in stale:
+                del SELECTED[p]
+            if stale:
+                for t in TILES:
+                    t.sync_check()
         n = len(SELECTED)
         self.sel_bar.set_reveal_child(n > 0 or self.select_mode)
         self.sel_label.set_label(f"{n} selected" if n else "Select videos")
