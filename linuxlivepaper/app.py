@@ -94,6 +94,12 @@ def toggle_selected(item):
         t.sync_check()
 
 
+def set_selected(item, on):
+    """Set, rather than toggle, an item's selected state."""
+    if (item.path in SELECTED) != on:
+        toggle_selected(item)
+
+
 def in_collection(item):
     """True when the item's files sit in a collection folder (collection/<Name>/)."""
     return Path(item.path).parent.parent.resolve() == library.collections_dir().resolve()
@@ -686,7 +692,7 @@ class MediaGrid(Gtk.Stack):
         t = self._tile_under(scroll, x, y)
         if t:
             self._drag = {"start": t, "last": t, "from": (x, y), "shape": select_shape(state),
-                          "paint": t.obj.item.path not in SELECTED, "moved": False, "orig": {}, "hit": set()}
+                          "paint": t.obj.item.path not in SELECTED, "moved": False, "orig": {}, "hit": {}}
 
     def _drag_update(self, g, dx, dy, scroll):
         d = self._drag
@@ -720,20 +726,24 @@ class MediaGrid(Gtk.Stack):
         self.band.set_visible(True)
         x0, x1 = min(x0, x1), max(x0, x1)
         y0, y1 = min(y0, y1), max(y0, y1)
-        inside = set()
+        # Bookkeeping is per item path, not per tile: a grid relayout mid-drag (a scan landing, a rebind) recycles
+        # tiles, and a stale tile must still hand back the item it was showing, or that item stays selected.
+        inside = {}
         for t in list(TILES):
-            if not t.obj or not t.is_ancestor(self.grid):  # only this grid's tiles
+            # mapped only: a tile that isn't on screen (scrolled out, or bound but never laid out) can report a
+            # stale position and size, and the box must not count what the user cannot see.
+            if not t.obj or not t.get_mapped() or not t.is_ancestor(self.grid):
                 continue
             ok, p = t.compute_point(scroll, Graphene.Point())
             if ok and p.x < x1 and p.x + t.get_width() > x0 and p.y < y1 and p.y + t.get_height() > y0:
-                inside.add(t)
-        for t in d["hit"] - inside:  # left the box: back to how it was before this drag
-            if t.obj:  # an unbind (grid relayout) leaves a dead tile behind
-                self._paint(t, d["orig"].pop(t.obj.item.path, False))
-        for t in inside:
-            path = t.obj.item.path
-            d["orig"].setdefault(path, path in SELECTED)
-            self._paint(t, d["paint"])
+                inside[t.obj.item.path] = t.obj.item
+        for path in [p for p in d["hit"] if p not in inside]:  # left the box: back to its pre-drag state
+            was, item = d["orig"].pop(path, (None, None))
+            if item is not None:
+                set_selected(item, was)
+        for path, item in inside.items():
+            d["orig"].setdefault(path, (path in SELECTED, item))
+            set_selected(item, d["paint"])
         d["hit"] = inside
         self.win.selection_changed()
 
@@ -743,9 +753,7 @@ class MediaGrid(Gtk.Stack):
 
     @staticmethod
     def _paint(tile, on):
-        item = tile.obj.item
-        if (item.path in SELECTED) != on:
-            toggle_selected(item)
+        set_selected(tile.obj.item, on)
 
     def _tile_at(self, pos):
         item = self.model.get_item(pos)
