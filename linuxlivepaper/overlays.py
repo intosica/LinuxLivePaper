@@ -101,7 +101,8 @@ def graph(overlays, W, H, dur, first_input=0):
     return inputs, steps, label
 
 
-def render(src, start, end, out, opts=None, overlays=(), height=None, fast=False, extra=(), loop=False):
+def render(src, start, end, out, opts=None, overlays=(), height=None, fast=False, extra=(), loop=False,
+           progress=None):
     """Like effects.render(), with overlays composited on top."""
     from . import effects
     opts = {**effects.DEFAULT, **(opts or {})}
@@ -119,7 +120,7 @@ def render(src, start, end, out, opts=None, overlays=(), height=None, fast=False
            "-map", "[fin]" if steps else "[vout]",
            *(["-map", "[aout]", "-c:a", "aac"] if audio else []),
            *thumbs.h264(fast, (W, H)), *extra, str(out)]
-    thumbs.run(cmd)
+    thumbs.run(cmd, progress=progress, total=effects.out_length(end - start, opts))
     return out
 
 

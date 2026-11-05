@@ -6,6 +6,8 @@ sdk: org.gnome.Sdk
 command: linuxlivepaper
 finish-args:
   - --share=ipc
+  # frame-interpolation models + network code download on demand (interp.install)
+  - --share=network
   - --socket=wayland
   - --socket=fallback-x11
   - --socket=pulseaudio

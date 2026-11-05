@@ -5,6 +5,7 @@ import hashlib
 import os
 import subprocess
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -167,7 +168,7 @@ def _cell_command(cell, w, h, out, fast):
           "format=yuv420p"]
     graph, amap = [f"[0:v]{','.join(v)}[v]"], []
     if cell["volume"] > 0 and effects.has_audio(cell["src"]):
-        a = ["asetpts=PTS-STARTPTS"] + ([f"atempo={o['speed']}"] if o["speed"] != 1 else [])
+        a = ["asetpts=PTS-STARTPTS"] + ([effects.atempo(o["speed"])] if o["speed"] != 1 else [])
         if o["direction"] == "reverse":
             a.append("areverse")
         elif o["direction"] == "bounce":
@@ -184,11 +185,13 @@ def _cell_command(cell, w, h, out, fast):
             *thumbs.h264(True, (w, h), 20 if fast else 12), "-r", str(FPS), str(out)]
 
 
-def _cell_file(cell, w, h, fast, d):
+def _cell_file(cell, w, h, fast, d, progress=None):
     """Render (or reuse from cache dir d) one cell pass; returns (path, has_audio)."""
     key = hashlib.sha1(repr(([[k, v] for k, v in sorted(cell.items()) if k not in ("dur", "ar")],
                              os.stat(cell["src"]).st_mtime_ns, w, h, fast)).encode()).hexdigest()
-    out = thumbs.cached(Path(d, key + ".mkv"), lambda tmp: thumbs.run(_cell_command(cell, w, h, tmp, fast)))
+    out = thumbs.cached(Path(d, key + ".mkv"), lambda tmp: thumbs.run(_cell_command(cell, w, h, tmp, fast),
+                                                                      progress=progress, total=window(cell)))
+    progress and progress(1.0)  # a cache hit never ran ffmpeg
     return str(out), cell["volume"] > 0 and effects.has_audio(cell["src"])  # same test _cell_command used
 
 
@@ -221,7 +224,8 @@ def command(c, cells, out, height=None, fast=False, extra=(), overlays=()):
             "-r", str(FPS), "-t", f"{D:.3f}", *extra, str(out)]
 
 
-def render(c, out, height=None, fast=False, extra=(), overlays=(), cache=None, repeat=None, interpolate=None):
+def render(c, out, height=None, fast=False, extra=(), overlays=(), cache=None, repeat=None, interpolate=None,
+           progress=None):
     """Render the collage to `out`: one pass of the longest cell, played `repeat` (default c["repeat"]) times.
     cache: directory to keep cell passes in, so editing one cell only re-renders that cell.
     interpolate: interp settings applied to the one pass before repeating (saved files only, never previews)."""
@@ -233,11 +237,21 @@ def render(c, out, height=None, fast=False, extra=(), overlays=(), cache=None, r
         d = cache or tmp
         Path(d).mkdir(parents=True, exist_ok=True)
         todo = [(i, x, *rects(c, W, H)[i][2:]) for i, x in enumerate(c["cells"]) if x]
+        done, lock = {}, threading.Lock()
+        weight = {t[0]: window(t[1]) for t in todo}
+
+        def cell_progress(i):  # all cells together fill 0..0.4 of the bar, each by its share of the playing time
+            def cb(f):
+                with lock:
+                    done[i] = f
+                    progress(0.4 * sum(weight[k] * v for k, v in done.items()) / sum(weight.values()))
+            return progress and cb
         with ThreadPoolExecutor(max_workers=max(1, min(4, os.cpu_count() or 2))) as ex:
-            files = list(ex.map(lambda t: (t[0], *_cell_file(t[1], t[2], t[3], fast, d)), todo))
+            files = list(ex.map(lambda t: (t[0], *_cell_file(t[1], t[2], t[3], fast, d, cell_progress(t[0]))), todo))
         # a hung ffmpeg must never wedge the preview thread pool
-        finish(lambda o, ex: thumbs.run(command(c, files, o, height, fast, ex, overlays)), out, tmp, repeat,
-               interpolate, list(extra))
+        finish(lambda o, ex, cb=None: thumbs.run(command(c, files, o, height, fast, ex, overlays), progress=cb,
+                                                 total=duration(c)),
+               out, tmp, repeat, interpolate, list(extra), thumbs.scaled(progress, 0.4, 1))
     return out
 
 

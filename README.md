@@ -60,7 +60,7 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
   and saved at its real (square-pixel) shape.
 - **Double-click anywhere on a timeline** to bring the yellow selection (or a collage cell's window) to that spot —
   much faster than dragging it across. The preview follows the timeline live, including while it plays.
-- The editor's side panel sets the **Filter**, **Effect**, **Speed**, **Direction** (forward/reverse/bounce) and
+- The editor's side panel sets the **Filter**, **Effect**, **Speed** (a slider, 0.1–4×; slowed audio keeps its pitch), **Direction** (forward/reverse/bounce) and
   **Repeat** (how many times the clip plays back to back in the saved live image, 1–10) and
   **Press effect**. Hold *Try it* to preview exactly what will be saved. *Save to collection* also files it in a collection.
 - **Text & stickers**: in the *Overlays* group, *Text* adds a caption and *Sticker* adds any image or

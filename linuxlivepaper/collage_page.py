@@ -19,7 +19,7 @@ from . import collage, effects, export, interp, library, livemake, overlays, thu
 from .editor import Timeline  # noqa: E402
 from .overlay_ui import OverlayHost  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, release  # noqa: E402
-from .widgets import CollectionRow, FileBrowser, HoldButton, InterpGroup, preview_quality_dropdown  # noqa: E402
+from .widgets import CollectionRow, FileBrowser, HoldButton, InterpGroup, SaveProgress, preview_quality_dropdown, speed_row  # noqa: E402
 
 PROXY_H = 360
 SYNC_TOL = 0.2  # seconds a live cell may be off the shared collage clock before it is seeked back
@@ -276,6 +276,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             group.add_action(act)
         self.insert_action_group("export", group)
         header = Adw.HeaderBar()
+        self.progress = SaveProgress(header)
         header.pack_end(self.save_btn)
         header.pack_start(preview_quality_dropdown())
         self.play_btn.set_tooltip_text("Play the collage (Space)")
@@ -402,8 +403,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             vol.add_suffix(mute)
             grp.add(vol)
             o = cell["opts"]
-            grp.add(self._combo("Speed", [(v, f"{v:g}×") for v in effects.SPEEDS], o["speed"],
-                                lambda v: self._set_opt("speed", v)))
+            grp.add(speed_row(o["speed"], lambda v: self._set_opt("speed", v)))
             grp.add(self._combo("Direction", list(effects.DIRECTIONS.items()), o["direction"],
                                 lambda v: self._set_opt("direction", v)))
             grp.add(self._combo("Filter", [(k, v[0]) for k, v in effects.LOOKS.items()], o["look"],
@@ -1113,6 +1113,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self.stop()
         self.save_btn.set_sensitive(False)
         self.save_btn.set_label("Saving…")
+        self.progress.begin()
         c = {**self.c, "cells": [dict(x) if x else None for x in self.c["cells"]]}
         style = self.style
         col = self.panel_page.collection_row.collection()
@@ -1122,7 +1123,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             try:
                 jpg, mov = livemake.out_paths(col.path if col else None)
                 collage.render(c, mov, extra=livemake.live_tags(), overlays=[dict(o) for o in self.overlays],
-                               interpolate=smooth)
+                               interpolate=smooth, progress=self.progress.report)
                 f = interp.stretch(smooth)  # slow motion stretches the timeline, the cover moment with it
                 livemake.still(mov, min(c["cover"] * f, collage.duration(c) * f - 0.05), jpg)
                 library.set_meta(jpg, transition=style)

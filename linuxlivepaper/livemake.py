@@ -11,35 +11,41 @@ from .library import library_dir
 
 
 def make_live(src, start=0.0, end=None, key_time=None, out_dir=None, name=None, opts=None, overlay_list=(),
-              repeat=1, interpolate=None):
+              repeat=1, interpolate=None, progress=None):
     """Render [start, end] of src (video or GIF) through effects `opts` → <name>.mov (played `repeat` times back
     to back), and grab the frame at key_time (source seconds after start, mapped through speed/reverse) → <name>.jpg.
     interpolate: interp settings (RIFE/FLAVR frames added to the one pass before repeating), None/off = none.
-    Defaults to the library folder."""
+    progress(fraction 0..1) is called as the save advances (any thread). Defaults to the library folder."""
     jpg, mov = out_paths(out_dir, name)
     opts = {**effects.DEFAULT, **(opts or {})}
     render = ov.render if overlay_list else effects.render
     kw = {"overlays": overlay_list} if overlay_list else {}
+    if end is None:
+        end = effects.thumbs.video_duration(str(src))
+    length = end - start
     with tempfile.TemporaryDirectory() as d:
-        finish(lambda out, extra: render(src, start, end, out, opts, extra=extra, **kw), mov, d, repeat, interpolate)
-    length = (end if end is not None else effects.thumbs.video_duration(str(src))) - start
+        finish(lambda out, extra, cb=None: render(src, start, end, out, opts, extra=extra, progress=cb, **kw), mov, d,
+               repeat, interpolate, progress=progress)
     key = effects.out_time(key_time or 0.0, length, opts)
     f = interp.stretch(interpolate)
     still(mov, min(max(0.0, key * f), effects.out_length(length, opts) * f - 0.05), jpg)
     return jpg, mov
 
 
-def finish(render, mov, d, repeat=1, interpolate=None, tags=None):
-    """render(out, extra) one pass, interpolate it, repeat it → mov tagged as a live MOV. d: scratch dir."""
+def finish(render, mov, d, repeat=1, interpolate=None, tags=None, progress=None):
+    """render(out, extra, progress) one pass, interpolate it, repeat it → mov tagged as a live MOV. d: scratch dir.
+    progress(0..1) covers all stages: the render, then the (much slower) interpolation when it is on."""
     tags = live_tags() if tags is None else tags
     on = interp.enabled(interpolate)
     once = mov if repeat <= 1 else Path(d, "once" + Path(mov).suffix)
     raw = Path(d, "raw" + Path(mov).suffix) if on else once
-    render(raw, tags if raw == mov else ())
+    sc = effects.thumbs.scaled
+    render(raw, tags if raw == mov else (), sc(progress, 0, 0.2 if on else 0.97))
     if on:
-        interp.apply(raw, once, interpolate, tags if once == mov else ())
+        interp.apply(raw, once, interpolate, tags if once == mov else (), sc(progress, 0.2, 0.97))
     if repeat > 1:
         effects.thumbs.repeat(once, mov, repeat, tags)
+    progress and progress(1.0)
     return mov
 
 
@@ -74,6 +80,9 @@ if __name__ == "__main__":
         tags = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags", str(mov)],
                               capture_output=True, text=True).stdout
         assert "content.identifier" in tags, tags
+        seen = []
+        make_live(src, 0, 2.0, 0.5, out, "p", progress=seen.append)
+        assert len(seen) > 1 and seen == sorted(seen) and 0 < seen[0] < 1 and seen[-1] == 1.0, seen
         gif = Path(d, "g.gif")
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=s=99x75:d=2", str(gif)], check=True)
         jpg, mov = make_live(gif, 0, 1.5, 0.2, out, "g")
@@ -88,7 +97,9 @@ if __name__ == "__main__":
         from . import interp  # 2x smoother then repeated twice (only when PyTorch + a RIFE model are set up)
         sm = {**interp.DEFAULTS, "engine": "rife", "factor": 2}
         if interp.python(sm) and interp.installed(sm):
-            jpg, mov = make_live(src, 0.5, 2.5, 1.0, out, "i", repeat=2, interpolate=sm)
+            seen.clear()
+            jpg, mov = make_live(src, 0.5, 2.5, 1.0, out, "i", repeat=2, interpolate=sm, progress=seen.append)
+            assert seen == sorted(seen) and seen[-1] == 1.0 and any(0.3 < x < 0.95 for x in seen), seen
             assert 3.8 < effects.thumbs.video_duration(str(mov)) < 4.3 and jpg.stat().st_size
             assert "content.identifier" in subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags",
                                                            str(mov)], capture_output=True, text=True).stdout

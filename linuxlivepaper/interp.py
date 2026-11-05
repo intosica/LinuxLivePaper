@@ -15,7 +15,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-from . import library, thumbs
+from . import effects, library, thumbs
 
 DATA = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "linuxlivepaper" / "interp"
 WORKER = Path(__file__).with_name("interp_worker.py")
@@ -31,8 +31,8 @@ FLAVR = {2: "1IZe-39ZuXy3OheGJC-fT3shZocGYuNdH", 4: "1GARJK0Ti1gLH_O0spxAEqzbMwU
          8: "1xoZqWJdIOjSaE2DtH4ifXKlRwFySm5Gq"}
 ENGINES = {"off": "Off", "rife": "RIFE (Practical-RIFE)", "flavr": "FLAVR"}
 FACTORS = {"rife": [2, 3, 4, 8], "flavr": [2, 4, 8]}
-MODES = {"smooth": "Smoother (more frames, same length)", "slow": "Slow motion (same frame rate, longer)"}
-SCALES = {1.0: "Full", 0.5: "Half (faster, for 4K)"}
+MODES = {"smooth": "Smoother", "slow": "Slow motion"}  # short: the side panel is narrow
+SCALES = {1.0: "Full", 0.5: "Half (faster)"}
 DEFAULTS = {"engine": "off", "rife": "4.25", "factor": 2, "mode": "smooth", "scale": 1.0, "python": ""}
 
 
@@ -159,16 +159,7 @@ def _rate(src):
         return 30, 1
 
 
-def atempo(f):
-    """atempo chain slowing audio down by f (each atempo stage only goes down to 0.5)."""
-    out = []
-    while f > 2:
-        out.append("atempo=0.5")
-        f /= 2
-    return ",".join(out + [f"atempo={1 / f:.6f}"])
-
-
-def apply(src, out, s, extra=()):
+def apply(src, out, s, extra=(), progress=None):
     """Write `out` = src with factor-1 AI frames between each pair. smooth: frame rate x factor, same length;
     slow: same frame rate, x factor longer (audio slowed to match, pitch kept)."""
     py = python(s)
@@ -180,23 +171,25 @@ def apply(src, out, s, extra=()):
     _, w, h = thumbs.probe(str(src))
     w, h = w // 2 * 2, h // 2 * 2
     n, d = _rate(src)
+    total = thumbs.probe(str(src))[0] * (f if s.get("mode") == "slow" else 1)
     rate = f"{n * f}/{d}" if s.get("mode") != "slow" else f"{n}/{d}"
-    audio = ["-c:a", "copy"] if s.get("mode") != "slow" else ["-af", atempo(f), "-c:a", "aac"]
+    audio = ["-c:a", "copy"] if s.get("mode") != "slow" else ["-af", effects.atempo(1 / f), "-c:a", "aac"]
     args = json.dumps({"engine": s["engine"], "weights": str(weights(s)), "code": str(code(s["engine"])),
                        "factor": f, "w": w, "h": h, "scale": float(s.get("scale", 1.0))})
     # NVDEC decode when GPU acceleration is on; frames cross the pipes as yuv420p (half the bytes of RGB) and the
     # worker converts them on the GPU, so the CPU only shuffles bytes; NVENC encodes (thumbs.h264)
     dec = ["ffmpeg", "-v", "error", *thumbs.hwdec(src), "-i", str(src), "-map", "0:v:0",
            "-vf", f"scale={w}:{h},setsar=1,format=yuv420p", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"]
-    enc = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}", "-r", rate,
+    enc = ["ffmpeg", "-v", "error", "-progress", "pipe:1", "-nostats", "-y", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", f"{w}x{h}", "-r", rate,
            "-i", "-", "-i", str(src), "-map", "0:v", "-map", "1:a:0?", *audio, *thumbs.h264(False, (w, h)),
            *extra, str(out)]
     with tempfile.TemporaryFile() as err:
         p1 = subprocess.Popen([*thumbs.NICE, *dec], stdout=subprocess.PIPE, stderr=err)
         p2 = subprocess.Popen([*thumbs.NICE, py, str(WORKER), args], stdin=p1.stdout, stdout=subprocess.PIPE, stderr=err)
         p1.stdout.close()
-        p3 = subprocess.Popen([*thumbs.NICE, *enc], stdin=p2.stdout, stderr=err)
+        p3 = subprocess.Popen([*thumbs.NICE, *enc], stdin=p2.stdout, stdout=subprocess.PIPE, stderr=err)
         p2.stdout.close()
+        thumbs.read_progress(p3.stdout, total or 1, progress or (lambda _: None))  # until the encoder closes it
         codes = [p3.wait(), p2.wait(), p1.wait()]
         if any(codes):
             err.seek(0)
@@ -207,8 +200,6 @@ def apply(src, out, s, extra=()):
 
 
 if __name__ == "__main__":
-    assert atempo(2) == "atempo=0.500000" and atempo(8) == "atempo=0.5,atempo=0.5,atempo=0.500000"
-    assert atempo(3) == "atempo=0.5,atempo=0.666667"
     s = {**DEFAULTS, "engine": "rife", "factor": 3, "mode": "slow"}
     assert enabled(s) and stretch(s) == 3 and stretch({**s, "mode": "smooth"}) == 1 and not enabled(DEFAULTS)
     py = python(s)

@@ -16,7 +16,7 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango, Pa
 
 from . import effects, export, library, livemake, overlays, thumbs  # noqa: E402
 from .overlay_ui import OverlayHost  # noqa: E402
-from .widgets import CollectionRow, HoldButton, InterpGroup, preview_quality_dropdown  # noqa: E402
+from .widgets import CollectionRow, HoldButton, InterpGroup, SaveProgress, preview_quality_dropdown, speed_row  # noqa: E402
 from .playback import DEFAULT_STYLE, STYLES, LiveCanvas, media_file, release  # noqa: E402
 
 YELLOW = (0.96, 0.76, 0.07)
@@ -429,6 +429,7 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         collage_btn = Gtk.Button(label="Create Collage", tooltip_text="Open a 4-video collage with this clip in every cell")
         collage_btn.connect("clicked", lambda *_: self._collage())
         header = Adw.HeaderBar()
+        self.progress = SaveProgress(header)
         header.pack_end(self.save_btn)
         header.pack_end(collage_btn)
         header.pack_start(preview_quality_dropdown())
@@ -469,8 +470,7 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
                              self.opts["effect"], lambda v: self._set_opt("effect", v)))
         page.add(look)
         motion = Adw.PreferencesGroup(title="Motion")
-        motion.add(self._combo("Speed", None, [(v, f"{v:g}×") for v in effects.SPEEDS], self.opts["speed"],
-                               lambda v: self._set_opt("speed", v)))
+        motion.add(speed_row(self.opts["speed"], lambda v: self._set_opt("speed", v)))
         motion.add(self._combo("Direction", "Bounce plays forward, then back", list(effects.DIRECTIONS.items()),
                                self.opts["direction"], lambda v: self._set_opt("direction", v)))
         rp = Adw.SpinRow.new_with_range(1, 10, 1)
@@ -811,6 +811,7 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         self.stop()
         self.save_btn.set_sensitive(False)
         self.save_btn.set_label("Saving…")
+        self.progress.begin()
         s, e, k, opts, style, n = self.tl.s, self.tl.e, self.tl.k, dict(self.opts), self.style, self.repeat
         ovs = [dict(o) for o in self.overlays]
         col = self.collection_row.collection()
@@ -820,7 +821,8 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
             try:
                 # straight into the collection folder when one is picked: one copy on disk, All reads the subfolders
                 res, err = livemake.make_live(self.src, s, e, k - s, out_dir=col.path if col else None, opts=opts,
-                                              overlay_list=ovs, repeat=n, interpolate=smooth), None
+                                              overlay_list=ovs, repeat=n, interpolate=smooth,
+                                              progress=self.progress.report), None
                 library.set_meta(res[0], transition=style)
             except Exception as ex:  # surfaced as a toast
                 res, err = None, str(ex)

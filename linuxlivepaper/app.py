@@ -51,6 +51,7 @@ SELECTED = {}  # path → Item: the multi-selection (shared by every grid)
 TILES = weakref.WeakSet()
 SELECT_KEYS = {"ctrl": ("Ctrl", Gdk.ModifierType.CONTROL_MASK), "shift": ("Shift", Gdk.ModifierType.SHIFT_MASK),
                "alt": ("Alt", Gdk.ModifierType.ALT_MASK)}
+AFTER_SAVE = {"gallery": "Go back to the gallery", "stay": "Stay on the edit page"}
 SELECT_SHAPES = {"linear": "Linear — paint what the pointer passes over",
                  "rect": "Rectangle — everything inside the dragged box"}
 COLLAGE_LAYOUT = {1: "2h", 2: "2h", 3: "1+2", 4: "4", 5: "6", 6: "6", 7: "9", 8: "9", 9: "9"}  # clips → layout
@@ -1491,12 +1492,18 @@ class Window(Adw.ApplicationWindow):
         self.nav.push(page)
 
     def _saved(self, page, res, err):
+        page.progress.end()
         if err:
             page.save_btn.set_sensitive(True)
             page.save_btn.set_label(page.SAVE_LABEL)
             self.toast(f"Saving failed: {err}")
             return
-        self.nav.pop_to_tag("gallery")
+        key = "after_save_collage" if isinstance(page, CollagePage) else "after_save_live"
+        if library.load_config().get(key, "gallery") == "stay":
+            page.save_btn.set_sensitive(True)
+            page.save_btn.set_label(page.SAVE_LABEL)
+        else:
+            self.nav.pop_to_tag("gallery")
         self.toast(f"Saved {res[0].stem}")
         self.rescan()
 
@@ -1582,6 +1589,15 @@ class Window(Adw.ApplicationWindow):
                                                                   self.apply_view_prefs()))
             gallery.add(row)
         page.add(gallery)
+        saving = Adw.PreferencesGroup(title="Saving", description="What happens after a save finishes.")
+        cfg, after = library.load_config(), list(AFTER_SAVE)
+        for key, title in (("after_save_live", "After saving a live image"), ("after_save_collage",
+                                                                              "After saving a collage")):
+            row = Adw.ComboRow(title=title, model=Gtk.StringList.new(list(AFTER_SAVE.values())))
+            row.set_selected(after.index(cfg[key]) if cfg.get(key) in after else 0)
+            row.connect("notify::selected", lambda w, _p, key=key: library.set_pref(key, after[w.get_selected()]))
+            saving.add(row)
+        page.add(saving)
         multi = Adw.PreferencesGroup(title="Multi-select", description="Pick several videos to make a collage "
                                      "or add them to a collection together. Right-click a selected video for the menu.")
         btn = Adw.SwitchRow(title="Show Select button", subtitle="The checkmark button in the gallery header",

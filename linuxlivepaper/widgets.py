@@ -9,7 +9,9 @@ import threading  # noqa: E402
 from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-from . import interp, library, thumbs  # noqa: E402
+import time  # noqa: E402
+
+from . import effects, interp, library, thumbs  # noqa: E402
 
 NEW = "New Collection…"
 
@@ -253,8 +255,77 @@ class CollectionRow(Adw.ComboRow):
         return library.get_collection(self.names[i - 1]) if 1 <= i <= len(self.names) else None
 
 
+def speed_row(value, on_change, title="Speed"):
+    """Adw.ActionRow with a speed slider (effects.SPEED_MIN..SPEED_MAX, 1× snaps). on_change(speed) fires 300 ms
+    after the last move, so dragging does not re-render the preview on every step."""
+    row = Adw.ActionRow(title=title, subtitle="Slower keeps the pitch of the sound")
+    lbl = Gtk.Label(label=f"{value:g}×", width_chars=5, xalign=1, css_classes=["numeric"])
+    scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, effects.SPEED_MIN, effects.SPEED_MAX, 0.05)
+    scale.set_size_request(150, -1)
+    scale.set_valign(Gtk.Align.CENTER)
+    scale.set_draw_value(False)
+    for m in (0.5, 1.0, 2.0):
+        scale.add_mark(m, Gtk.PositionType.BOTTOM, None)
+    scale.set_value(value)
+    pending = [0, value]
+
+    def moved(sc):
+        v = round(sc.get_value(), 2)
+        v = 1.0 if abs(v - 1) < 0.04 else v
+        lbl.set_label(f"{v:g}×")
+        if v == pending[1]:
+            return
+        pending[1] = v
+        if pending[0]:
+            GLib.source_remove(pending[0])
+        pending[0] = GLib.timeout_add(300, fire)
+
+    def fire():
+        pending[0] = 0
+        on_change(pending[1])
+        return False
+    scale.connect("value-changed", moved)
+    row.add_suffix(scale)
+    row.add_suffix(lbl)
+    return row
+
+
+class SaveProgress(Gtk.ProgressBar):
+    """Percent + time-left bar shown in the header while a live image / collage saves. report() is thread-safe."""
+
+    def __init__(self, header):
+        super().__init__(show_text=True, width_request=260, valign=Gtk.Align.CENTER)
+        self.header, self.t0 = header, 0.0
+
+    def begin(self):
+        self.t0 = time.monotonic()
+        self.set_fraction(0)
+        self.set_text("Starting…")
+        self.header.set_title_widget(self)
+
+    def end(self):
+        self.header.set_title_widget(None)
+
+    def report(self, f):
+        GLib.idle_add(self._show, f)
+
+    def _show(self, f):
+        used = time.monotonic() - self.t0
+        self.set_fraction(f)
+        left = used * (1 - f) / f if f > 0.02 and used > 3 else None  # no estimate until it has a basis
+        self.set_text(f"{f:.0%}" + (f" · about {eta(left)} left" if left is not None else ""))
+        return False
+
+
+def eta(seconds):
+    s = max(1, round(seconds))
+    return f"{s} s" if s < 90 else f"{round(s / 60)} min"
+
+
 class InterpGroup(Adw.PreferencesGroup):
     """'Frame interpolation' settings shared by the editor and collage panels (saved in the config, used on Save)."""
+
+    MODE_HELP = {"smooth": "More frames, same length", "slow": "Same frame rate, longer clip"}
 
     def __init__(self):
         super().__init__(title="Frame interpolation", description="AI in-between frames (RIFE or FLAVR) added when "
@@ -267,7 +338,8 @@ class InterpGroup(Adw.PreferencesGroup):
         self.factor.connect("notify::selected", self._factor_picked)
         self.add(self.factor)
         self.mode = self._combo("Use them for", None, interp.MODES, "mode")
-        self.scale = self._combo("Detail", "Half runs the network on smaller frames", interp.SCALES, "scale")
+        self.mode.set_subtitle(self.MODE_HELP[self.s["mode"]])
+        self.scale = self._combo("Detail", "Half is faster (good for 4K): the network runs on smaller frames", interp.SCALES, "scale")
         self.py = Adw.EntryRow(title="PyTorch Python (empty = find it)", text=self.s["python"],
                                show_apply_button=True)
         self.py.connect("apply", lambda r: self._set("python", r.get_text().strip()))
@@ -294,6 +366,8 @@ class InterpGroup(Adw.PreferencesGroup):
 
     def _set(self, key, value):
         self.s[key] = value
+        if key == "mode":
+            self.mode.set_subtitle(self.MODE_HELP[value])
         interp.save(**{key: value})
         self._sync()
 

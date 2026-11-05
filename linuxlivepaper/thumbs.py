@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -192,13 +193,51 @@ def _software(cmd):
     return cmd[:i - 1] + ["-c:v", "libx264", "-preset", "faster", "-crf", q] + cmd[i + 9:]  # keeps -pix_fmt
 
 
-def run(cmd, timeout=600):
+def scaled(progress, lo, hi):
+    """A progress callback mapping a stage's 0..1 onto lo..hi of the whole job (None stays None)."""
+    return progress and (lambda f: progress(lo + (hi - lo) * min(1.0, max(0.0, f))))
+
+
+def read_progress(lines, total, progress):
+    """Feed `progress(fraction)` from ffmpeg `-progress pipe:1` output lines (out_time_us=<microseconds>)."""
+    for line in lines:
+        k, _, v = line.decode("utf-8", "replace").strip().partition("=")
+        if k == "out_time_us" and v.lstrip("-").isdigit() and int(v) > 0:
+            progress(min(1.0, int(v) / 1e6 / total))
+
+
+def _exec(cmd, timeout, progress, total):
+    if not (progress and total):
+        return subprocess.run(cmd, capture_output=True, timeout=timeout)
+    with tempfile.TemporaryFile() as err:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+        timer = threading.Timer(timeout, p.kill)
+        timer.start()
+        try:
+            read_progress(p.stdout, total, progress)
+            p.wait()
+        finally:
+            timer.cancel()
+        err.seek(0)
+        return subprocess.CompletedProcess(cmd, p.returncode, b"", err.read())
+
+
+def with_progress(cmd):
+    """cmd with ffmpeg's machine-readable progress on stdout (inserted right after the `ffmpeg` word)."""
+    i = cmd.index("ffmpeg") + 1
+    return cmd[:i] + ["-progress", "pipe:1", "-nostats"] + cmd[i:]
+
+
+def run(cmd, timeout=600, progress=None, total=None):
     """Like subprocess.run(check=True), but the failure message is ffmpeg's own last line (shown in the UI).
-    A failed GPU encode is retried once on the CPU."""
-    p = subprocess.run(NICE + cmd, capture_output=True, timeout=timeout)
+    A failed GPU encode is retried once on the CPU. progress(fraction 0..1) is called while ffmpeg encodes a
+    `total`-second output."""
+    if progress and total:
+        cmd = with_progress(cmd)
+    p = _exec(NICE + cmd, timeout, progress, total)
     if p.returncode and ("h264_nvenc" in cmd or "-hwaccel" in cmd or "-resize" in cmd):
         log("GPU ffmpeg failed, retrying on the CPU:", p.stderr.decode("utf-8", "replace").strip()[-300:])
-        p = subprocess.run(NICE + _software(cmd), capture_output=True, timeout=timeout)
+        p = _exec(NICE + _software(cmd), timeout, progress, total)
     if p.returncode:
         err = p.stderr.decode("utf-8", "replace").strip().splitlines()
         raise RuntimeError(err[-1] if err else f"ffmpeg exited {p.returncode}")

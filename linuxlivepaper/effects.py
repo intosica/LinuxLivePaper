@@ -33,9 +33,19 @@ EFFECTS = {
     "pixel": ("Pixel", "pixelize=w=14:h=14"),
     "mirror": ("Mirror", "crop=trunc(iw/4)*2:ih:0:0,split[fxl][fxr];[fxr]hflip[fxf];[fxl][fxf]hstack"),
 }
-SPEEDS = (0.5, 1.0, 1.5, 2.0)
+SPEED_MIN, SPEED_MAX = 0.1, 4.0  # the Speed slider's range (1.0 = normal)
 DIRECTIONS = {"forward": "Forward", "reverse": "Reverse", "bounce": "Bounce"}
 DEFAULT = {"look": "none", "effect": "none", "speed": 1.0, "direction": "forward"}
+
+
+def atempo(speed):
+    """Pitch-preserving time-stretch (ffmpeg's WSOLA `atempo`, the usual way to slow audio without the chipmunk/
+    demon pitch shift). One atempo stage only reaches 0.5x, so slower speeds are split into equal stages (four
+    gentle 0.56x stages sound cleaner than 0.5, 0.5, 0.5, 0.8)."""
+    n = 1
+    while speed ** (1 / n) < 0.5:
+        n += 1
+    return ",".join([f"atempo={speed ** (1 / n):.6f}"] * n)
 
 
 def frame_chain(opts):
@@ -81,7 +91,7 @@ def graph(opts, has_audio, size):
         v.append("split[bf][bb];[bb]reverse[br];[bf][br]concat=n=2:v=1:a=0")
     parts = [f"[0:v]{','.join(v)},scale={size[0]}:{size[1]},setsar=1,format=yuv420p[vout]"]
     if has_audio:
-        a = ["asetpts=PTS-STARTPTS"] + ([f"atempo={opts['speed']}"] if opts["speed"] != 1 else [])
+        a = ["asetpts=PTS-STARTPTS"] + ([atempo(opts["speed"])] if opts["speed"] != 1 else [])
         if d == "reverse":
             a.append("areverse")
         elif d == "bounce":
@@ -100,7 +110,7 @@ def _has_audio(src, mtime):  # an ffprobe per call adds up when a collage re-ren
                                 "-of", "csv=p=0", src], capture_output=True, text=True).stdout.strip())
 
 
-def render(src, start, end, out, opts=None, height=None, fast=False, extra=(), loop=False):
+def render(src, start, end, out, opts=None, height=None, fast=False, extra=(), loop=False, progress=None):
     """Render [start, end] of src through the effect graph to out (H.264/AAC)."""
     opts = {**DEFAULT, **(opts or {})}
     audio = has_audio(src)
@@ -110,7 +120,7 @@ def render(src, start, end, out, opts=None, height=None, fast=False, extra=(), l
     cmd = ["ffmpeg", "-v", "error", "-y", *trim, *thumbs.hwdec(src, height and not frame_chain(opts) and out_size(w, h, height)), "-i", str(src), "-filter_complex", graph(opts, audio, out_size(w, h, height)),
            "-map", "[vout]", *(["-map", "[aout]", "-c:a", "aac"] if audio else []),
            *thumbs.h264(fast, out_size(w, h, height)), *extra, str(out)]
-    thumbs.run(cmd)
+    thumbs.run(cmd, progress=progress, total=end is not None and out_length(end - start, opts))
     return out
 
 
@@ -132,7 +142,7 @@ if __name__ == "__main__":
                         "-i", "sine=d=3", "-shortest", str(src)], check=True)
         # every look and effect renders and keeps the size; speed/bounce change the length as expected
         cases = [{"look": k} for k in LOOKS] + [{"effect": k} for k in EFFECTS] + \
-                [{"speed": 2.0, "direction": "bounce"}, {"speed": 0.5, "direction": "reverse"}]
+                [{"speed": 2.0, "direction": "bounce"}, {"speed": 0.5, "direction": "reverse"}, {"speed": 0.15}]
         for o in cases:
             out = render(src, 0.5, 2.5, Path(d, "o.mp4"), o, fast=True)
             j = json.loads(subprocess.run([*probe, str(out)], capture_output=True, text=True).stdout)
@@ -141,6 +151,16 @@ if __name__ == "__main__":
             assert sizes == [(320, 240)], (o, sizes)
             assert abs(float(j["format"]["duration"]) - out_length(2.0, o)) < 0.15, (o, j["format"])
             assert len(j["streams"]) == 2, o
+        # slow audio keeps its pitch: a 440 Hz sine at 0.25x is still ~440 Hz and 4x as long
+        wav = Path(d, "s.wav")
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=440:d=1", "-af", atempo(0.25),
+                        "-ar", "8000", "-ac", "1", str(wav)], check=True)
+        import wave
+        w = wave.open(str(wav))
+        pcm = memoryview(w.readframes(w.getnframes())).cast("h")
+        hz = sum(a < 0 <= b for a, b in zip(pcm, pcm[1:])) / (w.getnframes() / w.getframerate())
+        assert abs(w.getnframes() / w.getframerate() - 4) < 0.1 and abs(hz - 440) < 15, (hz, w.getnframes())
+        assert all(float(x) >= 0.5 for x in atempo(0.1).replace("atempo=", "").split(","))
         assert out_time(0.5, 2.0, {**DEFAULT, "direction": "reverse"}) == 1.5
         assert out_time(1.0, 2.0, {**DEFAULT, "speed": 2.0}) == 0.5
         for o in ({**DEFAULT, "direction": "reverse", "speed": 0.5}, {**DEFAULT, "speed": 2.0}):
