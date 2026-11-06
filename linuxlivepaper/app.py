@@ -1140,11 +1140,14 @@ class Window(Adw.ApplicationWindow):
         self._px = 10_000  # last pointer x: the arrow appears when the pointer comes near the left edge
         self.browse_pane = Gtk.Box(css_classes=["gallery-browse"])
         self.browse_pane.append(Gtk.Box(width_request=34))  # the arrow column: it stays clickable while open
+        # keep the revealer visible: a hidden Gtk.Revealer never gets mapped, so set_reveal_child() alone showed
+        # nothing (it measures 0 wide while it is closed, so it does not cover the grid either)
         self.gallery_browse = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT,
                                            transition_duration=200, halign=Gtk.Align.START, valign=Gtk.Align.FILL,
-                                           visible=False, child=self.browse_pane)
+                                           child=self.browse_pane)
         self.browse_btn = Gtk.ToggleButton(icon_name="go-next-symbolic", tooltip_text="Browse files",
                                            css_classes=["flat", "browse-handle", "floating"],
+                                           width_request=26, height_request=56,
                                            halign=Gtk.Align.START, valign=Gtk.Align.CENTER, visible=False)
         self.browse_btn.connect("toggled", self._toggle_gallery_browse)
         side = Gtk.Overlay(child=self.nav)
