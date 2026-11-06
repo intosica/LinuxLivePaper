@@ -86,13 +86,23 @@ class GifPlay:
         self.set_playing(False)
 
 
+def _clear_later(m):
+    m.clear()
+    return False
+
+
 def release(m):
     """Really free a stream. set_playing(False) only pauses: the GStreamer pipeline (and its NVDEC decoder, VRAM and
     GPU channel) lives until the object dies, and Python closures keep it alive. Leaking these exhausted the NVIDIA
-    driver's channels and froze the desktop."""
+    driver's channels and froze the desktop.
+
+    The clear() waits for the next main-loop turn on purpose. Freeing several playing streams in one callback — a
+    collage dropping all its cells on stop(), a cell replaced while playing — raced GstPlay's pause on its own thread
+    and segfaulted in gst_play_main (heap already corrupted, so the backtrace landed in random spots). 3 of 4 stress
+    runs crashed like that before this, 0 of 8 after."""
     if m is not None:
         m.set_playing(False)
-        m.clear()
+        GLib.idle_add(_clear_later, m)
 
 
 def play_stream(path, picture, muted=True, loop=True):
