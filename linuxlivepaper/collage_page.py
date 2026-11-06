@@ -720,6 +720,12 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         if what == "scrub":  # the red playhead is free: show the collage at that moment, and Play resumes there
             o = {**effects.DEFAULT, **cell["opts"]}
             self.pos = effects.out_time(max(0.0, tl.p - cell["start"]), collage.window(cell), o)
+            if self.playing:  # jump the shared clock; the tick seeks every cell onto it
+                if self.clock0 is not None:
+                    self.clock0 = GLib.get_monotonic_time() - int(self.pos * 1e6)
+                    for e in self.live:
+                        e and e.pop("hold", None)
+                return
             self.refresh(all_cells=True)
             return
         if what not in ("move", "start", "end"):
@@ -1075,7 +1081,10 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
 
     def _start_target(self, cell, spec):
         """Seconds into its own stream a cell must start at to show the collage from `start_pos`."""
-        pos = (self.start_pos or 0.0) % max(collage.duration(self.c), 0.05)
+        pos = self.start_pos or 0.0
+        if self.clock0 is not None:  # a cell that lands late (a bake finishing) joins the clock where it is now
+            pos = (GLib.get_monotonic_time() - self.clock0) / 1e6
+        pos %= max(collage.duration(self.c), 0.05)
         if spec[0] == "bake":
             return pos % max(collage.cell_length(cell), 0.05)  # a baked cell loops its own pass
         return collage.cell_time(cell, pos)

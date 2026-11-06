@@ -35,6 +35,11 @@ MIN_SEL = 0.3
 DEFAULT_SEL = 3.0
 
 
+def direct_ok(opts, overlays, src):
+    """Nothing to bake (no look/effect/speed/direction/overlay): the source plays as is."""
+    return opts == effects.DEFAULT and not overlays and not src.lower().endswith(".gif")
+
+
 def fmt(t, fine=True):
     m, s = divmod(max(0.0, t), 60)
     return f"{int(m)}:{s:05.2f}" if fine else f"{int(m)}:{int(s):02d}"
@@ -693,15 +698,18 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
             return
         self._try_done()
         s, e, opts = self.tl.s, self.tl.e, dict(self.opts)
-        # play from the red playhead when it sits in the yellow selection (it defaults to the selection start)
-        s = self.tl.p if s <= self.tl.p <= e - 0.05 else s
+        # start at the red playhead when it sits in the yellow selection (it defaults to the selection start); the
+        # bake and the loop always cover the whole selection
+        at = self.tl.p if s <= self.tl.p <= e - 0.05 else s
+        # where in the stream that moment is: the source itself, or its place in the rendered clip
+        t0 = at if direct_ok(opts, self.overlays, self.src) else effects.out_time(at - s, e - s, {**effects.DEFAULT, **opts})
         self.spinner.start()
         self.play_btn.set_icon_name("media-playback-pause-symbolic")
         self.req += 1
         req = self.play_req = self.play_req + 1
         # Nothing to bake (no look/effect/speed/direction/overlay): play the source itself — instant, hardware-
         # decoded by GStreamer, no ffmpeg at all. The tick loops it inside the selection.
-        direct = opts == effects.DEFAULT and not self.overlays and not self.src.lower().endswith(".gif")
+        direct = direct_ok(opts, self.overlays, self.src)
 
         def work():
             with thumbs.BAKE_LOCK:
@@ -724,18 +732,20 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
             self.ov_layer_on = False
             self.layer.set_visible(False)
             st, self.warm = (self.warm, None) if direct and self.warm else (media_file(path, muted=False, loop=True), self.warm)
-            self.stream, self.direct = st, direct
+            self.stream, self.direct, self.shown = st, direct, False
 
             def first_frame(st):
-                if direct and (st.is_seeking() or st.get_timestamp() / 1e6 < s - 0.5):
-                    return  # still on frame 0, before the seek to the selection landed
+                if t0 > 0.5 and (st.is_seeking() or st.get_timestamp() / 1e6 < t0 - 0.5):
+                    return  # still on frame 0, before the seek to the start point landed
                 st.disconnect(hid)
+                self.shown = True
                 self.pic.set_paintable(st)
             hid = st.connect("invalidate-contents", first_frame)
-            if direct and st.is_prepared():
-                st.seek(int(s * 1e6))  # the warm stream sits wherever the last play stopped
-            elif direct and s > 0:
-                st.connect("notify::prepared", lambda st, _: st.is_prepared() and st.seek(int(s * 1e6)))
+            if st.is_prepared():
+                if direct or t0 > 0.01:
+                    st.seek(int(t0 * 1e6))  # a warm stream sits wherever the last play stopped
+            elif t0 > 0.01:
+                st.connect("notify::prepared", lambda st, _: st.is_prepared() and st.seek(int(t0 * 1e6)))
             st.play()
             self.tick = GLib.timeout_add(40, self._on_tick, s, e - s, opts, direct)
         if direct:
@@ -747,6 +757,8 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
             self.tick = 0
             return False
         st = self.stream
+        if not self.shown:
+            return True  # the playhead stays put until the first frame at the start point is up
         if direct:
             ts = st.get_timestamp() / 1e6
             if st.is_prepared() and not st.is_seeking() and (ts >= s + length or ts < s - 0.25):
