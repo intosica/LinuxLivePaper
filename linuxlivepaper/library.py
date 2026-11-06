@@ -102,6 +102,22 @@ def scan_dir(folder):
     return items
 
 
+def item_for(path):
+    """The Item the gallery would show for one file (a live image when its still/motion pair is on disk), so a
+    menu opened from somewhere else (a collage cell, a file browser tile) offers the same actions."""
+    p = Path(path)
+    for it in scan_dir(p.parent):
+        if os.path.abspath(it.motion) == os.path.abspath(p) or os.path.abspath(it.path) == os.path.abspath(p):
+            return it
+    ext = p.suffix.lower()
+    kind = "gif" if ext in GIF_EXT else "image" if ext in IMAGE_EXT else "video"
+    try:
+        mtime = p.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return Item(kind, str(p), str(p), mtime)
+
+
 def scan(root=None):
     """Scan, oldest first (the gallery shows newest at the bottom, like iOS Photos). Subfolders are read when the
     user wants them (`scan_subfolders` preference); the collection/ folders are always read, so All can show the
@@ -295,6 +311,9 @@ if __name__ == "__main__":
         set_meta(live.path, transition="zoom")
         set_meta(Path(d, "IMG_1.MOV"), x=1)
         assert get_meta(live.motion) == {"transition": "zoom", "x": 1} and get_meta(Path(d, "b.mp4")) == {}
+        set_meta(Path(d, "b.mp4"), bookmarks=[1.5, 2.25])
+        assert get_meta(Path(d, "b.mp4"))["bookmarks"] == [1.5, 2.25], "timeline bookmarks round-trip through the sidecar"
+        set_meta(Path(d, "b.mp4"), bookmarks=[])
         assert len(scan(d)) == 5  # sidecar is hidden
         assert motion_for(live.path) == live.motion and motion_for(Path(d, "a.png")) is None
         assert motion_for(Path(d, "c.gif")).endswith("c.gif") and motion_for(Path(d, "notes.txt")) is None

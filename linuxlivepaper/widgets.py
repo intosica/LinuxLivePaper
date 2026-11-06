@@ -23,10 +23,10 @@ class FileBrowser(Gtk.Box):
     """Slide-out folder browser for the collage maker: thumbnails of the videos, GIFs and live images in a folder.
     Click a tile → on_pick(clip path); drag a tile onto a cell (it carries a Gdk.FileList, like a file manager)."""
 
-    def __init__(self, folder, on_pick):
+    def __init__(self, folder, on_pick, on_menu=None, hint=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6, width_request=280, hexpand=False,
                          css_classes=["file-browser"])
-        self.on_pick, self.folder, self.gen = on_pick, None, 0
+        self.on_pick, self.on_menu, self.folder, self.gen = on_pick, on_menu, None, 0
         bar = Gtk.Box(spacing=4, margin_start=6, margin_end=6, margin_top=6)
         self.up = Gtk.Button(icon_name="go-up-symbolic", tooltip_text="Parent folder", css_classes=["flat"])
         self.up.connect("clicked", lambda *_: self.load(self.folder.parent))
@@ -40,7 +40,7 @@ class FileBrowser(Gtk.Box):
                                 valign=Gtk.Align.START, margin_start=6, margin_end=6, margin_bottom=6)
         self.flow.connect("child-activated", lambda _f, ch: ch.activate_fn())
         self.append(bar)
-        self.append(Gtk.Label(label="Click to fill the selected cell · drag onto any cell", wrap=True,
+        self.append(Gtk.Label(label=hint or "Click to fill the selected cell · drag onto any cell", wrap=True,
                               css_classes=["dim-label", "caption"], margin_start=6, margin_end=6))
         self.append(Gtk.ScrolledWindow(child=self.flow, vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER))
         self.load(folder)
@@ -70,10 +70,10 @@ class FileBrowser(Gtk.Box):
             self._tile(e.name, Gtk.Image(icon_name="folder-symbolic", pixel_size=48), lambda p=e.path: self.load(p))
         for it in sorted(library.scan_dir(self.folder), key=lambda i: i.name.lower()):
             pic = Gtk.Picture(content_fit=Gtk.ContentFit.COVER, height_request=110, can_shrink=True)
-            tile = self._tile(it.name, pic, lambda m=it.motion: self.on_pick(m), it.motion)
+            tile = self._tile(it.name, pic, lambda m=it.motion: self.on_pick(m), it.motion, it)
             _thumbs.submit(self._thumb, it, pic, tile, self.gen)
 
-    def _tile(self, name, pic, fn, drag_path=None):
+    def _tile(self, name, pic, fn, drag_path=None, item=None):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, tooltip_text=name)
         box.append(pic)
         box.append(Gtk.Label(label=name, ellipsize=2, css_classes=["caption"]))  # 2 = MIDDLE
@@ -85,6 +85,10 @@ class FileBrowser(Gtk.Box):
                 Gdk.FileList.new_from_list([Gio.File.new_for_path(drag_path)])))
             src.connect("drag-begin", lambda s, _d: s.set_icon(Gtk.WidgetPaintable.new(pic), 20, 20))
             child.add_controller(src)
+        if item and self.on_menu:  # same right-click menu as a gallery tile (the window owns it)
+            click = Gtk.GestureClick(button=3)
+            click.connect("pressed", lambda _g, _n, x, y: self.on_menu(item, child, x, y))
+            child.add_controller(click)
         self.flow.append(child)
         return child
 
@@ -290,30 +294,46 @@ def speed_row(value, on_change, title="Speed"):
     return row
 
 
-class SaveProgress(Gtk.ProgressBar):
-    """Percent + time-left bar shown in the header while a live image / collage saves. report() is thread-safe."""
+class SaveProgress(Gtk.Box):
+    """Percent + time-left bar and a Cancel button, shown in the header while a live image / collage saves.
+    report() is thread-safe; rows that report progress raise thumbs.Cancelled once the user cancels."""
 
     def __init__(self, header):
-        super().__init__(show_text=True, width_request=260, valign=Gtk.Align.CENTER)
-        self.header, self.t0 = header, 0.0
+        super().__init__(spacing=6, valign=Gtk.Align.CENTER)
+        self.header, self.t0, self.cancelled = header, 0.0, threading.Event()
+        self.bar = Gtk.ProgressBar(show_text=True, width_request=260, valign=Gtk.Align.CENTER)
+        self.cancel_btn = Gtk.Button(icon_name="process-stop-symbolic", tooltip_text="Cancel saving",
+                                     css_classes=["flat"])
+        self.cancel_btn.connect("clicked", lambda *_a: self.cancel())
+        self.append(self.bar)
+        self.append(self.cancel_btn)
 
     def begin(self):
+        self.cancelled.clear()
+        self.cancel_btn.set_sensitive(True)
         self.t0 = time.monotonic()
-        self.set_fraction(0)
-        self.set_text("Starting…")
+        self.bar.set_fraction(0)
+        self.bar.set_text("Starting…")
         self.header.set_title_widget(self)
 
     def end(self):
         self.header.set_title_widget(None)
 
+    def cancel(self):
+        self.cancelled.set()
+        self.bar.set_text("Cancelling…")
+        self.cancel_btn.set_sensitive(False)
+
     def report(self, f):
+        if self.cancelled.is_set():
+            raise thumbs.Cancelled()
         GLib.idle_add(self._show, f)
 
     def _show(self, f):
         used = time.monotonic() - self.t0
-        self.set_fraction(f)
+        self.bar.set_fraction(f)
         left = used * (1 - f) / f if f > 0.02 and used > 3 else None  # no estimate until it has a basis
-        self.set_text(f"{f:.0%}" + (f" · about {eta(left)} left" if left is not None else ""))
+        self.bar.set_text(f"{f:.0%}" + (f" · about {eta(left)} left" if left is not None else ""))
         return False
 
 

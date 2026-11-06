@@ -31,6 +31,11 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
   Change the folder in ☰ → *Preferences…* (library folder, GPU acceleration, preview size). Tabs at the top: **All · Live · Images · Videos · Collections**.
 - Use the **− / +** buttons in the header to make tiles (or, on the Collections tab, collection icons) smaller or bigger. The two
   sizes are independent and remembered between runs; long lists scroll vertically.
+- Point at the **left edge of the window** and a small arrow appears — click it to slide a file browser over the grid:
+  click a clip to edit it as a live image, drag a tile onto the grid to import it, right-click one for the same menu as a
+  gallery tile (minus *Add to Collection*).
+- **Drop videos, GIFs or live images from your file manager onto the window** and pick *Live Image* (opens the editor on
+  the first one) or *Live Collage* (one clip per cell, the layout follows how many you dropped).
   The gallery shows live images, plain images (JPG/PNG/WebP…), plain videos (MP4/MOV/MKV/WMV/VOB/TS…), and GIFs;
   JPEG+MOV pairs are shown as one live image. Use the import button to copy videos/GIFs into the folder.
   *Preferences → Gallery* can hide plain images or plain videos completely — their tab disappears too.
@@ -56,6 +61,9 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
   drag inside the selection to move it, and drag **COVER** to pick the still. Click to place the red playhead.
   Scroll to zoom, Shift+scroll to pan, and drag the overview strip to jump around long videos. Space plays the
   selection with sound, ←/→ steps one frame (Shift for 1 s). Saves go to the library folder.
+  After a trim the red playhead parks on the start of the yellow selection; otherwise it moves freely — click anywhere on
+  the timeline to preview that spot, and Space plays from there. **B** (or right-click on the ruler) adds a **bookmark** to
+  that frame, **,** and **.** jump to the previous/next one; bookmarks are stored next to the video and survive a restart.
   Videos can be MP4, MOV, M4V, WebM, MKV, AVI and DVD/MPEG files (VOB, MPG, TS, M2TS); anamorphic DVD video is shown
   and saved at its real (square-pixel) shape.
 - **Double-click anywhere on a timeline** to bring the yellow selection (or a collage cell's window) to that spot —
@@ -75,7 +83,10 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
   loop to fill it.** **Preview: …** (header) trades preview sharpness for speed; saving is always full quality. **Preferences → GPU acceleration** switches NVENC/CPU encoding. **Match clip lengths** (Longest / Shortest) resizes every clip's window to the longest or shortest one. *Repeat* plays the whole collage 1–10 times in the saved file. Space plays the collage,
   *Try it* previews the saved result (with repeats), and overlays work the same as in the editor (over the whole canvas;
   clicking an empty spot selects the cell under it). Changes re-render while playing (cell passes are cached, so only
-  the changed cell is re-encoded).
+  the changed cell is re-encoded). **Right-click a cell → *Edit as Live Image…*** opens that clip in the editor on its own.
+  Pausing keeps the moment the playhead shows instead of jumping back to the window start: drag the red playhead to any
+  point of the collage and every cell paints that instant, and Space resumes from there. Moving the yellow window puts the
+  cell back at the start of its window.
 - **Frame interpolation** (editor and collage panels, *Frame interpolation* group): when saving, add AI in-between
   frames with [Practical-RIFE](https://github.com/hzwer/Practical-RIFE) (models 4.26, 4.25 — upstream's
   recommended default — and 4.25.lite; 2×/3×/4×/8×) or [FLAVR](https://github.com/tarun005/FLAVR) (its 2×, 4× and
@@ -89,6 +100,8 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
   model (RIFE ~23 MB, FLAVR ~505 MB each) and the upstream network code into `~/.local/share/linuxlivepaper/interp/`.
   On the GPU, decoding (NVDEC), YUV↔RGB conversion, the network and encoding (NVENC) all run there; the CPU only moves
   bytes. Not available inside the Flatpak sandbox (no PyTorch there) — run from source for it.
+- **Saving** shows a progress bar with a time estimate in the header, and a **Cancel** button next to it — handy when
+  interpolation makes a save take minutes. Cancelling kills the encoders and removes the half-written files.
 
 A *live image* is a still and a video that share a name in the same folder (`x.jpg` + `x.mov`).
 That means Live Photos copied over from an iPhone show up as LIVE too.

@@ -31,6 +31,11 @@ NICE = ["nice", "-n", "19"] if shutil.which("nice") else []
 BAKE_LOCK = threading.Lock()
 
 
+class Cancelled(BaseException):
+    """Raised from a progress callback to abort the running encode (BaseException, so `except Exception` swallow
+    loops in the callers cannot eat it). The ffmpeg child is killed in _exec."""
+
+
 def log(*parts):
     """Append a line to ~/.cache/linuxlivepaper/log.txt — the only place a failed render explains itself."""
     try:
@@ -216,6 +221,9 @@ def _exec(cmd, timeout, progress, total):
         try:
             read_progress(p.stdout, total, progress)
             p.wait()
+        except BaseException:  # cancelled from the progress callback: no orphan ffmpeg left encoding
+            p.kill()
+            raise
         finally:
             timer.cancel()
         err.seek(0)
@@ -300,7 +308,7 @@ def _frame_at(src, t, height=None, chain="", key=False):
 def thumb_info(item):
     """(cached thumbnail path or None, duration in s for videos else None). The duration is cached next to the
     thumbnail, so a gallery tile costs at most one ffprobe per file, ever (it used to re-probe on every launch)."""
-    out = CACHE / "thumbs" / (_key(item.path, "mid") + ".jpg")  # "mid": frame at 50%, not the old ~1 s
+    out = CACHE / "thumbs" / (_key(item.path, "mid2") + ".jpg")  # "mid2": frame at 50% (regenerates old ~1 s ones)
     dur = None
     if item.kind == "video":
         side = out.with_suffix(".dur")
@@ -316,15 +324,15 @@ def thumb_info(item):
 def make_thumb(item, out=None, dur=None):
     """Cached JPEG thumbnail path for a gallery Item, or None."""
     src = item.path
-    out = out or CACHE / "thumbs" / (_key(src, "mid") + ".jpg")
+    out = out or CACHE / "thumbs" / (_key(src, "mid2") + ".jpg")
     if out.exists():
         return str(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
         if item.kind not in ("live", "image"):  # video or GIF (GdkPixbuf's GIF loader chokes on many real-world GIFs)
-            # videos: nearest keyframe (no decoding up to the middle of a long GOP); scaled inside ffmpeg
-            pb = grab_frame(src, (dur if dur is not None else video_duration(src)) / 2, None, f"scale={WIDTH}:-2",
-                            key=item.kind == "video")
+            # videos: the frame at 50% — keyframe-only seeking landed ~1 s in for many clips (a GOP is long), so
+            # the poster was nowhere near the middle. Scaled inside ffmpeg.
+            pb = grab_frame(src, (dur if dur is not None else video_duration(src)) / 2, None, f"scale={WIDTH}:-2")
         else:
             pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, WIDTH, -1, True)
             pb = pb.apply_embedded_orientation() or pb

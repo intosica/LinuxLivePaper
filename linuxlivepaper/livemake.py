@@ -23,12 +23,17 @@ def make_live(src, start=0.0, end=None, key_time=None, out_dir=None, name=None, 
     if end is None:
         end = effects.thumbs.video_duration(str(src))
     length = end - start
-    with tempfile.TemporaryDirectory() as d:
-        finish(lambda out, extra, cb=None: render(src, start, end, out, opts, extra=extra, progress=cb, **kw), mov, d,
-               repeat, interpolate, progress=progress)
-    key = effects.out_time(key_time or 0.0, length, opts)
-    f = interp.stretch(interpolate)
-    still(mov, min(max(0.0, key * f), effects.out_length(length, opts) * f - 0.05), jpg)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            finish(lambda out, extra, cb=None: render(src, start, end, out, opts, extra=extra, progress=cb, **kw), mov,
+                   d, repeat, interpolate, progress=progress)
+        key = effects.out_time(key_time or 0.0, length, opts)
+        f = interp.stretch(interpolate)
+        still(mov, min(max(0.0, key * f), effects.out_length(length, opts) * f - 0.05), jpg)
+    except effects.thumbs.Cancelled:  # stopped from the progress bar: no half-written live image left behind
+        for p in (jpg, mov):
+            Path(p).unlink(missing_ok=True)
+        raise
     return jpg, mov
 
 

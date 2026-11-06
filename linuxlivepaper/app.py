@@ -16,7 +16,8 @@ from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk  # noqa: E
 from . import effects, export, library, thumbs  # noqa: E402
 from .collage_page import CollagePage  # noqa: E402
 from .editor import EditorPage  # noqa: E402
-from .widgets import ZOOM_MAX, ZOOM_STEP, ZoomPicture, collection_dialog, icon_widget, pick_icon  # noqa: E402
+from .widgets import (ZOOM_MAX, ZOOM_STEP, FileBrowser, ZoomPicture, collection_dialog, icon_widget,  # noqa: E402
+                     pick_icon)
 from .playback import DEFAULT_STYLE, STYLES, GifPlay, LiveCanvas, media_file, play_stream, release  # noqa: E402
 
 APP_ID = "io.github.linuxlivepaper"
@@ -180,6 +181,8 @@ flowbox.collections > flowboxchild { padding: 6px; border-radius: 12px; }
 .nav-arrow { min-width: 44px; min-height: 44px; }
 .zoom-bar { border-radius: 999px; padding: 4px; }
 .browse-handle { min-width: 20px; min-height: 120px; padding: 0 2px; border-radius: 999px; }
+.browse-handle.floating { background: rgba(0,0,0,0.45); color: white; margin: 8px; }
+.gallery-browse { background: @window_bg_color; box-shadow: 1px 0 12px rgba(0,0,0,0.45); }
 .file-browser flowboxchild { padding: 0; border-radius: 10px; }
 .file-browser flowboxchild picture { border-radius: 10px 10px 0 0; }
 .hold { background: alpha(currentColor, 0.12); border-radius: 999px; padding: 5px 14px; }
@@ -1130,8 +1133,27 @@ class Window(Adw.ApplicationWindow):
         self.nav.add(Adw.NavigationPage(child=self.tv, title="Gallery", tag="gallery"))
         # the selection belongs to the view you are looking at: dropping it when the page changes keeps the count
         # (and Delete / Add to Collection) from acting on items that page doesn't even show
-        self.nav.connect("notify::visible-page", lambda *_: self.selection_changed())
-        self.toasts = Adw.ToastOverlay(child=self.nav)  # around every page, so toasts show from any page
+        self.nav.connect("notify::visible-page", lambda *_: (self.selection_changed(), self._near_edge()))
+        # the gallery's file browser: a thin arrow at the left edge (shown only near the pointer) slides a pane over
+        # the grid, so a clip can be found without leaving the gallery
+        self.browser = None
+        self._px = 10_000  # last pointer x: the arrow appears when the pointer comes near the left edge
+        self.browse_pane = Gtk.Box(css_classes=["gallery-browse"])
+        self.browse_pane.append(Gtk.Box(width_request=34))  # the arrow column: it stays clickable while open
+        self.gallery_browse = Gtk.Revealer(transition_type=Gtk.RevealerTransitionType.SLIDE_RIGHT,
+                                           transition_duration=200, halign=Gtk.Align.START, valign=Gtk.Align.FILL,
+                                           visible=False, child=self.browse_pane)
+        self.browse_btn = Gtk.ToggleButton(icon_name="go-next-symbolic", tooltip_text="Browse files",
+                                           css_classes=["flat", "browse-handle", "floating"],
+                                           halign=Gtk.Align.START, valign=Gtk.Align.CENTER, visible=False)
+        self.browse_btn.connect("toggled", self._toggle_gallery_browse)
+        side = Gtk.Overlay(child=self.nav)
+        side.add_overlay(self.gallery_browse)
+        side.add_overlay(self.browse_btn)
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)  # clips dragged in from the file manager
+        drop.connect("drop", lambda _t, files, _x, _y: self._dropped(files))
+        side.add_controller(drop)
+        self.toasts = Adw.ToastOverlay(child=side)  # around every page, so toasts show from any page
         self.set_content(self.toasts)
         self.apply_view_prefs()
         first.set_active(True)
@@ -1161,10 +1183,71 @@ class Window(Adw.ApplicationWindow):
         self._chrome(False)
         return False
 
-    def _moved(self, *_a):
+    def _moved(self, _c, x, _y):
+        self._px = x
+        self._near_edge()
         page = self.nav.get_visible_page()
         if self.is_fullscreen() and page is not None and page.get_tag() == "gallery":
             self._chrome()  # the viewer owns its own chrome while it is on top
+
+    def _near_edge(self):
+        """The gallery's browse arrow shows only when the pointer is near the left edge (or while its pane is open)."""
+        page = self.nav.get_visible_page()
+        show = page is not None and page.get_tag() == "gallery" and (self.browse_btn.get_active() or self._px < 56)
+        if self.browse_btn.get_visible() != show:
+            self.browse_btn.set_visible(show)
+        if not show and self.browse_btn.get_active():  # left the gallery: no pane over the next page
+            self.browse_btn.set_active(False)
+
+    def _toggle_gallery_browse(self, b):
+        if b.get_active() and not self.browser:  # built on first open: scanning a folder isn't free
+            self.browser = FileBrowser(library.library_dir(), self._browse_pick, self._browse_menu,
+                                        hint="Click a clip to edit it as a live image · right-click for more")
+            self.browse_pane.append(self.browser)
+        self.gallery_browse.set_reveal_child(b.get_active())
+        b.set_icon_name("go-previous-symbolic" if b.get_active() else "go-next-symbolic")
+
+    def _browse_pick(self, path):
+        """A clip picked in the gallery's browser starts a live image, like 'Edit as Live Image…'."""
+        self.open_editor(library.motion_for(path))
+
+    def _browse_menu(self, item, widget, x, y):
+        self.item_menu(widget, x, y, item, None, add=False)
+
+    def _dropped(self, files):
+        """A clip dropped from the file manager: ask what to start with it."""
+        page = self.nav.get_visible_page()
+        if page is not None and page.get_tag() != "gallery":
+            return False
+        clips = [m for m in (library.motion_for(f.get_path()) for f in files.get_files() if f.get_path()) if m]
+        if not clips:
+            self.toast("Drop a video, GIF or live image")
+            return False
+        dlg = Adw.AlertDialog(heading="Start with this clip" if len(clips) == 1 else f"Start with {len(clips)} clips",
+                              body="A live image is the frame you pick with the clip playing behind it; a collage "
+                                   "plays several clips side by side and loops them.")
+        dlg.add_response("collage", "Live Collage")
+        dlg.add_response("image", "Live Image")
+        dlg.set_response_appearance("image", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("image")
+        dlg.set_close_response("image")
+        dlg.connect("response", lambda _d, r: self._start_with(clips, r))
+        dlg.present(self)
+        return True
+
+    def _start_with(self, clips, choice):
+        if choice == "image":
+            return self.open_editor(clips[0])
+        self._collage_with(clips)
+
+    def _collage_with(self, clips):
+        """A collage maker holding `clips` (paths) from the first cell on, in the layout for their count."""
+        clips = clips[:9]
+        page = CollagePage(self._saved)
+        page._set_layout(COLLAGE_LAYOUT[len(clips)])
+        for i, path in enumerate(clips):
+            page.set_clip(i, path)
+        self.nav.push(page)
 
     def toast(self, text):
         self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
@@ -1217,17 +1300,19 @@ class Window(Adw.ApplicationWindow):
         pm.connect("closed", lambda p: GLib.idle_add(p.unparent))
         pm.popup()
 
-    def item_menu(self, widget, x, y, item, collection=None):
+    def item_menu(self, widget, x, y, item, collection=None, add=True):
+        """The tile menu. add=False drops 'Add to Collection' (the collages' and the browser pane's tiles: a clip
+        dropped into a collage has no gallery folder to belong to)."""
         self.ctx_item, self.ctx_collection = item, collection
-        if item.path in SELECTED:
+        if add and item.path in SELECTED:
             return self._popup(widget, x, y, self._selection_menu())
-        add = Gio.Menu()
+        sub = Gio.Menu()
         for c in library.collections():
             if c.path.resolve() != Path(item.path).parent.resolve():
                 mi = Gio.MenuItem.new(c.name, None)
                 mi.set_action_and_target_value("win.add-to", GLib.Variant.new_string(c.name))
-                add.append_item(mi)
-        add.append("New Collection…", "win.add-to-new")
+                sub.append_item(mi)
+        sub.append("New Collection…", "win.add-to-new")
         menu = Gio.Menu()
         if item.kind != "image":  # a still has nothing to edit into a live image
             edit = Gio.Menu()
@@ -1239,7 +1324,8 @@ class Window(Adw.ApplicationWindow):
         open_with_menu.append("Open in Application…", "win.open-with")
         open_with_menu.append("Show in Files", "win.show-in-files")
         menu.append_section(None, open_with_menu)
-        menu.append_submenu("Add to Collection", add)
+        if add:
+            menu.append_submenu("Add to Collection", sub)
         if in_collection(item):
             menu.append("Remove from Collection", "win.remove-from")
         if item.kind == "live":  # same entries + options dialog as the editor's Save ▾ menu
@@ -1357,12 +1443,7 @@ class Window(Adw.ApplicationWindow):
         items = list(SELECTED.values())
         if len(items) > 9:
             self.toast("A collage holds 9 clips: using the first 9")
-            items = items[:9]
-        page = CollagePage(self._saved)
-        page._set_layout(COLLAGE_LAYOUT[len(items)])
-        for i, it in enumerate(items):
-            page.set_clip(i, it.motion)
-        self.nav.push(page)
+        self._collage_with([it.motion for it in items])
         self.set_select_mode(False)
         self.select_btn.set_active(False)
 
@@ -1493,10 +1574,10 @@ class Window(Adw.ApplicationWindow):
 
     def _saved(self, page, res, err):
         page.progress.end()
-        if err:
+        if err or not res:
             page.save_btn.set_sensitive(True)
             page.save_btn.set_label(page.SAVE_LABEL)
-            self.toast(f"Saving failed: {err}")
+            self.toast(f"Saving failed: {err}" if err else "Saving cancelled")
             return
         key = "after_save_collage" if isinstance(page, CollagePage) else "after_save_live"
         if library.load_config().get(key, "gallery") == "stay":

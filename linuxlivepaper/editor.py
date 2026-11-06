@@ -62,6 +62,9 @@ class Timeline(Gtk.DrawingArea):
         while len(_STRIPS) > 6:
             _STRIPS.pop(next(iter(_STRIPS)))
         self.wanted = set()
+        # bookmarks live in the clip's own .linuxlivepaper.json sidecar, so they survive a restart
+        self.marks = sorted(float(m) for m in (library.get_meta(src).get("bookmarks") or [])
+                            if isinstance(m, (int, float)) and 0 <= m <= self.D)
         self.pool = _FILM_STRIP
         self.mode, self.mx = None, 0.0
         self.set_draw_func(self._draw)
@@ -79,6 +82,9 @@ class Timeline(Gtk.DrawingArea):
         double = Gtk.GestureClick()
         double.connect("pressed", self._double)
         self.add_controller(double)
+        mark = Gtk.GestureClick(button=3)  # right click on the ruler: add / remove a bookmark
+        mark.connect("pressed", lambda _g, _n, x, _y: self.toggle_mark(min(max(self.t(x), 0.0), self.D)))
+        self.add_controller(mark)
 
     # --- geometry -------------------------------------------------------------------------------
     def _w(self):
@@ -115,6 +121,31 @@ class Timeline(Gtk.DrawingArea):
         self.k = min(max(self.k, s), e)
         self.queue_draw()
         self.emit("changed", what)
+
+    # --- bookmarks ------------------------------------------------------------------------------
+    def toggle_mark(self, t=None):
+        """Add (or remove) a bookmark at t (default: the playhead) and save it with the clip."""
+        t = self.p if t is None else t
+        near = next((m for m in self.marks if abs(m - t) < 0.3), None)
+        if near is not None:
+            self.marks.remove(near)
+        else:
+            self.marks = sorted([*self.marks, round(t, 3)])
+        try:
+            library.set_meta(self.src, bookmarks=self.marks)
+        except OSError:
+            pass
+        self.queue_draw()
+
+    def jump_mark(self, step):
+        """Playhead to the next (1) or previous (-1) bookmark; False when there is none that way."""
+        cands = [m for m in self.marks if (m > self.p + 0.01 if step > 0 else m < self.p - 0.01)]
+        if not cands:
+            return False
+        self.p = min(cands) if step > 0 else max(cands)
+        self.queue_draw()
+        self.emit("changed", "scrub")
+        return True
 
     # --- input ----------------------------------------------------------------------------------
     def _hit(self, x, y):
@@ -333,6 +364,18 @@ class Timeline(Gtk.DrawingArea):
         self._rrect(cr, xk - 24, CV_Y, 48, CV_H, CV_H / 2)
         cr.fill()
         self._text(cr, xk, CV_Y + 2, "COVER", 7, (0, 0, 0, 0.85), True, True)
+        # bookmarks: a tick in the ruler plus a small flag at the top of the filmstrip
+        cr.set_source_rgb(0.35, 0.75, 1.0)
+        for m in self.marks:
+            if not self.v0 <= m <= self.v1:
+                continue
+            xm = self.x(m)
+            cr.rectangle(xm - 1, RU_Y + 2, 2, RU_H - 4)
+            cr.fill()
+            cr.move_to(xm - 4, ST_Y + 1)
+            cr.line_to(xm + 4, ST_Y + 1)
+            cr.line_to(xm, ST_Y + 9)
+            cr.fill()
         # playhead
         xp = self.x(self.p)
         if PAD - 1 <= xp <= W - PAD + 1:
@@ -399,6 +442,9 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         here.connect("clicked", lambda *_: self._start_at_playhead())
         cover = Gtk.Button(label="Cover = playhead", tooltip_text="Use the frame under the red playhead as the still")
         cover.connect("clicked", lambda *_: self._cover_at_playhead())
+        mark = Gtk.Button(icon_name="user-bookmarks-symbolic",
+                          tooltip_text="Bookmark this frame (B) · right-click the timeline to add or remove one")
+        mark.connect("clicked", lambda *_: self.tl.toggle_mark())
         zoom = Gtk.Box(css_classes=["linked"])
         for icon, tip, fn in (("zoom-out-symbolic", "Zoom out", lambda: self.tl.zoom(1.6)),
                               ("zoom-fit-best-symbolic", "Zoom to selection", self.tl.zoom_to_selection),
@@ -407,12 +453,13 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
             b.connect("clicked", lambda _b, f=fn: f())
             zoom.append(b)
         controls = Gtk.Box(spacing=8)
-        for wdg in (self.play_btn, self.time_lbl, Gtk.Box(hexpand=True), here, cover, presets, zoom):
+        for wdg in (self.play_btn, self.time_lbl, Gtk.Box(hexpand=True), here, cover, mark, presets, zoom):
             controls.append(wdg)
 
         hint = Gtk.Label(wrap=True, css_classes=["dim-label", "caption"], label=(
             "Drag the yellow handles to trim · drag inside the selection to move it · drag COVER to pick the still · "
-            "click to move the playhead · scroll to zoom, Shift+scroll to pan · drag the top bar to jump around"))
+            "click to move the playhead · B or right-click to bookmark, , and . jump · scroll to zoom, "
+            "Shift+scroll to pan · drag the top bar to jump around"))
 
         menu = Gio.Menu()
         menu.append("Save as GIF…", "export.gif")
@@ -646,6 +693,8 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
             return
         self._try_done()
         s, e, opts = self.tl.s, self.tl.e, dict(self.opts)
+        # play from the red playhead when it sits in the yellow selection (it defaults to the selection start)
+        s = self.tl.p if s <= self.tl.p <= e - 0.05 else s
         self.spinner.start()
         self.play_btn.set_icon_name("media-playback-pause-symbolic")
         self.req += 1
@@ -742,11 +791,14 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
 
     # --- edits ----------------------------------------------------------------------------------
     def _changed(self, _tl, what):
+        if what in ("start", "end", "move"):  # a trimmed selection parks the playhead at its start...
+            self.tl.p = self.tl.s
         if self.stream:  # keep the preview running and just re-bake it over the new selection
             self._rebake()
         else:
             self.stop()
-            self._show_frame({"start": self.tl.s, "end": self.tl.e, "move": self.tl.s, "cover": self.tl.k}.get(what, self.tl.p))
+            # ...and every other move (scrub, bookmark jump) previews what the playhead points at
+            self._show_frame(self.tl.k if what == "cover" else self.tl.p)
         self._update_label()
 
     def _update_label(self):
@@ -774,6 +826,13 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
         fps_step = 1.0 if state & Gdk.ModifierType.SHIFT_MASK else 1 / 24
         if keyval == Gdk.KEY_space:
             self.toggle_play()
+        elif keyval == Gdk.KEY_b:
+            self.tl.toggle_mark()
+        elif keyval in (Gdk.KEY_comma, Gdk.KEY_period):
+            if not self.tl.jump_mark(1 if keyval == Gdk.KEY_period else -1):
+                return False
+            if not self.tl.v0 <= self.tl.p <= self.tl.v1:
+                self.tl.set_view(self.tl.p - (self.tl.v1 - self.tl.v0) / 2, self.tl.v1 - self.tl.v0)
         elif keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
             self.stop()
             self.tl.p = min(max(0.0, self.tl.p + (fps_step if keyval == Gdk.KEY_Right else -fps_step)), self.D)
@@ -824,6 +883,9 @@ class EditorPage(OverlayHost, Adw.NavigationPage):
                                               overlay_list=ovs, repeat=n, interpolate=smooth,
                                               progress=self.progress.report), None
                 library.set_meta(res[0], transition=style)
+            except thumbs.Cancelled:  # the user stopped it: make_live removed its partial files
+                thumbs.log("save cancelled")
+                res, err = None, None
             except Exception as ex:  # surfaced as a toast
                 res, err = None, str(ex)
             GLib.idle_add(self.on_saved, self, res, err)

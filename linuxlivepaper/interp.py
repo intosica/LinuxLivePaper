@@ -189,8 +189,13 @@ def apply(src, out, s, extra=(), progress=None):
         p1.stdout.close()
         p3 = subprocess.Popen([*thumbs.NICE, *enc], stdin=p2.stdout, stdout=subprocess.PIPE, stderr=err)
         p2.stdout.close()
-        thumbs.read_progress(p3.stdout, total or 1, progress or (lambda _: None))  # until the encoder closes it
-        codes = [p3.wait(), p2.wait(), p1.wait()]
+        try:
+            thumbs.read_progress(p3.stdout, total or 1, progress or (lambda _: None))  # until the encoder closes it
+            codes = [p3.wait(), p2.wait(), p1.wait()]
+        except BaseException:  # cancelled from the progress bar: nothing left writing to a file nobody wants
+            for p in (p1, p2, p3):
+                p.kill()
+            raise
         if any(codes):
             err.seek(0)
             lines = err.read().decode(errors="replace").strip().splitlines()

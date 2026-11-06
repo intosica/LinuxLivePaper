@@ -76,6 +76,9 @@ class CollageCanvas(Gtk.Widget):
         scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
         scroll.connect("scroll", self._scroll)
         self.add_controller(scroll)
+        menu = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)  # right click: the clip's menu, as in the gallery
+        menu.connect("pressed", lambda _g, _n, x, y: self._menu(x, y))
+        self.add_controller(menu)
         self.set_cursor_from_name("grab")
 
     def frame(self):
@@ -96,6 +99,16 @@ class CollageCanvas(Gtk.Widget):
         _, _, w, h = collage.rects(c, W, H)[i]
         zw, zh = collage.fit_size(c["cells"][i], w, h)
         return max(1.0, zw - w), max(1.0, zh - h)
+
+    def _menu(self, x, y):
+        """Right click on a cell opens the same menu a gallery tile has, so a clip can go straight to single edit."""
+        i = self.cell_at(x, y)
+        cell = self.page.c["cells"][i] if i is not None else None
+        win = self.page.get_root()
+        if not cell or not hasattr(win, "item_menu"):
+            return
+        self.page.select(i)
+        win.item_menu(self, x, y, library.item_for(cell["src"]), None, add=False)
 
     def _pressed(self, _g, _n, x, y):
         """A plain click selects the cell under the pointer."""
@@ -234,8 +247,10 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self.tick, self._resync = 0, set()
         self.live = [None] * 9  # per cell while playing: {"spec", "stream", "shown", "win", "old"}
         self.clock0 = None  # shared collage clock while playing (monotonic µs at collage time 0)
+        self.pos = None  # collage seconds to show while paused (None: the cover moment)
+        self.start_pos = 0.0  # collage seconds Play starts from
+        self.now_t = 0.0  # collage clock at the last tick, so Pause holds the moment the playhead shows
         self.bake_tok, self.pending = [0] * 9, set()
-        self.at_start = False  # after a pause every cell shows the first frame of its window, in sync
         self.canvas_live = None
         self.canvas_widget, self.trying, self._try_gen = None, False, 0
 
@@ -559,10 +574,16 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
     # --- file browser + drag and drop ------------------------------------------------------------
     def _toggle_browser(self, b):
         if b.get_active() and not self.browser:  # built on first open: scanning a folder isn't free
-            self.browser = FileBrowser(library.library_dir(), self._browser_pick)
+            self.browser = FileBrowser(library.library_dir(), self._browser_pick, self._browser_menu)
             self.browse.set_child(self.browser)
         self.browse.set_reveal_child(b.get_active())
         b.set_icon_name("go-previous-symbolic" if b.get_active() else "go-next-symbolic")
+
+    def _browser_menu(self, item, widget, x, y):
+        """Right click on a browser tile: the gallery's menu (the window owns it), minus 'Add to Collection'."""
+        win = self.get_root()
+        if hasattr(win, "item_menu"):
+            win.item_menu(widget, x, y, item, None, add=False)
 
     def _browser_pick(self, path):
         cells = self.c["cells"]
@@ -660,7 +681,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
 
     def _set_cover(self, t):
         self.c["cover"] = t
-        self.at_start = False
+        self.pos = None  # the stills follow the cover again
         if not self.playing:
             self.refresh(all_cells=True)
 
@@ -678,7 +699,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         need = collage.window(cell)
         cell["start"] = min(cell["start"], max(0.0, D - min(need, D)))
         self.tl.s, self.tl.e = cell["start"], min(D, cell["start"] + collage.window(cell))
-        self.tl.p = cell["start"]
+        self.tl.p = self._red_line(cell)
         if D > 60:
             self.tl.zoom_to_selection()
         self.tl.connect("changed", self._tl_changed)
@@ -693,17 +714,26 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
 
     def _tl_changed(self, tl, what):
         """The yellow window is both movable and stretchable; it is what the cell plays (and loops)."""
+        cell = self.c["cells"][self.sel]
+        if not cell:
+            return
+        if what == "scrub":  # the red playhead is free: show the collage at that moment, and Play resumes there
+            o = {**effects.DEFAULT, **cell["opts"]}
+            self.pos = effects.out_time(max(0.0, tl.p - cell["start"]), collage.window(cell), o)
+            self.refresh(all_cells=True)
+            return
         if what not in ("move", "start", "end"):
             return
-        cell = self.c["cells"][self.sel]
         length = round(tl.e - tl.s, 3)
         auto = abs(length - min(cell["dur"] - tl.s, collage.MAX_WINDOW)) < 1e-3
         if abs(cell["start"] - tl.s) < 1e-3 and (auto and cell.get("len") is None
                                                  or abs(length - (cell.get("len") or 0)) < 1e-3):
             return
         cell["start"], cell["len"] = round(tl.s, 3), None if auto else length
+        self.pos, self.tl.p = 0.0, tl.s  # moving the yellow window puts every cell back at its start
         self._label()
         self.refresh([self.sel])
+        self.refresh_later([i for i in range(len(self.c["cells"])) if i != self.sel])
 
     def _fit_window(self):
         cell = self.c["cells"][self.sel]
@@ -808,7 +838,8 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
 
     # --- preview --------------------------------------------------------------------------------
     def refresh(self, cells=None, all_cells=False, quick=False):
-        """Show the cover moment of each changed cell (still frames). Playback re-bakes if it was running."""
+        """Show each changed cell at the paused moment (the cover, or wherever the red playhead sits). Playback
+        re-bakes if it was running."""
         idx = list(range(len(self.c["cells"])) if all_cells or cells is None else cells)
         self._length_changed()
         if self.playing:
@@ -816,13 +847,13 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             self._resync_later(idx)
             return
         W, H = collage.size(self.c, PROXY_H)
-        cover = min(self.c["cover"], collage.duration(self.c) - 0.04)
+        pos = min(max(self.c["cover"] if self.pos is None else self.pos, 0.0), collage.duration(self.c) - 0.04)
         for i in idx:
             cell = self.c["cells"][i]
             if not cell:
                 continue
             o = {**effects.DEFAULT, **cell["opts"]}
-            t = cell["start"] if self.at_start else collage.cell_time(cell, cover)  # short clips loop
+            t = collage.cell_time(cell, pos)  # the cover moment, or wherever the red playhead was left; short clips loop
             x, y, w, h = collage.rects(self.c, W, H)[i]
             crop = o["effect"] in CROP_EFFECTS
             if crop:
@@ -892,6 +923,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         if not any(self.c["cells"]):
             return
         self.stop()
+        self.start_pos = self.pos or 0.0  # Play resumes from the red playhead, not from the top
         self.playing = True
         self.gen += 1
         self.play_btn.set_icon_name("media-playback-pause-symbolic")
@@ -971,8 +1003,9 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         entry = {"spec": spec, "stream": m, "shown": False, "win": (cell["start"], collage.window(cell))}
 
         def prepared(s, _):
-            if s.is_prepared() and spec[0] == "direct" and cell["start"] > 0:
-                s.seek(int(entry["win"][0] * 1e6))
+            t = self._start_target(cell, spec)  # Play may start mid-collage: land on the right frame
+            if s.is_prepared() and t > 0.01:
+                s.seek(int(t * 1e6))
 
         def frame(_s):
             if self.live[i] is not entry:
@@ -981,8 +1014,8 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
                 return  # frame 0 before the seek to the window landed: keep showing the still
             if not entry["shown"]:
                 entry["shown"] = True
-                if self.clock0 is None:
-                    self.clock0 = GLib.get_monotonic_time() - int(self._stream_pos(entry) * 1e6)
+                if self.clock0 is None:  # the clock reads start_pos the moment the first frame is up
+                    self.clock0 = GLib.get_monotonic_time() - int((self.start_pos or 0.0) * 1e6)
                 old = entry.pop("old", None)
                 if old:
                     release(old["stream"])
@@ -1040,6 +1073,13 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
                     self._sync_cell(i)
         return False
 
+    def _start_target(self, cell, spec):
+        """Seconds into its own stream a cell must start at to show the collage from `start_pos`."""
+        pos = (self.start_pos or 0.0) % max(collage.duration(self.c), 0.05)
+        if spec[0] == "bake":
+            return pos % max(collage.cell_length(cell), 0.05)  # a baked cell loops its own pass
+        return collage.cell_time(cell, pos)
+
     def _stream_pos(self, e):
         """Collage-pass seconds cell i's stream is at (a direct stream plays the source, offset by the window)."""
         ts = e["stream"].get_timestamp() / 1e6
@@ -1053,6 +1093,7 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         now = GLib.get_monotonic_time()
         if self.clock0 is not None:
             T = (now - self.clock0) / 1e6 % max(collage.duration(self.c), 0.05)
+            self.now_t = T
             for i, (e, cell) in enumerate(zip(self.live, self.c["cells"])):
                 st = e and e["stream"]
                 if not (st and cell and e["shown"] and st.is_prepared()) or st.is_seeking() or now < e.get("hold", 0):
@@ -1070,7 +1111,8 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             self.tl.queue_draw()
         return True
 
-    def stop(self):
+    def stop(self, pos=None):
+        """Pause: the red playhead stays on the moment it shows and every cell paints that moment (pos overrides)."""
         was = self.playing
         self.playing = False
         self.gen += 1
@@ -1084,12 +1126,25 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             self._drop_live(i)
         self.pending.clear()
         self.canvas.queue_draw()
-        if was:  # pause = back to the start of the yellow window, for every cell
-            self.at_start = True
-            if self.tl and self.c["cells"][self.sel]:
-                self.tl.p = self.c["cells"][self.sel]["start"]
-                self.tl.queue_draw()
-            self.refresh(all_cells=True)
+        if was or pos is not None:
+            self.pos = self.now_t if pos is None else pos
+            self._show_pos()
+
+    def _show_pos(self):
+        """Line the red playhead up with the paused moment and paint the cells there."""
+        cell = self.c["cells"][self.sel]
+        if cell and self.tl:
+            self.tl.p = self._red_line(cell)
+            self.tl.queue_draw()
+        self.refresh(all_cells=True)
+
+    def _red_line(self, cell):
+        """Source seconds on the selected cell's timeline that match the paused collage moment."""
+        if self.pos is None:
+            return cell["start"]
+        o = {**effects.DEFAULT, **cell["opts"]}
+        want = self.pos % max(collage.cell_length(cell), 0.05)
+        return cell["start"] + effects.src_time(want, collage.window(cell), o)
 
     # --- save -----------------------------------------------------------------------------------
     def _export(self, fmt):
@@ -1120,14 +1175,19 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         smooth = self.panel_page.interp_group.settings()
 
         def work():
+            jpg, mov = livemake.out_paths(col.path if col else None)
             try:
-                jpg, mov = livemake.out_paths(col.path if col else None)
                 collage.render(c, mov, extra=livemake.live_tags(), overlays=[dict(o) for o in self.overlays],
                                interpolate=smooth, progress=self.progress.report)
                 f = interp.stretch(smooth)  # slow motion stretches the timeline, the cover moment with it
                 livemake.still(mov, min(c["cover"] * f, collage.duration(c) * f - 0.05), jpg)
                 library.set_meta(jpg, transition=style)
                 res, err = (jpg, mov), None
+            except thumbs.Cancelled:
+                for p in (jpg, mov):  # no half-written live image left behind
+                    Path(p).unlink(missing_ok=True)
+                thumbs.log("collage save cancelled")
+                res, err = None, None
             except Exception as ex:
                 thumbs.log("collage save failed:", ex)
                 res, err = None, str(ex)
