@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
 
 from . import effects, export, library, thumbs  # noqa: E402
 from .collage_page import CollagePage  # noqa: E402
@@ -982,7 +982,13 @@ class CollectionsView(Gtk.Stack):
         for c, n in rows:
             box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, width_request=self.icon + 22)
             box.append(icon_widget(c.icon, self.icon))
-            box.append(Gtk.Label(label=c.name, css_classes=["collection-name"], ellipsize=3, max_width_chars=max(8, self.icon // 6)))
+            # The name gets two lines before it is cut: a hard max_width_chars cap ellipsized "Spongebob
+            # Squarepants" even when the card had room, and fullscreen's narrower columns cut names that fit in a
+            # window. Wrapping lets the full name show at either size.
+            box.append(Gtk.Label(label=c.name, css_classes=["collection-name"], wrap=True,
+                                 wrap_mode=Pango.WrapMode.WORD_CHAR, justify=Gtk.Justification.CENTER,
+                                 lines=2, ellipsize=Pango.EllipsizeMode.END,
+                                 max_width_chars=max(14, self.icon // 4)))
             box.append(Gtk.Label(label=f"{n} item{'s' if n != 1 else ''}", css_classes=["dim-label", "caption"]))
             child = Gtk.FlowBoxChild(child=box, tooltip_text=c.name)
             child.collection = c
