@@ -4,3 +4,4 @@ dist/
 AGENT-HANDOFF.md
 .pi/
 docs/
+tests/
