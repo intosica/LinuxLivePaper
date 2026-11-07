@@ -9,6 +9,10 @@ Live Photos do. Browse your live images, videos and GIFs in a good-looking galle
 from videos or GIFs on a trimming timeline, with filters, effects, speed and boomerang (text and stickers are coming).
 It's inspired by the iOS app **intoLive**. Linux comes first; iPhone compatibility and Windows are planned for later.
 
+<p align="center">
+  <img src="screenshots/gallery.png" alt="The LinuxLivePaper gallery: a grid of live images, a video and a GIF under the All / Live / Images / Videos / Collections tabs" width="1128">
+</p>
+
 > Status: early development. The gallery and the quick creator work. See `AGENT-HANDOFF.md`.
 
 ## Run
@@ -105,3 +109,20 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
 
 A *live image* is a still and a video that share a name in the same folder (`x.jpg` + `x.mov`).
 That means Live Photos copied over from an iPhone show up as LIVE too.
+
+## Screenshots
+
+| Collections | Viewer |
+|:--:|:--:|
+| <img src="screenshots/collections.png" alt="Collections tab: Spongebob Squarepants and Yu-Gi-Oh! Arc-V cards with icons and item counts" width="560"> | <img src="screenshots/viewer.png" alt="The viewer showing a live image full-bleed" width="560"> |
+| long names wrap instead of being cut off | press the image to make it play |
+
+| Live Image editor | Live Collage |
+|:--:|:--:|
+| <img src="screenshots/editor.png" alt="Create Live Image: preview, trim timeline with a cover frame, and the Look / Motion / Press effect panel" width="560"> | <img src="screenshots/collage.png" alt="Create Collage: a 4-cell 9:16 collage with its own timeline" width="560"> |
+| trim on the timeline; filters, motion and the press transition | up to 9 cells, each with its own trim |
+
+| A collection | Preferences |
+|:--:|:--:|
+| <img src="screenshots/collection.png" alt="The Yu-Gi-Oh! Arc-V collection page" width="560"> | <img src="screenshots/preferences.png" alt="Preferences: library folder, gallery switches and saving behaviour" width="560"> |
+| a folder per collection in your library | library folder, gallery switches, saving behaviour |
