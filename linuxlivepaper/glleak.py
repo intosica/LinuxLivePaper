@@ -9,6 +9,7 @@ import os
 
 P = C.c_void_p
 _keep = []  # ctypes callbacks must outlive the process
+_keeper = []  # the one GstGLDisplay we keep alive, see gone()
 
 
 def _bind():
@@ -52,13 +53,20 @@ def install():
         # That "one ref" is real: gst_structure_get() copies the GValue, i.e. it is transfer FULL (checked against
         # GStreamer 1.26.11: refcount 1 → 2 after g_value_set_object → 2 after gst_structure_take_value → 3 after
         # gst_structure_get), so the two unrefs below are correct and adding a g_object_ref() would leak instead.
-        # The context's GstGLDisplay is kept alive on purpose (get_display's ref is never dropped): finalizing it calls
-        # eglTerminate on the EGLDisplay that GDK and every other playing stream share, and the next frame GTK uploads
-        # aborts in libepoxy ("No provider of eglCreateImageKHR"). Hit when a collage cell swapped streams mid-play.
-        # ponytail: leaks one tiny display wrapper per played stream (no fds, no threads); fine for any session length
+        # The first GstGLDisplay is kept alive on purpose (its get_display ref is never dropped): finalizing the last
+        # one calls eglTerminate on the EGLDisplay that GDK and every other playing stream share, and the next frame
+        # GTK uploads aborts in libepoxy ("No provider of eglCreateImageKHR"). Hit when a collage cell swapped
+        # streams mid-play. Every *later* display must be dropped: GTK creates one per media stream, and a held
+        # display keeps its gldisplay-event thread and fds for good — that was the growth that froze the UI after a
+        # long browsing session (30 streams: threads 41 → 106, fds 61 → 138; with this: → 51, → 66).
         # One fixed run in 15 once died in gc.collect() right after a release and never again since: no known
         # mechanism, and this file deletes itself once the runtime ships GTK > 4.22.
-        gl.gst_gl_context_get_display(ctx)
+        disp = gl.gst_gl_context_get_display(ctx)
+        if disp:
+            if _keeper:
+                go.g_object_unref(disp)
+            else:
+                _keeper.append(disp)
         if C.c_uint.from_address(ctx + C.sizeof(P)).value >= 2:
             go.g_object_unref(ctx)
         go.g_object_unref(ctx)
