@@ -23,9 +23,12 @@ from .widgets import CollectionRow, FileBrowser, HoldButton, InterpGroup, SavePr
 
 PROXY_H = 360
 SYNC_TOL = 0.2  # seconds a live cell may be off the shared collage clock before it is seeked back
+SEEK_LEAD = 0.3  # first guess (s) of how long a re-sync seek takes; each cell then learns its own
+SETTLE = 0.3  # s after a seek lands before the cell is judged again (doubles while a cell keeps missing)
 # Stills are grabbed uncropped (look + effect applied to the whole frame) and cropped at draw time, so dragging and
 # scroll-zooming a cell are pure GPU redraws. Effects whose result depends on the crop get an exact cropped grab.
 CROP_EFFECTS = {"mirror"}
+PROXIES = {}  # (src, start, window, w, h) -> built proxy path, so the next Play starts on it (no mid-play swap)
 pool = ThreadPoolExecutor(max_workers=max(2, min(6, (os.cpu_count() or 4) // 2)))
 
 
@@ -245,7 +248,9 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         self._panel_stale = False
         self.zoom_scale, self.framing_lbl, self._zoom_sync = None, None, False
         self.tick, self._resync = 0, set()
-        self.live = [None] * 9  # per cell while playing: {"spec", "stream", "shown", "win", "old"}
+        # per cell while playing: {"spec", "stream", "shown", "win", "old"}; cells playing the same source window
+        # share ONE entry (the same dict object), i.e. one decoder (a grid of 4 of one clip decodes it once)
+        self.live = [None] * 9
         self.clock0 = None  # shared collage clock while playing (monotonic µs at collage time 0)
         self.pos = None  # collage seconds to show while paused (None: the cover moment)
         self.start_pos = 0.0  # collage seconds Play starts from
@@ -960,21 +965,48 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         bake["volume"] = 1.0  # the level is applied live on the stream
         return ("bake", repr(sorted(bake.items())), w, h)
 
+    def _shared(self, i):
+        """Another cell plays cell i's live entry too."""
+        return any(j != i and x is self.live[i] for j, x in enumerate(self.live)) if self.live[i] else False
+
+    def _free(self, e):
+        """Release a live entry's stream (and its stale predecessor) once no cell plays it any more."""
+        if not e or e.get("dead") or any(x is e for x in self.live):
+            return
+        e["dead"] = True
+        release(e["stream"])
+        self._free(e.pop("old", None))
+
     def _sync_cell(self, i):
         """Make cell i's live stream match the cell; the old stream keeps playing until a new one is ready."""
-        spec, cur = self._live_spec(i), self.live[i]
+        spec, cur, cell = self._live_spec(i), self.live[i], self.c["cells"][i]
+        if spec and spec[0] == "direct":
+            self._unbake(i)  # a bake still queued for this cell's old look must not land over it
+            win = (cell["start"], collage.window(cell))
+            mate = next((e for j, e in enumerate(self.live) if j != i and e and e["spec"] == spec and e["win"] == win
+                         and not e.get("dead")), None)
+            if mate:  # same clip, same window as another cell: show its stream, no second decoder
+                self.live[i] = mate
+                self._free(cur)
+                self._apply_volume(i)
+                return self.canvas.queue_draw()
+            if cur and cur["spec"] == spec and not self._shared(i) and not cur.get("proxy"):
+                if cur["win"] != win:
+                    cur["win"] = win
+                    cur["stream"].seek(int(cell["start"] * 1e6))
+                    self._want_proxy(i, cur)
+                return self._apply_volume(i)
+            if cur and cur["spec"] == spec and cur["win"] == win:
+                return self._apply_volume(i)
+            px = PROXIES.get(self._proxy_key(i))
+            if px and os.path.exists(px):
+                return self._start_live(i, spec, px, proxy=True)
+            return self._start_live(i, spec, spec[1])  # the source right away; a small copy replaces it soon
         if cur and cur["spec"] == spec:
-            cell = self.c["cells"][i]
-            if spec[0] == "direct" and cur["win"] != (cell["start"], collage.window(cell)):
-                cur["win"] = (cell["start"], collage.window(cell))
-                cur["stream"].seek(int(cell["start"] * 1e6))
-            self._apply_volume(i)
-            return
+            return self._apply_volume(i)
         if not spec:
             return self._drop_live(i)
         gen = self.gen
-        if spec[0] == "direct":
-            return self._start_live(i, spec, spec[1])
         self.bake_tok[i] += 1
         tok, cell = self.bake_tok[i], dict(self.c["cells"][i], volume=1.0)
         self.pending.add(i)
@@ -1003,49 +1035,97 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
                 self.clip_lbl.set_label(f"Preview failed — {err}")
         threading.Thread(target=work, daemon=True).start()
 
-    def _start_live(self, i, spec, path):
+    def _unbake(self, i):
+        self.bake_tok[i] += 1
+        if i in self.pending:
+            self.pending.discard(i)
+            if not self.pending:
+                self.spinner.stop()
+
+    def _proxy_key(self, i):
+        cell = self.c["cells"][i]
+        W, H = collage.size(self.c, thumbs.preview_height())
+        _, _, w, h = collage.rects(self.c, W, H)[i]
+        return cell["src"], cell["start"], collage.window(cell), w, h
+
+    def _want_proxy(self, i, entry):
+        """Swap a direct stream for a small cached copy of its window (collage.proxy) once that is built."""
+        gen, win, cell, key = self.gen, entry["win"], dict(self.c["cells"][i]), self._proxy_key(i)
+        w, h = key[3], key[4]
+
+        def work():
+            with thumbs.BAKE_LOCK:  # behind any look bake; one ffmpeg at a time
+                if gen != self.gen or entry.get("dead") or entry["win"] != win:
+                    return
+                try:
+                    path = collage.proxy(cell, w, h, thumbs.CACHE / "collage" / "proxies")
+                    if path:
+                        PROXIES[key] = path
+                except Exception as ex:  # the source keeps playing; nothing lost
+                    return thumbs.log("collage proxy failed:", ex)
+            path and GLib.timeout_add(250, land, path)
+
+        def land(path):
+            if gen != self.gen or entry.get("dead") or entry["win"] != win or self.live[i] is not entry:
+                return False
+            if not entry["shown"] or entry["stream"].is_seeking():
+                return True  # tearing down a 4K pipeline mid-seek blocks the main loop ~2 s: swap once it settled
+            self._start_live(i, entry["spec"], path, proxy=True)
+            for j, x in enumerate(self.live):
+                if x is entry:  # cells sharing the source stream move over with it
+                    self.live[j] = self.live[i]
+            self.canvas.queue_draw()
+        threading.Thread(target=work, daemon=True).start()  # not the pool: waiting on BAKE_LOCK must not starve grabs
+
+    def _start_live(self, i, spec, path, proxy=False):
         cell = self.c["cells"][i]
         m = media_file(path, muted=cell["volume"] <= 0, loop=True)
-        entry = {"spec": spec, "stream": m, "shown": False, "win": (cell["start"], collage.window(cell))}
+        # "pass": the stream's own time IS the cell's pass time (a bake or a proxy), else it is source time
+        entry = {"spec": spec, "stream": m, "shown": False, "win": (cell["start"], collage.window(cell)),
+                 "proxy": proxy, "pass": proxy or spec[0] == "bake", "prep": False}
 
         def prepared(s, _):
-            t = self._start_target(cell, spec)  # Play may start mid-collage: land on the right frame
+            entry["prep"] = True  # positioned from here on: before this the stream can still deliver frame 0
+            t = self._start_target(cell, entry["pass"])  # Play may start mid-collage: land on the right frame
             if s.is_prepared() and t > 0.01:
                 s.seek(int(t * 1e6))
 
         def frame(_s):
-            if self.live[i] is not entry:
+            if entry.get("dead"):
                 return
-            if spec[0] == "direct" and (m.is_seeking() or m.get_timestamp() / 1e6 < entry["win"][0] - 0.5):
-                return  # frame 0 before the seek to the window landed: keep showing the still
+            # frame 0 of a bake or a proxy before its seek to the right moment landed: keep showing what was there
+            # (until it is prepared no seek has been asked for yet, so is_seeking() alone is not enough here)
+            if not entry["shown"] and (m.is_seeking() or entry["pass"] and not entry["prep"]
+                                      or not entry["pass"] and m.get_timestamp() / 1e6 < entry["win"][0] - 0.5):
+                return
             if not entry["shown"]:
                 entry["shown"] = True
                 if self.clock0 is None:  # the clock reads start_pos the moment the first frame is up
                     self.clock0 = GLib.get_monotonic_time() - int((self.start_pos or 0.0) * 1e6)
-                old = entry.pop("old", None)
-                if old:
-                    release(old["stream"])
+                self._free(entry.pop("old", None))
             self.canvas.queue_draw()
         m.connect("notify::prepared", prepared)
         m.connect("invalidate-contents", frame)
         m.set_volume(max(0.0, min(1.0, cell["volume"])))
         cur = self.live[i]  # keep showing whatever is on screen until the new stream's first frame
         if cur and cur["shown"]:
-            entry["old"] = cur
-            if cur.get("old"):  # never chain: at most one stale stream (and its decoder) behind the new one
-                release(cur.pop("old")["stream"])
+            entry["old"] = cur  # (a shared cur keeps playing for its other cells: _free skips it)
+            if not self._shared(i):  # never chain: at most one stale stream (and its decoder) behind the new one
+                self._free(cur.pop("old", None))
         elif cur:
-            entry["old"] = cur.pop("old", None)
-            release(cur["stream"])
+            if not self._shared(i):
+                entry["old"] = cur.pop("old", None)
         self.live[i] = entry
+        if entry.get("old") is not cur:
+            self._free(cur)
+        self._apply_volume(i)
         m.play()
+        if not entry["pass"]:
+            self._want_proxy(i, entry)
 
     def _drop_live(self, i):
         e, self.live[i] = self.live[i], None
-        if e:
-            release(e["stream"])
-            if e.get("old"):
-                release(e["old"]["stream"])
+        self._free(e)
         self.canvas.queue_draw()
 
     def live_paint(self, i):
@@ -1058,10 +1138,11 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
         return e["stream"], e["spec"][0] == "bake"
 
     def _apply_volume(self, i):
-        e, cell = self.live[i], self.c["cells"][i]
-        if e and cell:
-            e["stream"].set_muted(cell["volume"] <= 0)
-            e["stream"].set_volume(max(0.0, min(1.0, cell["volume"])))
+        e = self.live[i]
+        vols = [c["volume"] for x, c in zip(self.live, self.c["cells"]) if c and x is e]
+        if e and vols:  # a shared stream plays once, at the loudest of its cells' levels
+            e["stream"].set_muted(max(vols) <= 0)
+            e["stream"].set_volume(max(0.0, min(1.0, max(vols))))
 
     def _resync_later(self, cells):
         """Debounced re-sync for edits while playing (each bake is a render; a drag must not start dozens)."""
@@ -1079,44 +1160,57 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
                     self._sync_cell(i)
         return False
 
-    def _start_target(self, cell, spec):
+    def _start_target(self, cell, pass_time):
         """Seconds into its own stream a cell must start at to show the collage from `start_pos`."""
         pos = self.start_pos or 0.0
         if self.clock0 is not None:  # a cell that lands late (a bake finishing) joins the clock where it is now
             pos = (GLib.get_monotonic_time() - self.clock0) / 1e6
         pos %= max(collage.duration(self.c), 0.05)
-        if spec[0] == "bake":
-            return pos % max(collage.cell_length(cell), 0.05)  # a baked cell loops its own pass
+        if pass_time:
+            return pos % max(collage.cell_length(cell), 0.05)  # a baked cell / proxy loops its own pass
         return collage.cell_time(cell, pos)
 
-    def _stream_pos(self, e):
-        """Collage-pass seconds cell i's stream is at (a direct stream plays the source, offset by the window)."""
-        ts = e["stream"].get_timestamp() / 1e6
-        return (ts - e["win"][0]) % max(e["win"][1], 0.05) if e["spec"][0] == "direct" else ts
-
     def _on_tick(self):
-        """Keep every cell on the shared collage clock and move the playhead of the selected one."""
+        """Keep every cell on the shared collage clock and move the red playhead with that clock."""
         if not self.playing:
             self.tick = 0
             return False
         now = GLib.get_monotonic_time()
-        if self.clock0 is not None:
-            T = (now - self.clock0) / 1e6 % max(collage.duration(self.c), 0.05)
-            self.now_t = T
-            for i, (e, cell) in enumerate(zip(self.live, self.c["cells"])):
-                st = e and e["stream"]
-                if not (st and cell and e["shown"] and st.is_prepared()) or st.is_seeking() or now < e.get("hold", 0):
-                    continue
-                want = T % max(collage.cell_length(cell), 0.05)
-                pos = st.get_timestamp() / 1e6
-                target = collage.cell_time(cell, want) if e["spec"][0] == "direct" else want
-                if abs(pos - target) > SYNC_TOL:
-                    st.seek(int(target * 1e6))
-                    e["hold"] = now + 500_000  # let the seek land before judging it again
-        e, cell = self.live[self.sel] if self.sel < len(self.live) else None, self.c["cells"][self.sel]
-        if e and cell and self.tl:
-            ts = e["stream"].get_timestamp() / 1e6
-            self.tl.p = ts if e["spec"][0] == "direct" else collage.cell_time(cell, ts)
+        if self.clock0 is None:
+            return True
+        T = (now - self.clock0) / 1e6 % max(collage.duration(self.c), 0.05)
+        self.now_t = T
+        seen = set()
+        for e, cell in zip(self.live, self.c["cells"]):
+            st = e and e["stream"]
+            if not (st and cell) or id(e) in seen:
+                continue
+            seen.add(id(e))
+            if e.get("seek_at") and not st.is_seeking():  # a seek landed: learn how long seeks take here
+                took = (now - e.pop("seek_at")) / 1e6
+                e["lat"] = min(2.0, 0.5 * e.get("lat", SEEK_LEAD) + 0.5 * took)
+                e["hold"] = now + int(SETTLE * 1e6 * 2 ** min(e.get("miss", 0), 3))
+            if not (e["shown"] and st.is_prepared()) or st.is_seeking() or now < e.get("hold", 0):
+                continue  # a cell that has not shown its own frame yet is left alone: its seek is still coming
+            L = max(collage.cell_length(cell), 0.05)
+            pos, want = st.get_timestamp() / 1e6, T % L
+            if not e["pass"]:
+                off = pos - collage.cell_time(cell, want)
+            else:  # a baked pass loops by itself: 0.1 s before its end is 0.1 s off, not L - 0.1
+                off = (pos - want + L / 2) % L - L / 2
+            if abs(off) > SYNC_TOL:
+                # seek to where the clock WILL be when the seek lands, so a slow (4K, long-GOP) seek doesn't land
+                # behind and trigger the next one; a cell that keeps missing waits longer each time (no seek storm)
+                lead = e.get("lat", SEEK_LEAD)
+                ahead = (want + lead) % L
+                st.seek(int((collage.cell_time(cell, ahead) if not e["pass"] else ahead) * 1e6))
+                e["miss"] = e.get("miss", 0) + 1 if now - e.get("last_seek", 0) < 3_000_000 else 0
+                e["seek_at"] = e["last_seek"] = now
+            else:
+                e["miss"] = 0  # back in sync: the next miss starts the backoff over
+        cell = self.c["cells"][self.sel]
+        if cell and self.tl:
+            self.tl.p = self._red_line(cell, T)
             self.tl.queue_draw()
         return True
 
@@ -1147,12 +1241,13 @@ class CollagePage(OverlayHost, Adw.NavigationPage):
             self.tl.queue_draw()
         self.refresh(all_cells=True)
 
-    def _red_line(self, cell):
-        """Source seconds on the selected cell's timeline that match the paused collage moment."""
-        if self.pos is None:
+    def _red_line(self, cell, t=None):
+        """Source seconds on the selected cell's timeline that match collage moment t (default: the paused one)."""
+        t = self.pos if t is None else t
+        if t is None:
             return cell["start"]
         o = {**effects.DEFAULT, **cell["opts"]}
-        want = self.pos % max(collage.cell_length(cell), 0.05)
+        want = t % max(collage.cell_length(cell), 0.05)
         return cell["start"] + effects.src_time(want, collage.window(cell), o)
 
     # --- save -----------------------------------------------------------------------------------

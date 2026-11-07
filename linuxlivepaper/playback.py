@@ -86,9 +86,12 @@ class GifPlay:
         self.set_playing(False)
 
 
-def _clear_later(m):
-    m.clear()
-    return False
+_dying = []  # released streams waiting for their clear(), oldest first
+
+
+def _clear_later():
+    _dying.pop(0).clear()
+    return bool(_dying)  # one per call: a 4K NVDEC pipeline takes 0.1-0.5 s to tear down, 4 at once froze the UI
 
 
 def release(m):
@@ -99,10 +102,13 @@ def release(m):
     The clear() waits for the next main-loop turn on purpose. Freeing several playing streams in one callback — a
     collage dropping all its cells on stop(), a cell replaced while playing — raced GstPlay's pause on its own thread
     and segfaulted in gst_play_main (heap already corrupted, so the backtrace landed in random spots). 3 of 4 stress
-    runs crashed like that before this, 0 of 8 after."""
+    runs crashed like that before this, 0 of 8 after. Clears run one per 60 ms timeout so frames keep painting between
+    teardowns (stopping a 4-cell 4K collage blocked the main loop for ~1 s in one go)."""
     if m is not None:
         m.set_playing(False)
-        GLib.idle_add(_clear_later, m)
+        _dying.append(m)
+        if len(_dying) == 1:
+            GLib.timeout_add(60, _clear_later)
 
 
 def play_stream(path, picture, muted=True, loop=True):

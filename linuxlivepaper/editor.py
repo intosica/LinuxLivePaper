@@ -8,6 +8,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import cairo
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
@@ -67,6 +68,7 @@ class Timeline(Gtk.DrawingArea):
         while len(_STRIPS) > 6:
             _STRIPS.pop(next(iter(_STRIPS)))
         self.wanted = set()
+        self.fgen, self.static = 0, (None, None)  # frames-arrived counter; cached (key, surface) of all but the playhead
         # bookmarks live in the clip's own .linuxlivepaper.json sidecar, so they survive a restart
         self.marks = sorted(float(m) for m in (library.get_meta(src).get("bookmarks") or [])
                             if isinstance(m, (int, float)) and 0 <= m <= self.D)
@@ -250,6 +252,7 @@ class Timeline(Gtk.DrawingArea):
             self.wanted.discard(t)
             if pb:
                 self.frames[t] = pb
+                self.fgen += 1
                 if len(self.frames) > 600:
                     self.frames.pop(next(iter(self.frames)))
                 self.queue_draw()
@@ -301,7 +304,35 @@ class Timeline(Gtk.DrawingArea):
                 cr.restore()
             k += 1
 
-    def _draw(self, _a, cr, W, _H):
+    def _draw(self, _a, cr, W, H):
+        """Everything but the playhead and the length pill is drawn once into a cached surface: while playing only the
+        red line moves 25x a second, and redrawing the filmstrip (pixbuf -> surface per frame) cost ~4 ms each time."""
+        key = (W, H, self.v0, self.v1, self.s, self.e, self.k, tuple(self.marks), self.fgen, self.D)
+        if self.static[0] != key:
+            surf = cr.get_target().create_similar(cairo.CONTENT_COLOR_ALPHA, W, H)
+            self._draw_static(cairo.Context(surf), W)
+            self.static = (key, surf)
+        cr.set_source_surface(self.static[1], 0, 0)
+        cr.paint()
+        xs, xe = self.x(self.s), self.x(self.e)
+        # playhead
+        xp = self.x(self.p)
+        if PAD - 1 <= xp <= W - PAD + 1:
+            cr.set_source_rgb(0.9, 0.2, 0.2)
+            cr.rectangle(xp - 1, RU_Y + 6, 2, ST_Y + ST_H - RU_Y - 6)
+            cr.fill()
+            cr.move_to(xp - 5, RU_Y + 4)
+            cr.line_to(xp + 5, RU_Y + 4)
+            cr.line_to(xp, RU_Y + 10)
+            cr.fill()
+        # selection length pill above the selection
+        label = f"{self.e - self.s:.1f}s"
+        self._rrect(cr, (xs + xe) / 2 - 22, ST_Y - 18, 44, 16, 8)
+        cr.set_source_rgb(*YELLOW)
+        cr.fill()
+        self._text(cr, (xs + xe) / 2, ST_Y - 17, label, 8, (0, 0, 0, 0.9), True, True)
+
+    def _draw_static(self, cr, W):
         w = self._w()
         span = self.v1 - self.v0
         # overview: whole video, dimmed except the zoomed view window; selection as a yellow bar
@@ -381,22 +412,6 @@ class Timeline(Gtk.DrawingArea):
             cr.line_to(xm + 4, ST_Y + 1)
             cr.line_to(xm, ST_Y + 9)
             cr.fill()
-        # playhead
-        xp = self.x(self.p)
-        if PAD - 1 <= xp <= W - PAD + 1:
-            cr.set_source_rgb(0.9, 0.2, 0.2)
-            cr.rectangle(xp - 1, RU_Y + 6, 2, ST_Y + ST_H - RU_Y - 6)
-            cr.fill()
-            cr.move_to(xp - 5, RU_Y + 4)
-            cr.line_to(xp + 5, RU_Y + 4)
-            cr.line_to(xp, RU_Y + 10)
-            cr.fill()
-        # selection length pill above the selection
-        label = f"{self.e - self.s:.1f}s"
-        self._rrect(cr, (xs + xe) / 2 - 22, ST_Y - 18, 44, 16, 8)
-        cr.set_source_rgb(*YELLOW)
-        cr.fill()
-        self._text(cr, (xs + xe) / 2, ST_Y - 17, label, 8, (0, 0, 0, 0.9), True, True)
 
 
 class EditorPage(OverlayHost, Adw.NavigationPage):

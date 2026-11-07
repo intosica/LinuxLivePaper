@@ -54,8 +54,10 @@ def _border(o, H):
     return max(0, int(round(H * float(v))))
 
 
-def graph(overlays, W, H, dur, first_input=0):
-    """Build (extra ffmpeg inputs, filter tail). The tail expects the label [vout] and yields [ovout]."""
+def graph(overlays, W, H, dur, first_input=0, tmpdir=None):
+    """Build (extra ffmpeg inputs, filter tail). The tail expects the label [vout] and yields [ovout].
+    Text is handed to drawtext as files: put them in tmpdir (the caller's temp dir, removed with it) so a
+    render never litters /tmp; without tmpdir they still go to a fresh throwaway directory of their own."""
     inputs, steps, label = [], [], "vout"
     n_input = first_input
     for n, o in enumerate(overlays or []):
@@ -67,9 +69,8 @@ def graph(overlays, W, H, dur, first_input=0):
         rot = float(o.get("rotation") or 0.0)
         turn = f",rotate={rot * 3.141592653589793 / 180:.5f}"
         if o["kind"] == "text":
-            fd, tmp = tempfile.mkstemp(prefix="llp-text-", suffix=".txt")
-            with open(fd, "w") as fh:
-                fh.write(o.get("text") or "")
+            tmp = str(Path(tmpdir or tempfile.mkdtemp(prefix="llp-ov-"), f"text{n}.txt"))
+            Path(tmp).write_text(o.get("text") or "")
             dt = (f"drawtext=textfile='{_esc(tmp, True)}':fontcolor={o.get('color', '#ffffff')}@{alpha}"
                   f":fontsize={max(8, int(H * o.get('size', 0.09)))}:font={_font(o)}"
                   f":borderw={_border(o, H)}:bordercolor={o.get('outline_color', 'black@0.55')}")
@@ -111,16 +112,17 @@ def render(src, start, end, out, opts=None, overlays=(), height=None, fast=False
     W, H = effects.out_size(w, h, height)
     trim = (["-stream_loop", "-1"] if loop else []) + ["-ss", f"{start:.3f}"] + \
         (["-t", f"{end - start:.3f}"] if end is not None else [])
-    ov_inputs, steps, label = graph(overlays, W, H, end - start, first_input=1)
-    base = effects.graph(opts, audio, (W, H))
-    body = f"{base};" + ";".join(steps) if steps else base
-    if steps:
-        body += f";[{label}]format=yuv420p[fin]"
-    cmd = ["ffmpeg", "-v", "error", "-y", *trim, *thumbs.hwdec(src, height and not effects.frame_chain(opts) and (W, H)), "-i", str(src), *ov_inputs, "-filter_complex", body,
-           "-map", "[fin]" if steps else "[vout]",
-           *(["-map", "[aout]", "-c:a", "aac"] if audio else []),
-           *thumbs.h264(fast, (W, H)), *extra, str(out)]
-    thumbs.run(cmd, progress=progress, total=effects.out_length(end - start, opts))
+    with tempfile.TemporaryDirectory(prefix="llp-ov-") as td:
+        ov_inputs, steps, label = graph(overlays, W, H, end - start, first_input=1, tmpdir=td)
+        base = effects.graph(opts, audio, (W, H))
+        body = f"{base};" + ";".join(steps) if steps else base
+        if steps:
+            body += f";[{label}]format=yuv420p[fin]"
+        cmd = ["ffmpeg", "-v", "error", "-y", *trim, *thumbs.hwdec(src, height and not effects.frame_chain(opts) and (W, H)), "-i", str(src), *ov_inputs, "-filter_complex", body,
+               "-map", "[fin]" if steps else "[vout]",
+               *(["-map", "[aout]", "-c:a", "aac"] if audio else []),
+               *thumbs.h264(fast, (W, H)), *extra, str(out)]
+        thumbs.run(cmd, progress=progress, total=effects.out_length(end - start, opts))
     return out
 
 
@@ -146,6 +148,7 @@ if __name__ == "__main__":
              "-of", "json"]
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
+        litter = set(Path(tempfile.gettempdir()).glob("llp-text-*.txt"))  # pre-fix leftovers may still be around
         src, gif = d / "src.mp4", d / "s.gif"
         # a sticker with transparency: a small circle on a transparent background
         subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1", "-vf",
@@ -177,4 +180,6 @@ if __name__ == "__main__":
         frame = subprocess.run(["ffmpeg", "-v", "error", "-ss", "0.9", "-i", str(out), "-frames:v", "1",
                                 "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
         assert max(frame) > 150, max(frame)                    # text and sticker are both visible mid-window
+        # the text files live and die inside the render: nothing of ours is left behind in /tmp
+        assert not set(Path(tempfile.gettempdir()).glob("llp-text-*.txt")) - litter, "text temp files leaked"
     print("overlays ok")

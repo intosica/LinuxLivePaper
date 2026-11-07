@@ -195,7 +195,31 @@ def _cell_file(cell, w, h, fast, d, progress=None):
     return str(out), cell["volume"] > 0 and effects.has_audio(cell["src"])  # same test _cell_command used
 
 
-def command(c, cells, out, height=None, fast=False, extra=(), overlays=()):
+PROXY_MAX = 120.0  # longest window (s) the live preview makes a small copy of
+
+
+def proxy(cell, w, h, d):
+    """Path of a small copy of the cell's window (source scaled to cover 2·w × 2·h, NOT cropped, no look) for the live
+    preview to play instead of the source, or None when the source isn't much bigger than that. Decoding a 4K source
+    for a 270 px cell costs a full 4K decode + upload per frame; four of them is what made the preview stutter.
+    Built on the GPU (cuvid resize + NVENC) when it can, cached in d."""
+    src = cell["src"]
+    _, sw, sh = thumbs._video_info(src, os.stat(src).st_mtime_ns)
+    ar = cell.get("ar") or (sw / sh if sh else 16 / 9)
+    cw, ch = max(2 * w, round(2 * h * ar)), max(2 * h, round(2 * w / ar))  # cover 2x the cell: zoom stays sharp
+    win = window(cell)
+    if not sw or sh < 1.5 * ch or win > PROXY_MAX or cell["start"] + win > float(cell.get("dur") or 0) + 0.05:
+        return None  # small already, long, or a window that wraps past the end of the clip (plays the source)
+    ch = ch // 2 * 2
+    key = hashlib.sha1(repr((src, os.stat(src).st_mtime_ns, cell["start"], win, ch)).encode()).hexdigest()
+    cmd = ["ffmpeg", "-v", "error", "-y", "-ss", f"{cell['start']:.3f}", "-t", f"{win:.3f}",
+           *thumbs.hwdec(src, (round(ch * ar), ch)), "-i", src, "-map", "0:v:0", "-map", "0:a:0?",
+           "-vf", f"{thumbs.SQUARE},scale=-2:{ch},format=yuv420p", *thumbs.h264(True, (round(ch * ar), ch), 23),
+           "-g", "15", "-c:a", "aac", "-b:a", "160k"]  # short GOP: re-sync seeks land fast
+    return str(thumbs.cached(Path(d, key + ".mp4"), lambda tmp: thumbs.run(cmd + [str(tmp)])))
+
+
+def command(c, cells, out, height=None, fast=False, extra=(), overlays=(), tmpdir=None):
     """ffmpeg argv composing pre-rendered cell passes [(index, path, has_audio)] into one pass of the collage."""
     W, H = size(c, height)
     D = duration(c)
@@ -210,7 +234,7 @@ def command(c, cells, out, height=None, fast=False, extra=(), overlays=()):
     graph = chains + [f"[{prev}]trim=duration={D:.3f},format=yuv420p[vout]"]
     vmap = ["-map", "[vout]"]
     if overlays:
-        ov_in, steps, label = ovmod.graph(overlays, W, H, D, first_input=len(cells))
+        ov_in, steps, label = ovmod.graph(overlays, W, H, D, first_input=len(cells), tmpdir=tmpdir)
         inputs += ov_in
         graph += steps + [f"[{label}]format=yuv420p[fin]"]
         vmap = ["-map", "[fin]"]
@@ -249,7 +273,7 @@ def render(c, out, height=None, fast=False, extra=(), overlays=(), cache=None, r
         with ThreadPoolExecutor(max_workers=max(1, min(4, os.cpu_count() or 2))) as ex:
             files = list(ex.map(lambda t: (t[0], *_cell_file(t[1], t[2], t[3], fast, d, cell_progress(t[0]))), todo))
         # a hung ffmpeg must never wedge the preview thread pool
-        finish(lambda o, ex, cb=None: thumbs.run(command(c, files, o, height, fast, ex, overlays), progress=cb,
+        finish(lambda o, ex, cb=None: thumbs.run(command(c, files, o, height, fast, ex, overlays, tmp), progress=cb,
                                                  total=duration(c)),
                out, tmp, repeat, interpolate, list(extra), thumbs.scaled(progress, 0.4, 1))
     return out

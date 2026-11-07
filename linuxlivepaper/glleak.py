@@ -26,7 +26,7 @@ def _bind():
         (gst, "gst_query_parse_context", None, [P, C.POINTER(P)]), (gst, "gst_mini_object_unref", None, [P]),
         (gst, "gst_context_get_structure", P, [P]),
         (gst, "gst_structure_get", C.c_int, [P, C.c_char_p, C.c_size_t, C.POINTER(P), P]),
-        (gl, "gst_gl_context_get_type", C.c_size_t, [])]:
+        (gl, "gst_gl_context_get_type", C.c_size_t, []), (gl, "gst_gl_context_get_display", P, [P])]:
         f = getattr(lib, name)
         f.restype, f.argtypes = res, args
     return go, gst, gl
@@ -49,6 +49,16 @@ def install():
     def gone(ctx, _sink):
         # We hold one ref. Exactly two left → GTK's leaked ref is still there, drop it. One left → this GTK already
         # releases it (backported fix), so only drop ours. ref_count is the guint right after the GTypeInstance.
+        # That "one ref" is real: gst_structure_get() copies the GValue, i.e. it is transfer FULL (checked against
+        # GStreamer 1.26.11: refcount 1 → 2 after g_value_set_object → 2 after gst_structure_take_value → 3 after
+        # gst_structure_get), so the two unrefs below are correct and adding a g_object_ref() would leak instead.
+        # The context's GstGLDisplay is kept alive on purpose (get_display's ref is never dropped): finalizing it calls
+        # eglTerminate on the EGLDisplay that GDK and every other playing stream share, and the next frame GTK uploads
+        # aborts in libepoxy ("No provider of eglCreateImageKHR"). Hit when a collage cell swapped streams mid-play.
+        # ponytail: leaks one tiny display wrapper per played stream (no fds, no threads); fine for any session length
+        # One fixed run in 15 once died in gc.collect() right after a release and never again since: no known
+        # mechanism, and this file deletes itself once the runtime ships GTK > 4.22.
+        gl.gst_gl_context_get_display(ctx)
         if C.c_uint.from_address(ctx + C.sizeof(P)).value >= 2:
             go.g_object_unref(ctx)
         go.g_object_unref(ctx)
