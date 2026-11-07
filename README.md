@@ -105,6 +105,3 @@ The first build compiles x264 + ffmpeg (a few minutes); later builds reuse `.fla
 
 A *live image* is a still and a video that share a name in the same folder (`x.jpg` + `x.mov`).
 That means Live Photos copied over from an iPhone show up as LIVE too.
-
-## Docs
-- `AGENT-HANDOFF.md`: current state and next steps
